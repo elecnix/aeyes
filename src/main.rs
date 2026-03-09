@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{info, warn, Level};
@@ -34,8 +34,8 @@ enum Commands {
     /// Capture image from daemon
     #[command(arg_required_else_help = false)]
     Capture {
-        /// Output path, default /tmp/aeyes-last.jpg
-        #[arg(short, long, default_value = "/tmp/aeyes-last.jpg")]
+        /// Output path for the captured frame
+        #[arg(short, long, default_value_os_t = default_capture_output())]
         output: PathBuf,
     },
     /// Stop the daemon
@@ -69,11 +69,70 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-const SOCKET_PATH: &str = "/tmp/aeyes.sock";
-const PID_PATH: &str = "/tmp/aeyes.pid";
+const DAEMON_ADDR: &str = "127.0.0.1:47321";
+
+fn runtime_dir() -> PathBuf {
+    env::temp_dir().join("aeyes")
+}
+
+fn pid_path() -> PathBuf {
+    runtime_dir().join("aeyes.pid")
+}
+
+fn default_capture_output() -> PathBuf {
+    runtime_dir().join("aeyes-last.jpg")
+}
+
+fn ensure_runtime_dir() -> Result<PathBuf> {
+    let dir = runtime_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create runtime dir at {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn parse_capture_command(cmd: &str) -> Option<PathBuf> {
+    cmd.strip_prefix("capture ")
+        .and_then(|s| s.strip_suffix('\n'))
+        .map(|s| PathBuf::from(s.trim()))
+}
+
+async fn connect_daemon() -> Result<TcpStream> {
+    TcpStream::connect(DAEMON_ADDR)
+        .await
+        .with_context(|| format!("failed to connect to daemon at {DAEMON_ADDR}"))
+}
+
+#[cfg(windows)]
+async fn terminate_process(pid: u32) -> Result<()> {
+    let status = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .await
+        .with_context(|| format!("failed to invoke taskkill for PID {pid}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("taskkill failed for PID {pid} with status {status}")
+    }
+}
+
+#[cfg(not(windows))]
+async fn terminate_process(pid: u32) -> Result<()> {
+    let status = tokio::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .await
+        .with_context(|| format!("failed to invoke kill for PID {pid}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("kill failed for PID {pid} with status {status}")
+    }
+}
 
 async fn is_running() -> bool {
-    UnixStream::connect(SOCKET_PATH).await.is_ok()
+    TcpStream::connect(DAEMON_ADDR).await.is_ok()
 }
 
 async fn start_daemon() -> Result<()> {
@@ -82,17 +141,18 @@ async fn start_daemon() -> Result<()> {
         return Ok(());
     }
 
+    ensure_runtime_dir()?;
+
     let exe = env::current_exe()?;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("--daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::null());
 
-    let mut child = cmd.spawn()?;
-    let pid = child.id();
-    std::fs::write(PID_PATH, pid.to_string().as_bytes())?;
+    let child = cmd.spawn()?;
+    let pid = child.id().context("spawned daemon process did not report a PID")?;
+    std::fs::write(pid_path(), pid.to_string().as_bytes())?;
 
     info!("Daemon started with PID {}", pid);
     println!("Daemon started (PID: {})", pid);
@@ -102,16 +162,14 @@ async fn start_daemon() -> Result<()> {
 }
 
 async fn stop_daemon() -> Result<()> {
-    if let Ok(pid_str) = std::fs::read_to_string(PID_PATH) {
+    if let Ok(pid_str) = std::fs::read_to_string(pid_path()) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            let _ = tokio::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .await;
+            if let Err(error) = terminate_process(pid).await {
+                warn!("Failed to stop daemon process {}: {:?}", pid, error);
+            }
         }
     }
-    let _ = std::fs::remove_file(SOCKET_PATH);
-    let _ = std::fs::remove_file(PID_PATH);
+    let _ = std::fs::remove_file(pid_path());
     println!("Daemon stopped.");
     Ok(())
 }
@@ -130,7 +188,9 @@ async fn capture(output: &Path) -> Result<()> {
         anyhow::bail!("Daemon is not running. Run `aeyes start` first.");
     }
 
-    let mut stream = UnixStream::connect(SOCKET_PATH).await?;
+    ensure_runtime_dir()?;
+
+    let mut stream = connect_daemon().await?;
     let cmd = format!("capture {}\n", output.to_string_lossy());
     stream.write_all(cmd.as_bytes()).await?;
 
@@ -148,23 +208,21 @@ async fn capture(output: &Path) -> Result<()> {
 }
 
 async fn run_daemon() -> Result<()> {
-    let _ = std::fs::remove_file(SOCKET_PATH);
-    let _ = std::fs::remove_file(PID_PATH);
+    ensure_runtime_dir()?;
+    let _ = std::fs::remove_file(pid_path());
 
-    let listener = UnixListener::bind(SOCKET_PATH)?;
+    let listener = TcpListener::bind(DAEMON_ADDR).await?;
     let pid = std::process::id();
-    std::fs::write(PID_PATH, pid.to_string().as_bytes())?;
+    std::fs::write(pid_path(), pid.to_string().as_bytes())?;
 
-    info!("Daemon running, listening on {}", SOCKET_PATH);
+    info!("Daemon running, listening on {}", DAEMON_ADDR);
 
     let latest_image: Arc<RwLock<Option<Arc<RgbImage>>>> = Arc::new(RwLock::new(None));
 
     // Camera task
     let camera_latest = Arc::clone(&latest_image);
     tokio::spawn(async move {
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Nearest)
-            .with_width(1280)
-            .with_height(720);
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
         let mut camera = match Camera::new(CameraIndex::Index(0), requested) {
             Ok(c) => c,
             Err(e) => {
@@ -180,7 +238,7 @@ async fn run_daemon() -> Result<()> {
         loop {
             match camera.frame() {
                 Ok(frame) => {
-                    match frame.decode_image::<image::Rgb<u8>>() {
+                    match frame.decode_image::<RgbFormat>() {
                         Ok(img) => {
                             let arc_img = Arc::new(img);
                             let mut latest = camera_latest.write().await;
@@ -213,8 +271,7 @@ async fn run_daemon() -> Result<()> {
                 Err(_) => return,
             };
             let cmd = String::from_utf8_lossy(&buf[..n]);
-            if let Some(path_str) = cmd.strip_prefix("capture ").and_then(|s| s.strip_suffix('\n')) {
-                let path = PathBuf::from(path_str.trim());
+            if let Some(path) = parse_capture_command(&cmd) {
                 let guard = latest_clone.read().await;
                 if let Some(arc_img) = guard.as_ref().cloned() {
                     drop(guard);
@@ -229,5 +286,31 @@ async fn run_daemon() -> Result<()> {
             }
             let _ = stream.shutdown().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_capture_output, parse_capture_command, pid_path, runtime_dir};
+
+    #[test]
+    fn runtime_paths_are_nested_under_temp_dir() {
+        let temp_dir = std::env::temp_dir();
+
+        assert!(runtime_dir().starts_with(&temp_dir));
+        assert!(pid_path().starts_with(runtime_dir()));
+        assert!(default_capture_output().starts_with(runtime_dir()));
+    }
+
+    #[test]
+    fn parse_capture_command_extracts_output_path() {
+        let parsed = parse_capture_command("capture C:/temp/frame.jpg\n");
+
+        assert_eq!(parsed, Some(std::path::PathBuf::from("C:/temp/frame.jpg")));
+    }
+
+    #[test]
+    fn parse_capture_command_rejects_unknown_commands() {
+        assert!(parse_capture_command("status\n").is_none());
     }
 }

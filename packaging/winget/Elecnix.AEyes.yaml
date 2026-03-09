@@ -1,0 +1,16 @@
+PackageIdentifier: Elecnix.AEyes
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: Elecnix
+PackageName: A-Eyes
+License: MIT
+ShortDescription: CLI daemon that keeps a webcam warm for instant captures by AI agents.
+InstallerType: portable
+Commands:
+- aeyes
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/elecnix/aeyes/releases/download/v0.1.0/aeyes-windows-x64.exe
+  InstallerSha256: AC7082F03D39D1DAF02461C28C5F24873D755405B0C845CCFD106E4EF11E1862
+ManifestType: singleton
+ManifestVersion: 1.6.0
