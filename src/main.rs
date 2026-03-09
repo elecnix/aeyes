@@ -1,19 +1,20 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use dotenvy::dotenv;
-use image::ImageBuffer;
-use nokhwa::{Camera, CameraCloseConfiguration, CameraFormat, Cameras, Device, FormatSpecificRequestBuilder, NokhwaError, PixelFormat, RequestedFormat, RequestedFormatType, SourceBuilder};
+use clap::{CommandFactory, Parser, Subcommand};
+use image::RgbImage;
+use nokhwa::{
+    pixel_format::RgbFormat,
+    utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+    Camera,
+};
 use std::env;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixListener;
-use tokio::sync::{RwLock, watch};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber;
 
 #[derive(Parser)]
@@ -45,7 +46,6 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .init();
@@ -61,23 +61,19 @@ async fn main() -> Result<()> {
             Some(Commands::Stop {}) => stop_daemon().await?,
             Some(Commands::Status {}) => status().await?,
             None => {
-                println!("Run `aeyes --help` for usage.");
+                Cli::command().print_help()?;
+                println!();
             }
         }
     }
-
     Ok(())
 }
 
 const SOCKET_PATH: &str = "/tmp/aeyes.sock";
 const PID_PATH: &str = "/tmp/aeyes.pid";
-const DEFAULT_OUTPUT: &str = "/tmp/aeyes-last.jpg";
 
 async fn is_running() -> bool {
-    match tokio::net::UnixStream::connect(SOCKET_PATH).await {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    UnixStream::connect(SOCKET_PATH).await.is_ok()
 }
 
 async fn start_daemon() -> Result<()> {
@@ -87,19 +83,21 @@ async fn start_daemon() -> Result<()> {
     }
 
     let exe = env::current_exe()?;
-    let mut cmd = tokio::process::Command::new(exe);
+    let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("--daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child.id();
-    std::fs::write(PID_PATH, pid.to_string())?;
+    std::fs::write(PID_PATH, pid.to_string().as_bytes())?;
 
     info!("Daemon started with PID {}", pid);
     println!("Daemon started (PID: {})", pid);
 
+    sleep(Duration::from_millis(500)).await;
     Ok(())
 }
 
@@ -132,97 +130,104 @@ async fn capture(output: &Path) -> Result<()> {
         anyhow::bail!("Daemon is not running. Run `aeyes start` first.");
     }
 
-    let mut stream = tokio::net::UnixStream::connect(SOCKET_PATH).await?;
-    stream.write_all(b"capture ").await?;
-    stream.write_all(output.to_string_lossy().as_bytes()).await?;
-    stream.write_all(b"\n").await?;
+    let mut stream = UnixStream::connect(SOCKET_PATH).await?;
+    let cmd = format!("capture {}\n", output.to_string_lossy());
+    stream.write_all(cmd.as_bytes()).await?;
 
-    let mut buf = [0u8; 1024];
+    let mut buf = vec![0u8; 1024];
     let n = stream.read(&mut buf).await?;
-    let response = String::from_utf8_lossy(&buf[..n]);
+    let response = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
-    if response.trim() == "OK" {
-        println!("Captured to {:?}", output);
-    } else {
-        anyhow::bail!("Daemon error: {}", response);
+    match response.as_str() {
+        "OK" => {
+            println!("Captured to {:?}.", output);
+            Ok(())
+        }
+        other => anyhow::bail!("Daemon error: {}", other),
     }
-
-    Ok(())
 }
 
 async fn run_daemon() -> Result<()> {
-    // Cleanup old socket/pid
     let _ = std::fs::remove_file(SOCKET_PATH);
     let _ = std::fs::remove_file(PID_PATH);
 
     let listener = UnixListener::bind(SOCKET_PATH)?;
-    std::fs::write(PID_PATH, std::process::id().to_string())?;
+    let pid = std::process::id();
+    std::fs::write(PID_PATH, pid.to_string().as_bytes())?;
 
     info!("Daemon running, listening on {}", SOCKET_PATH);
 
-    // Find camera
-    let devices = nokhwa::utils::available_devices()?;
-    if devices.is_empty() {
-        anyhow::bail!("No cameras found");
-    }
-    let device = devices.into_iter().next().unwrap();
-    info!("Using camera: {:?}", device);
+    let latest_image: Arc<RwLock<Option<Arc<RgbImage>>>> = Arc::new(RwLock::new(None));
 
-    let requested = RequestedFormat::new::<nokhwa::utils::RgbFormat>()
-        .with_width(1280)
-        .with_height(720)
-        .build();
-
-    let mut camera = Camera::new(device, requested)?;
-
-    camera.open_stream()?;
-
-    let latest_frame = Arc::new(RwLock::new(None::<nokhwa::Frame>));
-
-    let camera_loop_latest = latest_frame.clone();
+    // Camera task
+    let camera_latest = Arc::clone(&latest_image);
     tokio::spawn(async move {
-        loop {
-            match camera.capture() {
-                Ok(frame) => {
-                    let mut latest = camera_loop_latest.write().await;
-                    *latest = Some(frame);
-                }
-                Err(e) => {
-                    info!("Capture error: {:?}", e);
-                }
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Nearest)
+            .with_width(1280)
+            .with_height(720);
+        let mut camera = match Camera::new(CameraIndex::Index(0), requested) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to create camera: {:?}", e);
+                return;
             }
-            sleep(Duration::from_millis(33)).await; // ~30fps
+        };
+        if let Err(e) = camera.open_stream() {
+            warn!("Failed to open stream: {:?}", e);
+            return;
+        }
+        info!("Camera opened");
+        loop {
+            match camera.frame() {
+                Ok(frame) => {
+                    match frame.decode_image::<image::Rgb<u8>>() {
+                        Ok(img) => {
+                            let arc_img = Arc::new(img);
+                            let mut latest = camera_latest.write().await;
+                            *latest = Some(arc_img);
+                        }
+                        Err(e) => warn!("Decode error: {:?}", e),
+                    }
+                }
+                Err(e) => warn!("Frame error: {:?}", e),
+            }
+            sleep(Duration::from_millis(33)).await;
         }
     });
 
+    // Server loop
     loop {
-        let (mut stream, _) = listener.accept().await?;
-        let latest_clone = latest_frame.clone();
+        let (mut stream, _) = match listener.accept().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Accept error: {:?}", e);
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let latest_clone = Arc::clone(&latest_image);
         tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            if let Ok(n) = stream.read(&mut buf).await {
-                let cmd = String::from_utf8_lossy(&buf[..n]);
-                if let Some((_, path_str)) = cmd.split_once("capture ") {
-                    if let Some(path_str) = path_str.strip_suffix('\n') {
-                        let path = PathBuf::from(path_str);
-                        if let Some(frame) = latest_clone.read().await.as_ref().cloned() {
-                            if let Err(e) = save_frame(&frame, &path) {
-                                let _ = stream.write_all(format!("ERROR: {}", e).as_bytes()).await;
-                            } else {
-                                let _ = stream.write_all(b"OK").await;
-                            }
-                        } else {
-                            let _ = stream.write_all(b"NOFRAME").await;
-                        }
+            let mut buf = vec![0u8; 4096];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            let cmd = String::from_utf8_lossy(&buf[..n]);
+            if let Some(path_str) = cmd.strip_prefix("capture ").and_then(|s| s.strip_suffix('\n')) {
+                let path = PathBuf::from(path_str.trim());
+                let guard = latest_clone.read().await;
+                if let Some(arc_img) = guard.as_ref().cloned() {
+                    drop(guard);
+                    if let Err(e) = arc_img.save(&path) {
+                        let _ = stream.write_all(format!("ERROR: {}", e).as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"OK").await;
                     }
+                } else {
+                    let _ = stream.write_all(b"NOFRAME").await;
                 }
             }
+            let _ = stream.shutdown().await;
         });
     }
-}
-
-fn save_frame(frame: &nokhwa::Frame, path: &Path) -> Result<()> {
-    let buf = frame.decode_image::<image::Rgb<u8>>()?;
-    buf.save(path).with_context(|| format!("Failed to save to {:?}", path))?;
-    Ok(())
 }

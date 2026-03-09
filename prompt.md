@@ -13,3 +13,12 @@ I want you to push this repo to github using the ghcli which I already have logg
 Please commit early so I can fork the development onto Windows and Mac OS coding agents
 You have to decide which video system, library, whatever to use on Linux You may implement one plugin for each
 yes the system should be pluggable so it can support multiple video systems
+It should provide the highest-possible quality images
+it should support autofocus, auto-exposure
+the CLI should select a camera by name or ID, never index, so the selection is stable as cameras are added or removed
+if there is more than one camera, the CLI should list them and ask the user to select one (non-interactively)
+all invocations should be non-interactive, so the CLI does not block an AI agent
+the daemon should expose an HTTP API that exposes a simple GET /cams/<id>/frame to grab a frame, and GET /cams to list them
+all generated files should be git-ignored
+ship it so it can be installed on linux, windows, macos
+make it installable with all os-specific tools: brew, apt, winget, etc.
