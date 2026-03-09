@@ -13,6 +13,7 @@ use nokhwa::{
     query,
     utils::{ApiBackend, CameraIndex},
 };
+
 #[cfg(target_os = "linux")]
 use rscam::{Camera as RsCamera, Config as RsConfig};
 #[cfg(target_os = "linux")]
@@ -190,8 +191,7 @@ impl V4l2OpenCamera {
         let index = id
             .parse::<u32>()
             .with_context(|| format!("camera id '{id}' is not a Linux V4L2 device index"))?;
-        let device_path =
-            find_video_capture_device(index).unwrap_or_else(|| format!("/dev/video{index}"));
+        let device_path = find_video_capture_device(index).unwrap_or_else(|| format!("/dev/video{index}"));
         let mut camera = RsCamera::new(&device_path)
             .with_context(|| format!("failed to open V4L2 device {device_path}"))?;
 
@@ -326,6 +326,8 @@ impl OpenCamera for V4l2OpenCamera {
     }
 }
 
+
+
 #[cfg(target_os = "linux")]
 #[derive(Copy, Clone)]
 struct CapturePreset {
@@ -370,7 +372,7 @@ fn device_supports_video_capture(path: &str) -> bool {
         .args(["-D", "-d", path])
         .output()
     else {
-        return true;
+        return false;
     };
     if !output.status.success() {
         return false;

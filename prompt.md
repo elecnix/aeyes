@@ -22,3 +22,8 @@ the daemon should expose an HTTP API that exposes a simple GET /cams/<id>/frame 
 all generated files should be git-ignored
 ship it so it can be installed on linux, windows, macos
 make it installable with all os-specific tools: brew, apt, winget, etc.
+the test coverage should be kept above 80%
+the daemon should respond with comprehensive error messages
+the daemon should auto-start on the first frame grab request
+the daemon should auto-stop after a period of inactivity (configurable, default to 1 hour)
+GitHub actions should test linux, windows, macos on every push

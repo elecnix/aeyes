@@ -16,6 +16,9 @@ tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rscam = "0.5.5"
+
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
