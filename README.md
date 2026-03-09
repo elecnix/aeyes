@@ -8,6 +8,7 @@
 ## Features
 - Daemon mode: Open webcam continuously (~30 FPS latest frame buffer).
 - Fast CLI capture: Save latest frame in &lt;100ms.
+- Adaptive Linux exposure control to keep bright screens readable in dark rooms.
 - Unix socket IPC (/tmp/aeyes.sock).
 - Linux V4L2 (nokhwa). Pluggable for Windows/Mac.
 

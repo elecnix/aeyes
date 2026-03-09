@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use clap::{CommandFactory, Parser, Subcommand};
-use image::RgbImage;
+use image::{load_from_memory, RgbImage};
 #[cfg(not(target_os = "linux"))]
 use nokhwa::{
     query,
@@ -19,7 +19,9 @@ use std::{collections::HashMap, time::Instant};
 #[cfg(target_os = "linux")]
 use rscam::{Camera as RsCamera, Config as RsConfig};
 #[cfg(target_os = "linux")]
-use rscam::{CID_EXPOSURE_AUTO, CID_FOCUS_AUTO};
+use rscam::{
+    Control as RsControl, CtrlData, CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO, CID_FOCUS_AUTO,
+};
 use serde::Serialize;
 use std::{
     env, fs,
@@ -40,6 +42,11 @@ const DEFAULT_BIND: &str = "127.0.0.1:43210";
 const DEFAULT_OUTPUT: &str = "aeyes-frame.jpg";
 const FRAME_WAIT_RETRIES: usize = 50;
 const FRAME_WAIT_MS: u64 = 100;
+const EXPOSURE_SAMPLE_INTERVAL: u32 = 8;
+const EXPOSURE_SETTLE_FRAMES: u32 = 6;
+const EXPOSURE_WARMUP_FRAMES: u32 = 8;
+const HIGHLIGHT_CLIP_LUMA: u8 = 250;
+const SHADOW_LUMA_THRESHOLD: u8 = 40;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -103,6 +110,25 @@ pub trait OpenCamera: Send {
 pub struct DaemonErrorState {
     message: String,
     details: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+struct FrameLumaStats {
+    average_luma: f32,
+    p95_luma: u8,
+    clipped_ratio: f32,
+    dark_ratio: f32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug)]
+struct ExposureController {
+    minimum: i32,
+    maximum: i32,
+    step: i32,
+    current: i32,
+    frames_until_sample: u32,
+    cooldown_frames: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -246,6 +272,7 @@ struct V4l2OpenCamera {
     width: u32,
     height: u32,
     format: [u8; 4],
+    exposure_controller: Option<ExposureController>,
 }
 
 #[cfg(target_os = "linux")]
@@ -331,6 +358,7 @@ impl V4l2OpenCamera {
                         width: preset.width,
                         height: preset.height,
                         format: preset.format,
+                        exposure_controller: None,
                     });
                 }
                 Err(err) => {
@@ -353,6 +381,90 @@ impl V4l2OpenCamera {
             last_error.unwrap_or_else(|| "no capture modes attempted".to_string())
         )
     }
+
+    fn configure_exposure_controller(&mut self) {
+        if let Err(err) = self.camera.set_control(CID_EXPOSURE_AUTO, &1i32) {
+            info!(?err, device = %self.device_path, "failed to enable manual exposure mode");
+        }
+
+        match self.camera.get_control(CID_EXPOSURE_ABSOLUTE) {
+            Ok(control) => {
+                self.exposure_controller = ExposureController::from_control(control);
+                if self.exposure_controller.is_none() {
+                    info!(device = %self.device_path, "camera exposure control is not an integer range");
+                }
+            }
+            Err(err) => {
+                info!(?err, device = %self.device_path, "failed to inspect exposure controls");
+            }
+        }
+    }
+
+    fn warm_up_exposure(&mut self) {
+        if self.exposure_controller.is_none() {
+            return;
+        }
+
+        for _ in 0..EXPOSURE_WARMUP_FRAMES {
+            let frame = match self.camera.capture() {
+                Ok(frame) => frame,
+                Err(err) => {
+                    info!(?err, device = %self.device_path, "failed to capture warm-up frame");
+                    break;
+                }
+            };
+
+            if let Err(err) = self.observe_exposure_from_frame(&frame, true) {
+                info!(?err, device = %self.device_path, "failed to warm up exposure");
+                break;
+            }
+        }
+    }
+
+    fn observe_exposure_from_frame(&mut self, frame: &[u8], force: bool) -> Result<()> {
+        let Some(controller) = self.exposure_controller.as_mut() else {
+            return Ok(());
+        };
+        if !controller.should_sample(force) {
+            return Ok(());
+        }
+
+        let stats = if self.format == *b"MJPG" {
+            analyze_mjpeg_frame(frame).with_context(|| {
+                format!("failed to decode MJPEG frame from {}", self.device_path)
+            })?
+        } else if self.format == *b"YUYV" {
+            analyze_yuyv_frame(frame)?
+        } else {
+            return Ok(());
+        };
+
+        let Some(next) = self
+            .exposure_controller
+            .as_ref()
+            .and_then(|controller| controller.proposed_value(stats))
+        else {
+            return Ok(());
+        };
+
+        self.camera
+            .set_control(CID_EXPOSURE_ABSOLUTE, &next)
+            .with_context(|| format!("failed to set exposure {} on {}", next, self.device_path))?;
+
+        if let Some(controller) = self.exposure_controller.as_mut() {
+            controller.record_applied(next);
+        }
+
+        info!(
+            device = %self.device_path,
+            exposure = next,
+            average_luma = stats.average_luma,
+            p95_luma = stats.p95_luma,
+            clipped_ratio = stats.clipped_ratio,
+            "adjusted exposure for highlight preservation"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -361,9 +473,8 @@ impl OpenCamera for V4l2OpenCamera {
         if let Err(err) = self.camera.set_control(CID_FOCUS_AUTO, &1i32) {
             info!(?err, device = %self.device_path, "failed to enable autofocus");
         }
-        if let Err(err) = self.camera.set_control(CID_EXPOSURE_AUTO, &3i32) {
-            info!(?err, device = %self.device_path, "failed to enable auto exposure");
-        }
+        self.configure_exposure_controller();
+        self.warm_up_exposure();
         Ok(())
     }
 
@@ -372,6 +483,10 @@ impl OpenCamera for V4l2OpenCamera {
             .camera
             .capture()
             .with_context(|| format!("failed to capture frame from {}", self.device_path))?;
+
+        if let Err(err) = self.observe_exposure_from_frame(&frame, false) {
+            warn!(?err, device = %self.device_path, "failed to adapt exposure from captured frame");
+        }
 
         if self.format == *b"MJPG" {
             return Ok(frame.to_vec());
@@ -396,6 +511,55 @@ struct CapturePreset {
     height: u32,
     fps: u32,
     format: [u8; 4],
+}
+
+#[cfg(target_os = "linux")]
+impl ExposureController {
+    fn from_control(control: RsControl) -> Option<Self> {
+        match control.data {
+            CtrlData::Integer {
+                value,
+                minimum,
+                maximum,
+                step,
+                ..
+            } => Some(Self {
+                minimum,
+                maximum,
+                step: step.max(1),
+                current: value.clamp(minimum, maximum),
+                frames_until_sample: 0,
+                cooldown_frames: 0,
+            }),
+            _ => None,
+        }
+    }
+
+    fn should_sample(&mut self, force: bool) -> bool {
+        if force {
+            return true;
+        }
+        if self.cooldown_frames > 0 {
+            self.cooldown_frames -= 1;
+            return false;
+        }
+        if self.frames_until_sample == 0 {
+            self.frames_until_sample = EXPOSURE_SAMPLE_INTERVAL;
+            return true;
+        }
+        self.frames_until_sample -= 1;
+        false
+    }
+
+    fn proposed_value(&self, stats: FrameLumaStats) -> Option<i32> {
+        recommend_exposure_value(self.minimum, self.maximum, self.step, self.current, stats)
+    }
+
+    fn record_applied(&mut self, value: i32) {
+        self.current = value;
+        self.cooldown_frames = EXPOSURE_SETTLE_FRAMES;
+        self.frames_until_sample = EXPOSURE_SAMPLE_INTERVAL;
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -866,6 +1030,163 @@ pub fn encode_rgb_to_jpeg(width: u32, height: u32, bytes: Vec<u8>) -> Result<Vec
     Ok(out)
 }
 
+fn analyze_rgb_frame(bytes: &[u8]) -> FrameLumaStats {
+    let mut histogram = [0u32; 256];
+    let mut samples = 0u64;
+    let mut total_luma = 0u64;
+    let mut clipped = 0u64;
+    let mut dark = 0u64;
+
+    for pixel in bytes.chunks_exact(3).step_by(4) {
+        let r = pixel[0] as u64;
+        let g = pixel[1] as u64;
+        let b = pixel[2] as u64;
+        let luma = ((54 * r + 183 * g + 19 * b) >> 8) as u8;
+        histogram[luma as usize] += 1;
+        samples += 1;
+        total_luma += luma as u64;
+        if luma >= HIGHLIGHT_CLIP_LUMA {
+            clipped += 1;
+        }
+        if luma <= SHADOW_LUMA_THRESHOLD {
+            dark += 1;
+        }
+    }
+
+    if samples == 0 {
+        return FrameLumaStats::default();
+    }
+
+    let target = ((samples as f32) * 0.95).ceil() as u64;
+    let mut cumulative = 0u64;
+    let mut p95_luma = 0u8;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative += *count as u64;
+        if cumulative >= target {
+            p95_luma = index as u8;
+            break;
+        }
+    }
+
+    FrameLumaStats {
+        average_luma: total_luma as f32 / samples as f32,
+        p95_luma,
+        clipped_ratio: clipped as f32 / samples as f32,
+        dark_ratio: dark as f32 / samples as f32,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn analyze_mjpeg_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
+    let rgb = load_from_memory(bytes)
+        .context("invalid MJPEG buffer")?
+        .to_rgb8();
+    Ok(analyze_rgb_frame(rgb.as_raw()))
+}
+
+#[cfg(target_os = "linux")]
+fn analyze_yuyv_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
+    if !bytes.len().is_multiple_of(2) {
+        bail!("invalid YUYV buffer length: {}", bytes.len());
+    }
+
+    let mut histogram = [0u32; 256];
+    let mut samples = 0u64;
+    let mut total_luma = 0u64;
+    let mut clipped = 0u64;
+    let mut dark = 0u64;
+
+    for chunk in bytes.chunks_exact(4) {
+        for y in [chunk[0], chunk[2]] {
+            histogram[y as usize] += 1;
+            samples += 1;
+            total_luma += y as u64;
+            if y >= HIGHLIGHT_CLIP_LUMA {
+                clipped += 1;
+            }
+            if y <= SHADOW_LUMA_THRESHOLD {
+                dark += 1;
+            }
+        }
+    }
+
+    if samples == 0 {
+        return Ok(FrameLumaStats::default());
+    }
+
+    let target = ((samples as f32) * 0.95).ceil() as u64;
+    let mut cumulative = 0u64;
+    let mut p95_luma = 0u8;
+    for (index, count) in histogram.iter().enumerate() {
+        cumulative += *count as u64;
+        if cumulative >= target {
+            p95_luma = index as u8;
+            break;
+        }
+    }
+
+    Ok(FrameLumaStats {
+        average_luma: total_luma as f32 / samples as f32,
+        p95_luma,
+        clipped_ratio: clipped as f32 / samples as f32,
+        dark_ratio: dark as f32 / samples as f32,
+    })
+}
+
+fn recommend_exposure_value(
+    minimum: i32,
+    maximum: i32,
+    step: i32,
+    current: i32,
+    stats: FrameLumaStats,
+) -> Option<i32> {
+    let step = step.max(1);
+
+    let decrease_ratio = if stats.clipped_ratio >= 0.10 || stats.p95_luma >= 252 {
+        0.35
+    } else if stats.clipped_ratio >= 0.03 || stats.p95_luma >= 248 {
+        0.22
+    } else if stats.clipped_ratio >= 0.008 || stats.p95_luma >= 242 {
+        0.12
+    } else {
+        0.0
+    };
+    if decrease_ratio > 0.0 {
+        let delta = ((current as f32) * decrease_ratio).round() as i32;
+        let next = quantize_exposure_value(minimum, maximum, step, current - delta.max(step));
+        return (next != current).then_some(next);
+    }
+
+    let increase_ratio =
+        if stats.average_luma <= 18.0 && stats.dark_ratio >= 0.85 && stats.p95_luma <= 110 {
+            0.35
+        } else if stats.average_luma <= 30.0 && stats.dark_ratio >= 0.70 && stats.p95_luma <= 150 {
+            0.20
+        } else if stats.average_luma <= 45.0
+            && stats.dark_ratio >= 0.55
+            && stats.p95_luma <= 175
+            && stats.clipped_ratio < 0.002
+        {
+            0.12
+        } else {
+            0.0
+        };
+    if increase_ratio > 0.0 {
+        let delta = ((current as f32) * increase_ratio).round() as i32;
+        let next = quantize_exposure_value(minimum, maximum, step, current + delta.max(step));
+        return (next != current).then_some(next);
+    }
+
+    None
+}
+
+fn quantize_exposure_value(minimum: i32, maximum: i32, step: i32, value: i32) -> i32 {
+    let step = step.max(1);
+    let clamped = value.clamp(minimum, maximum);
+    let offset = clamped - minimum;
+    minimum + ((offset + (step / 2)) / step) * step
+}
+
 pub fn yuyv_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
     let expected = (width as usize) * (height as usize) * 2;
     if bytes.len() != expected {
@@ -1105,6 +1426,69 @@ mod tests {
     fn test_encode_rgb_to_jpeg_encodes() {
         let jpeg = encode_rgb_to_jpeg(2, 1, vec![255, 0, 0, 0, 255, 0]).unwrap();
         assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+
+    #[test]
+    fn test_analyze_rgb_frame_detects_bright_highlights() {
+        let stats = analyze_rgb_frame(&[
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 20, 20, 20, 20, 20, 20, 20,
+            20, 20, 20, 20, 20,
+        ]);
+        assert!(stats.clipped_ratio > 0.45);
+        assert!(stats.p95_luma >= 250);
+    }
+
+    #[test]
+    fn test_recommend_exposure_value_reduces_blown_highlights() {
+        let next = recommend_exposure_value(
+            2,
+            40000,
+            1,
+            400,
+            FrameLumaStats {
+                average_luma: 170.0,
+                p95_luma: 252,
+                clipped_ratio: 0.08,
+                dark_ratio: 0.10,
+            },
+        )
+        .unwrap();
+        assert!(next < 400);
+    }
+
+    #[test]
+    fn test_recommend_exposure_value_increases_dark_scene() {
+        let next = recommend_exposure_value(
+            2,
+            40000,
+            1,
+            100,
+            FrameLumaStats {
+                average_luma: 16.0,
+                p95_luma: 80,
+                clipped_ratio: 0.0,
+                dark_ratio: 0.92,
+            },
+        )
+        .unwrap();
+        assert!(next > 100);
+    }
+
+    #[test]
+    fn test_recommend_exposure_value_keeps_balanced_frame() {
+        let next = recommend_exposure_value(
+            2,
+            40000,
+            1,
+            120,
+            FrameLumaStats {
+                average_luma: 88.0,
+                p95_luma: 210,
+                clipped_ratio: 0.001,
+                dark_ratio: 0.15,
+            },
+        );
+        assert!(next.is_none());
     }
 
     #[test]
