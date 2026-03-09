@@ -9,10 +9,12 @@ use axum::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use image::RgbImage;
+#[cfg(not(target_os = "linux"))]
 use nokhwa::{
     query,
     utils::{ApiBackend, CameraIndex},
 };
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use rscam::{Camera as RsCamera, Config as RsConfig};
@@ -103,6 +105,45 @@ pub struct DaemonErrorState {
     details: Vec<String>,
 }
 
+#[cfg(target_os = "linux")]
+fn list_v4l2_cameras() -> Result<Vec<CameraDescriptor>> {
+    let mut cams = vec![];
+    if let Ok(entries) = fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let path_str = entry.path().to_string_lossy().to_string();
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if let Some(idx_str) = fname.strip_prefix("video") {
+                if idx_str.parse::<u32>().is_ok() && device_supports_video_capture(&path_str) {
+                    let output = std::process::Command::new("v4l2-ctl")
+                        .arg("--device")
+                        .arg(&path_str)
+                        .arg("--info")
+                        .output()
+                        .ok();
+                    let info_text = if let Some(out) = output {
+                        if out.status.success() {
+                            String::from_utf8_lossy(&out.stdout).lines()
+                                .find(|l| l.contains("Card type"))
+                                .map(|l| l.split(':').nth(1).map(|s| s.trim().to_string()).unwrap_or(fname.to_string()))
+                                .unwrap_or(fname.to_string())
+                        } else {
+                            fname.to_string()
+                        }
+                    } else {
+                        fname.to_string()
+                    };
+                    cams.push(CameraDescriptor {
+                        id: path_str,
+                        name: info_text,
+                        backend: "v4l2".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(cams)
+}
+
 impl DaemonErrorState {
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -123,6 +164,7 @@ pub struct AppState {
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
     cameras: Arc<Vec<CameraDescriptor>>,
     last_error: Arc<RwLock<Option<DaemonErrorState>>>,
+    last_activity: Arc<RwLock<Instant>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,15 +191,22 @@ impl CameraBackend for NativeBackend {
     }
 
     fn list_cameras(&self) -> Result<Vec<CameraDescriptor>> {
-        let cams = query(ApiBackend::Auto).context("failed to query cameras")?;
-        Ok(cams
-            .into_iter()
-            .map(|cam| CameraDescriptor {
-                id: camera_index_to_id(cam.index()),
-                name: cam.human_name(),
-                backend: self.name().to_string(),
-            })
-            .collect())
+        #[cfg(target_os = "linux")]
+        {
+            list_v4l2_cameras()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let cams = query(ApiBackend::Auto).context("failed to query cameras")?;
+            Ok(cams
+                .into_iter()
+                .map(|cam| CameraDescriptor {
+                    id: camera_index_to_id(cam.index()),
+                    name: cam.human_name(),
+                    backend: self.name().to_string(),
+                })
+                .collect())
+        }
     }
 
     fn open(&self, id: &str) -> Result<Box<dyn OpenCamera>> {
@@ -172,6 +221,7 @@ impl CameraBackend for NativeBackend {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn camera_index_to_id(index: &CameraIndex) -> String {
     index.as_string()
 }
@@ -188,10 +238,7 @@ struct V4l2OpenCamera {
 #[cfg(target_os = "linux")]
 impl V4l2OpenCamera {
     fn open(id: &str) -> Result<Self> {
-        let index = id
-            .parse::<u32>()
-            .with_context(|| format!("camera id '{id}' is not a Linux V4L2 device index"))?;
-        let device_path = find_video_capture_device(index).unwrap_or_else(|| format!("/dev/video{index}"));
+        let device_path = id.to_string();
         let mut camera = RsCamera::new(&device_path)
             .with_context(|| format!("failed to open V4L2 device {device_path}"))?;
 
@@ -335,35 +382,6 @@ struct CapturePreset {
     height: u32,
     fps: u32,
     format: [u8; 4],
-}
-
-#[cfg(target_os = "linux")]
-fn find_video_capture_device(index: u32) -> Option<String> {
-    let primary = format!("/dev/video{index}");
-    if device_supports_video_capture(&primary) {
-        return Some(primary);
-    }
-
-    let mut candidates = fs::read_dir("/dev")
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(suffix) = name.strip_prefix("video") {
-                let parsed = suffix.parse::<u32>().ok()?;
-                Some((parsed, format!("/dev/{name}")))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|(idx, _)| *idx);
-
-    candidates
-        .into_iter()
-        .map(|(_, path)| path)
-        .find(|path| device_supports_video_capture(path))
 }
 
 #[cfg(target_os = "linux")]
@@ -526,11 +544,34 @@ async fn daemon_responding(addr: SocketAddr) -> bool {
 }
 
 pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
-    let addr = daemon_addr()
-        .await
-        .context("daemon is not running; run 'aeyes start' first")?;
-    let path = if let Some(camera) = camera {
-        format!("/cams/{camera}/frame")
+    let addr = match daemon_addr().await {
+        Ok(addr) if daemon_responding(addr).await => addr,
+        _ => {
+            let backend = NativeBackend;
+            let cams = backend.list_cameras().context("no cameras found")?;
+            let chosen = choose_camera(&cams, camera.as_deref()).context("could not auto-select camera (specify --camera <id-or-name> if multiple)")?;
+            let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+            let bind: SocketAddr = bind_str.parse().context("invalid AEYES_BIND env")?; 
+            start_daemon(Some(chosen.id.clone()), bind).await.context("failed to auto-start daemon")?;
+            let mut retries = 100;
+            let mut ready_addr = None;
+            while retries > 0 {
+                match daemon_addr().await {
+                    Ok(addr) if daemon_responding(addr).await => {
+                        ready_addr = Some(addr);
+                        break;
+                    }
+                    _ => {
+                        sleep(Duration::from_millis(100)).await;
+                        retries -= 1;
+                    }
+                }
+            }
+            ready_addr.context("daemon failed to become ready")?
+        }
+    };
+    let path = if let Some(cam) = &camera {
+        format!("/cams/{}/frame", cam)
     } else {
         "/cams/default/frame".to_string()
     };
@@ -611,14 +652,33 @@ pub async fn run_daemon(
     let chosen = choose_camera(&cameras, Some(&selected_camera))?;
     let latest_jpeg: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
     let last_error: Arc<RwLock<Option<DaemonErrorState>>> = Arc::new(RwLock::new(None));
+    let last_activity: Arc<RwLock<Instant>> = Arc::new(RwLock::new(Instant::now()));
     let latest_jpeg_task = latest_jpeg.clone();
     let last_error_task = last_error.clone();
+    let last_activity_task = last_activity.clone();
     let chosen_id = chosen.id.clone();
     tokio::spawn(async move {
         if let Err(err) = camera_loop(backend, chosen_id, latest_jpeg_task, last_error_task).await {
             warn!(?err, "camera loop exited");
         }
     });
+
+    let idle_timeout_secs: u64 = env::var("AEYES_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    {
+        let last_activity = last_activity_task.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(idle_timeout_secs)).await;
+                if last_activity.read().await.elapsed() > Duration::from_secs(idle_timeout_secs) {
+                    info!("daemon idle timeout, auto-stopping");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     fs::write(addr_path(), bind.to_string())?;
     fs::write(pid_path(), std::process::id().to_string())?;
@@ -628,10 +688,12 @@ pub async fn run_daemon(
         latest_jpeg,
         cameras: Arc::new(cameras),
         last_error,
+        last_activity,
     };
     let app = Router::new()
         .route("/cams", get(list_cams_http))
         .route("/cams/{id}/frame", get(frame_http))
+        .route("/health", get(health_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -684,13 +746,15 @@ async fn camera_loop(
 }
 
 async fn list_cams_http(State(state): State<AppState>) -> Json<CamerasResponse> {
+    *state.last_activity.write().await = Instant::now();
     Json(CamerasResponse {
-        selected_camera: state.selected_camera,
+        selected_camera: state.selected_camera.clone(),
         cameras: (*state.cameras).clone(),
     })
 }
 
 async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState>) -> Response {
+    *state.last_activity.write().await = Instant::now();
     let requested = if id == "default" {
         state.selected_camera.clone()
     } else {
@@ -725,6 +789,11 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
             ))
     });
     error_response(StatusCode::SERVICE_UNAVAILABLE, error)
+}
+
+async fn health_handler(State(state): State<AppState>) -> &'static str {
+    *state.last_activity.write().await = Instant::now();
+    "ok"
 }
 
 fn error_response(status: StatusCode, error: DaemonErrorState) -> Response {
