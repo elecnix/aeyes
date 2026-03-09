@@ -6,12 +6,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install deps
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libv4l-dev libclang-dev pkg-config v4l-utils
       - name: Format check
         run: cargo fmt --all -- --check
@@ -20,7 +24,8 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features
       - name: Coverage
+        if: runner.os == 'Linux'
         uses: actions-rs/tarpaulin@v0.1
         with:
-          version: '0.26.1'
+          version: '0.26.0'
           args: '--lib --ignore-tests --skip-clean --no-fail-fast'
