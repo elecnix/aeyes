@@ -132,8 +132,9 @@ fn list_v4l2_cameras() -> Result<Vec<CameraDescriptor>> {
                     } else {
                         fname.to_string()
                     };
+                    let id = idx_str.to_string();
                     cams.push(CameraDescriptor {
-                        id: path_str,
+                        id,
                         name: info_text,
                         backend: "v4l2".to_string(),
                     });
@@ -141,6 +142,7 @@ fn list_v4l2_cameras() -> Result<Vec<CameraDescriptor>> {
             }
         }
     }
+    cams.sort_by_key(|c| c.id.parse::<u32>().unwrap_or(999u32));
     Ok(cams)
 }
 
@@ -238,7 +240,8 @@ struct V4l2OpenCamera {
 #[cfg(target_os = "linux")]
 impl V4l2OpenCamera {
     fn open(id: &str) -> Result<Self> {
-        let device_path = id.to_string();
+        let index: u32 = id.parse().with_context(|| format!("camera ID '{id}' must be numeric like '0'"))?;
+        let device_path = format!("/dev/video{index}");
         let mut camera = RsCamera::new(&device_path)
             .with_context(|| format!("failed to open V4L2 device {device_path}"))?;
 
@@ -846,6 +849,7 @@ fn push_yuv_pixel(rgb: &mut Vec<u8>, y: f32, u: f32, v: f32) {
 mod tests {
     use super::*;
     use axum::http::{header, StatusCode};
+    #[cfg(not(target_os = "linux"))]
     use nokhwa::utils::CameraIndex;
     use reqwest::StatusCode as ReqwestStatus;
     use serial_test::serial;
@@ -928,6 +932,7 @@ mod tests {
             latest_jpeg: Arc::new(RwLock::new(None)),
             cameras: Arc::new(fake_cameras()),
             last_error: Arc::new(RwLock::new(None)),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
         }
     }
 
@@ -971,6 +976,7 @@ mod tests {
         assert_eq!(choose_camera(&cams, Some("Front Cam")).unwrap().id, "cam-a");
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_camera_index_to_id() {
         assert_eq!(
@@ -1114,6 +1120,7 @@ mod tests {
                 backend: "test".to_string(),
             }]),
             last_error: Arc::new(RwLock::new(None)),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
         };
         let Json(response) = list_cams_http(State(state)).await;
         assert_eq!(response.selected_camera, "cam-a");
@@ -1128,6 +1135,7 @@ mod tests {
             latest_jpeg: Arc::new(RwLock::new(Some(jpeg.clone()))),
             cameras: Arc::new(vec![]),
             last_error: Arc::new(RwLock::new(None)),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
         };
         let resp = frame_http(AxumPath("default".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
