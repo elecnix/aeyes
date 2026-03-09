@@ -9,6 +9,7 @@ use axum::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use image::RgbImage;
+use nokhwa::Buffer;
 use nokhwa::{
     pixel_format::RgbFormat,
     query,
@@ -16,7 +17,7 @@ use nokhwa::{
         ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl,
         RequestedFormat, RequestedFormatType, Resolution,
     },
-    Camera, Frame,
+    Camera,
 };
 use serde::Serialize;
 use std::{
@@ -349,7 +350,8 @@ pub fn parse_http_response(buf: &[u8]) -> Result<Vec<u8>> {
     let headers = String::from_utf8_lossy(&buf[..split]);
     let status_ok = headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200");
     if !status_ok {
-        bail!(headers.lines().next().unwrap_or("HTTP error"));
+        let first_line = headers.lines().next().unwrap_or("HTTP error").to_string();
+        bail!(first_line);
     }
     Ok(buf[split..].to_vec())
 }
@@ -369,6 +371,7 @@ pub async fn run_daemon(
     selected_camera: String,
     backend: Box<dyn CameraBackend>,
 ) -> Result<()> {
+    fs::create_dir_all(runtime_dir())?;
     let cameras = backend.list_cameras()?;
     let chosen = choose_camera(&cameras, Some(&selected_camera))?;
     let latest_jpeg: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
@@ -390,7 +393,7 @@ pub async fn run_daemon(
     };
     let app = Router::new()
         .route("/cams", get(list_cams_http))
-        .route("/cams/:id/frame", get(frame_http))
+        .route("/cams/{id}/frame", get(frame_http))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -439,23 +442,28 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
         )
             .into_response();
     }
-    match state.latest_jpeg.read().await.clone() {
-        Some(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/jpeg")
-            .body(Body::from(bytes))
-            .unwrap(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "camera has not produced a frame yet".to_string(),
-            }),
-        )
-            .into_response(),
+
+    for _ in 0..50 {
+        if let Some(bytes) = state.latest_jpeg.read().await.clone() {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/jpeg")
+                .body(Body::from(bytes))
+                .unwrap();
+        }
+        sleep(Duration::from_millis(100)).await;
     }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "camera has not produced a frame yet".to_string(),
+        }),
+    )
+        .into_response()
 }
 
-pub fn encode_frame_as_jpeg(frame: &Frame) -> Result<Vec<u8>> {
+pub fn encode_frame_as_jpeg(frame: &Buffer) -> Result<Vec<u8>> {
     let img: RgbImage = frame.decode_image::<RgbFormat>()?;
     let mut bytes = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
@@ -476,9 +484,6 @@ mod tests {
     use super::*;
     use reqwest::StatusCode as ReqwestStatus;
     use serial_test::serial;
-    use std::sync::Mutex;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct FakeBackend {
         cameras: Vec<CameraDescriptor>,
@@ -573,9 +578,6 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn daemon_serves_cams_and_frames_with_fake_backend() {
-        let _guard = TEST_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("TMPDIR", dir.path());
         let bind: SocketAddr = "127.0.0.1:43219".parse().unwrap();
         let frame =
             encode_rgb_to_jpeg(2, 2, vec![0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 0]).unwrap();
@@ -585,9 +587,20 @@ mod tests {
         };
 
         let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
-        sleep(Duration::from_millis(250)).await;
 
         let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/cams")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    ready = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "daemon did not become ready in time");
+
         let cams = client
             .get(format!("http://{bind}/cams"))
             .send()
@@ -608,5 +621,6 @@ mod tests {
         assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
 
         handle.abort();
+        let _ = handle.await;
     }
 }
