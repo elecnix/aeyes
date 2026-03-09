@@ -774,7 +774,8 @@ fn push_yuv_pixel(rgb: &mut Vec<u8>, y: f32, u: f32, v: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header;
+    use axum::http::{header, StatusCode};
+    use nokhwa::utils::CameraIndex;
     use reqwest::StatusCode as ReqwestStatus;
     use serial_test::serial;
     use std::sync::Arc;
@@ -860,26 +861,26 @@ mod tests {
     }
 
     #[test]
-    fn choose_camera_single() {
+    fn test_choose_camera_single() {
         let cams = vec![fake_cameras()[0].clone()];
         let cam = choose_camera(&cams, None).unwrap();
         assert_eq!(cam.id, "cam-a");
     }
 
     #[test]
-    fn choose_camera_empty() {
+    fn test_choose_camera_empty() {
         let err = choose_camera(&[], None).unwrap_err().to_string();
         assert_eq!(err, "no cameras found");
     }
 
     #[test]
-    fn choose_camera_requested_not_found() {
+    fn test_choose_camera_requested_not_found() {
         let err = choose_camera(&fake_cameras(), Some("missing")).unwrap_err().to_string();
         assert!(err.contains("not found"));
     }
 
     #[test]
-    fn choose_camera_requires_explicit_choice_for_multiple() {
+    fn test_choose_camera_requires_explicit_choice_for_multiple() {
         let err = choose_camera(&fake_cameras(), None)
             .unwrap_err()
             .to_string();
@@ -888,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn choose_camera_accepts_id_or_name() {
+    fn test_choose_camera_accepts_id_or_name() {
         let cams = fake_cameras();
         assert_eq!(
             choose_camera(&cams, Some("cam-b")).unwrap().name,
@@ -898,32 +899,31 @@ mod tests {
     }
 
     #[test]
-    fn camera_index_to_id() {
-        use nokhwa::utils::CameraIndex;
+    fn test_camera_index_to_id() {
         assert_eq!(camera_index_to_id(&CameraIndex::String("test".to_string())), "test");
         assert_eq!(camera_index_to_id(&CameraIndex::Index(42)), "42");
     }
 
     #[test]
-    fn parse_http_response_http10() {
+    fn test_parse_http_response_http10() {
         let body = parse_http_response(b"HTTP/1.0 200 OK\r\n\r\nabc").unwrap();
         assert_eq!(body, b"abc");
     }
 
     #[test]
-    fn parse_http_response_no_boundary() {
+    fn test_parse_http_response_no_boundary() {
         let err = parse_http_response(b"HTTP/1.1 200 OK\r\nabc").unwrap_err().to_string();
         assert!(err.contains("invalid HTTP response"));
     }
 
     #[test]
-    fn parse_http_response_extracts_body() {
+    fn test_parse_http_response_extracts_body() {
         let body = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").unwrap();
         assert_eq!(body, b"abc");
     }
 
     #[test]
-    fn parse_http_response_rejects_non_200_with_details() {
+    fn test_parse_http_response_rejects_non_200_with_details() {
         let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\r\n{\"error\":\"failed to capture\",\"details\":[\"camera id: cam-a\",\"device busy\"]}";
         let err = parse_http_response(response).unwrap_err().to_string();
         assert!(err.contains("503"));
@@ -932,53 +932,53 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_response_body_simple() {
+    fn test_parse_error_response_body_simple() {
         let parsed = parse_error_response_body(b"{\"error\":\"simple\"}").unwrap();
         assert_eq!(parsed, "simple");
     }
 
     #[test]
-    fn parse_error_response_body_details() {
+    fn test_parse_error_response_body_details() {
         let parsed = parse_error_response_body(b"{\"error\":\"err\",\"details\":[\"d1\",\"d2\"]}").unwrap();
         assert_eq!(parsed, "err [d1 | d2]");
     }
 
     #[test]
-    fn encode_rgb_to_jpeg_invalid_size() {
+    fn test_encode_rgb_to_jpeg_invalid_size() {
         let err = encode_rgb_to_jpeg(2, 1, vec![255, 0]).unwrap_err().to_string();
         assert!(err.contains("invalid RGB buffer"));
     }
 
     #[test]
-    fn encode_rgb_to_jpeg_encodes() {
+    fn test_encode_rgb_to_jpeg_encodes() {
         let jpeg = encode_rgb_to_jpeg(2, 1, vec![255, 0, 0, 0, 255, 0]).unwrap();
         assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
     }
 
     #[test]
-    fn yuyv_to_jpeg_invalid_length() {
+    fn test_yuyv_to_jpeg_invalid_length() {
         let err = yuyv_to_jpeg(2, 1, &[80, 90, 81]).unwrap_err().to_string();
         assert!(err.contains("invalid YUYV buffer length"));
     }
 
     #[test]
-    fn yuyv_to_jpeg_encodes() {
+    fn test_yuyv_to_jpeg_encodes() {
         let jpeg = yuyv_to_jpeg(2, 1, &[80, 90, 81, 240]).unwrap();
         assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
     }
 
     #[test]
-    fn print_help_works() {
+    fn test_print_help_works() {
         print_help().unwrap();
     }
 
     #[test]
-    fn list_cameras_cmd_works() {
+    fn test_list_cameras_cmd_works() {
         list_cameras_cmd().unwrap();
     }
 
     #[test]
-    fn native_backend_name_linux() {
+    fn test_native_backend_name_linux() {
         let backend = NativeBackend;
         #[cfg(target_os = "linux")]
         assert_eq!(backend.name(), "v4l2");
@@ -987,37 +987,37 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_list_cameras_works() {
+    fn test_native_backend_list_cameras_works() {
         let backend = NativeBackend;
         let _cams = backend.list_cameras();
     }
 
     #[test]
-    fn runtime_dir_contains_aeyes() {
+    fn test_runtime_dir_contains_aeyes() {
         let dir = runtime_dir();
         assert!(dir.to_string_lossy().contains("aeyes"));
     }
 
     #[test]
-    fn pid_path() {
+    fn test_pid_path() {
         let path = pid_path();
         assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("daemon.pid"));
     }
 
     #[test]
-    fn addr_path() {
+    fn test_addr_path() {
         let path = addr_path();
         assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("daemon.addr"));
     }
 
     #[test]
-    fn error_response_builds() {
+    fn test_error_response_builds() {
         let error = DaemonErrorState::new("test").with_detail("detail");
         let _resp = error_response(StatusCode::BAD_REQUEST, error);
     }
 
     #[tokio::test]
-    async fn list_cams_http() {
+    async fn test_list_cams_http() {
         let state = AppState {
             selected_camera: "cam-a".to_string(),
             latest_jpeg: Arc::new(RwLock::new(None)),
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_http_success_default() {
+    async fn test_frame_http_success_default() {
         let jpeg = vec![0xff, 0xd8, 0xff];
         let state = AppState {
             selected_camera: "cam-a".to_string(),
@@ -1042,21 +1042,21 @@ mod tests {
             cameras: Arc::new(vec![]),
             last_error: Arc::new(RwLock::new(None)),
         };
-        let resp = frame_http("default".parse().unwrap(), State(state)).await;
+        let resp = frame_http(AxumPath("default".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(header::CONTENT_TYPE), Some(&"image/jpeg"[..]));
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("image/jpeg"));
     }
 
     #[tokio::test]
-    async fn frame_http_wrong_camera_not_found() {
+    async fn test_frame_http_wrong_camera_not_found() {
         let state = default_state();
-        let resp = frame_http("cam-b".parse().unwrap(), State(state)).await;
+        let resp = frame_http(AxumPath("cam-b".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     #[serial]
-    async fn daemon_serves_cams_and_frames_with_fake_backend() {
+    async fn test_daemon_serves_cams_and_frames_with_fake_backend() {
         let bind: SocketAddr = "127.0.0.1:43219".parse().unwrap();
         let frame =
             encode_rgb_to_jpeg(2, 2, vec![0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 0]).unwrap();
@@ -1107,7 +1107,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn daemon_fails_to_open_camera() {
+    async fn test_daemon_fails_to_open_camera() {
         let bind: SocketAddr = "127.0.0.1:43221".parse().unwrap();
         let backend = FakeBackend {
             cameras: fake_cameras(),
@@ -1129,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn daemon_reports_detailed_capture_errors() {
+    async fn test_daemon_reports_detailed_capture_errors() {
         let bind: SocketAddr = "127.0.0.1:43220".parse().unwrap();
         let backend = FakeBackend {
             cameras: fake_cameras(),
