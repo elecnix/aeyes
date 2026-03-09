@@ -875,7 +875,9 @@ mod tests {
 
     #[test]
     fn test_choose_camera_requested_not_found() {
-        let err = choose_camera(&fake_cameras(), Some("missing")).unwrap_err().to_string();
+        let err = choose_camera(&fake_cameras(), Some("missing"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not found"));
     }
 
@@ -900,7 +902,10 @@ mod tests {
 
     #[test]
     fn test_camera_index_to_id() {
-        assert_eq!(camera_index_to_id(&CameraIndex::String("test".to_string())), "test");
+        assert_eq!(
+            camera_index_to_id(&CameraIndex::String("test".to_string())),
+            "test"
+        );
         assert_eq!(camera_index_to_id(&CameraIndex::Index(42)), "42");
     }
 
@@ -912,7 +917,9 @@ mod tests {
 
     #[test]
     fn test_parse_http_response_no_boundary() {
-        let err = parse_http_response(b"HTTP/1.1 200 OK\r\nabc").unwrap_err().to_string();
+        let err = parse_http_response(b"HTTP/1.1 200 OK\r\nabc")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid HTTP response"));
     }
 
@@ -939,13 +946,16 @@ mod tests {
 
     #[test]
     fn test_parse_error_response_body_details() {
-        let parsed = parse_error_response_body(b"{\"error\":\"err\",\"details\":[\"d1\",\"d2\"]}").unwrap();
+        let parsed =
+            parse_error_response_body(b"{\"error\":\"err\",\"details\":[\"d1\",\"d2\"]}").unwrap();
         assert_eq!(parsed, "err [d1 | d2]");
     }
 
     #[test]
     fn test_encode_rgb_to_jpeg_invalid_size() {
-        let err = encode_rgb_to_jpeg(2, 1, vec![255, 0]).unwrap_err().to_string();
+        let err = encode_rgb_to_jpeg(2, 1, vec![255, 0])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid RGB buffer"));
     }
 
@@ -1001,13 +1011,19 @@ mod tests {
     #[test]
     fn test_pid_path() {
         let path = pid_path();
-        assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("daemon.pid"));
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("daemon.pid")
+        );
     }
 
     #[test]
     fn test_addr_path() {
         let path = addr_path();
-        assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("daemon.addr"));
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("daemon.addr")
+        );
     }
 
     #[test]
@@ -1044,7 +1060,12 @@ mod tests {
         };
         let resp = frame_http(AxumPath("default".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("image/jpeg"));
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/jpeg")
+        );
     }
 
     #[tokio::test]
@@ -1118,7 +1139,11 @@ mod tests {
         let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
         tokio::time::sleep(Duration::from_millis(500)).await;
         let client = reqwest::Client::new();
-        let resp = client.get(format!("http://{bind}/cams/default/frame")).send().await.unwrap();
+        let resp = client
+            .get(format!("http://{bind}/cams/default/frame"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), ReqwestStatus::SERVICE_UNAVAILABLE);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"], "failed to open selected camera");
