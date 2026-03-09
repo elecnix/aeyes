@@ -9,16 +9,14 @@ use axum::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use image::RgbImage;
-use nokhwa::Buffer;
 use nokhwa::{
-    pixel_format::RgbFormat,
     query,
-    utils::{
-        ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl,
-        RequestedFormat, RequestedFormatType, Resolution,
-    },
-    Camera,
+    utils::{ApiBackend, CameraIndex},
 };
+#[cfg(target_os = "linux")]
+use rscam::{Camera as RsCamera, Config as RsConfig};
+#[cfg(target_os = "linux")]
+use rscam::{CID_EXPOSURE_AUTO, CID_FOCUS_AUTO};
 use serde::Serialize;
 use std::{
     env, fs,
@@ -35,11 +33,17 @@ use tokio::{
 };
 use tracing::{info, warn, Level};
 
+const DEFAULT_BIND: &str = "127.0.0.1:43210";
+const DEFAULT_OUTPUT: &str = "aeyes-frame.jpg";
+const FRAME_WAIT_RETRIES: usize = 50;
+const FRAME_WAIT_MS: u64 = 100;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "aeyes",
     about = "AI Eyes - non-interactive webcam daemon",
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    arg_required_else_help = false
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -54,7 +58,7 @@ pub enum Commands {
         #[arg(long)]
         camera: Option<String>,
         /// Bind address for the daemon HTTP API
-        #[arg(long, default_value = "127.0.0.1:43210")]
+        #[arg(long, default_value = DEFAULT_BIND)]
         bind: SocketAddr,
     },
     /// List available cameras
@@ -65,7 +69,7 @@ pub enum Commands {
         #[arg(long)]
         camera: Option<String>,
         /// Output file path
-        #[arg(short, long, default_value = "aeyes-frame.jpg")]
+        #[arg(short, long, default_value = DEFAULT_OUTPUT)]
         output: PathBuf,
     },
     /// Stop the daemon
@@ -92,63 +96,23 @@ pub trait OpenCamera: Send {
     fn capture_jpeg(&mut self) -> Result<Vec<u8>>;
 }
 
-pub struct NokhwaBackend;
-
-impl CameraBackend for NokhwaBackend {
-    fn name(&self) -> &'static str {
-        "native"
-    }
-
-    fn list_cameras(&self) -> Result<Vec<CameraDescriptor>> {
-        let api = ApiBackend::Auto;
-        let cams = query(api).context("failed to query cameras")?;
-        Ok(cams
-            .into_iter()
-            .map(|cam| CameraDescriptor {
-                id: cam.index().as_string(),
-                name: cam.human_name(),
-                backend: self.name().to_string(),
-            })
-            .collect())
-    }
-
-    fn open(&self, id: &str) -> Result<Box<dyn OpenCamera>> {
-        let camera_index = if let Ok(index) = id.parse::<u32>() {
-            CameraIndex::Index(index)
-        } else {
-            CameraIndex::String(id.to_string())
-        };
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
-            CameraFormat::new(Resolution::new(1920, 1080), FrameFormat::MJPEG, 30),
-        ));
-        let mut camera = Camera::new(camera_index, requested).context("failed to create camera")?;
-        camera
-            .open_stream()
-            .context("failed to open camera stream")?;
-        Ok(Box::new(NokhwaOpenCamera { camera }))
-    }
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct DaemonErrorState {
+    message: String,
+    details: Vec<String>,
 }
 
-struct NokhwaOpenCamera {
-    camera: Camera,
-}
-
-impl OpenCamera for NokhwaOpenCamera {
-    fn set_auto_features(&mut self) -> Result<()> {
-        for control in [KnownCameraControl::Exposure, KnownCameraControl::Focus] {
-            if let Err(err) = self
-                .camera
-                .set_camera_control(control, ControlValueSetter::Boolean(true))
-            {
-                info!(?control, ?err, "camera control not enabled automatically");
-            }
+impl DaemonErrorState {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            details: Vec::new(),
         }
-        Ok(())
     }
 
-    fn capture_jpeg(&mut self) -> Result<Vec<u8>> {
-        let frame = self.camera.frame().context("failed to read camera frame")?;
-        encode_frame_as_jpeg(&frame)
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.details.push(detail.into());
+        self
     }
 }
 
@@ -157,6 +121,7 @@ pub struct AppState {
     selected_camera: String,
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
     cameras: Arc<Vec<CameraDescriptor>>,
+    last_error: Arc<RwLock<Option<DaemonErrorState>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +133,252 @@ struct CamerasResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    details: Vec<String>,
+}
+
+pub struct NativeBackend;
+
+impl CameraBackend for NativeBackend {
+    fn name(&self) -> &'static str {
+        if cfg!(target_os = "linux") {
+            "v4l2"
+        } else {
+            "native"
+        }
+    }
+
+    fn list_cameras(&self) -> Result<Vec<CameraDescriptor>> {
+        let cams = query(ApiBackend::Auto).context("failed to query cameras")?;
+        Ok(cams
+            .into_iter()
+            .map(|cam| CameraDescriptor {
+                id: camera_index_to_id(cam.index()),
+                name: cam.human_name(),
+                backend: self.name().to_string(),
+            })
+            .collect())
+    }
+
+    fn open(&self, id: &str) -> Result<Box<dyn OpenCamera>> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Box::new(V4l2OpenCamera::open(id)?))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("native frame capture backend is not implemented for this OS yet")
+        }
+    }
+}
+
+fn camera_index_to_id(index: &CameraIndex) -> String {
+    index.as_string()
+}
+
+#[cfg(target_os = "linux")]
+struct V4l2OpenCamera {
+    camera: RsCamera,
+    device_path: String,
+    width: u32,
+    height: u32,
+    format: [u8; 4],
+}
+
+#[cfg(target_os = "linux")]
+impl V4l2OpenCamera {
+    fn open(id: &str) -> Result<Self> {
+        let index = id
+            .parse::<u32>()
+            .with_context(|| format!("camera id '{id}' is not a Linux V4L2 device index"))?;
+        let device_path = find_video_capture_device(index)
+            .unwrap_or_else(|| format!("/dev/video{index}"));
+        let mut camera = RsCamera::new(&device_path)
+            .with_context(|| format!("failed to open V4L2 device {device_path}"))?;
+
+        let candidates = [
+            CapturePreset {
+                width: 3840,
+                height: 2160,
+                fps: 30,
+                format: *b"MJPG",
+            },
+            CapturePreset {
+                width: 2560,
+                height: 1440,
+                fps: 30,
+                format: *b"MJPG",
+            },
+            CapturePreset {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                format: *b"MJPG",
+            },
+            CapturePreset {
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                format: *b"MJPG",
+            },
+            CapturePreset {
+                width: 1280,
+                height: 720,
+                fps: 60,
+                format: *b"MJPG",
+            },
+            CapturePreset {
+                width: 1280,
+                height: 720,
+                fps: 30,
+                format: *b"MJPG",
+            },
+            CapturePreset {
+                width: 1920,
+                height: 1080,
+                fps: 30,
+                format: *b"YUYV",
+            },
+            CapturePreset {
+                width: 1280,
+                height: 720,
+                fps: 30,
+                format: *b"YUYV",
+            },
+            CapturePreset {
+                width: 640,
+                height: 480,
+                fps: 30,
+                format: *b"MJPG",
+            },
+        ];
+
+        let mut last_error = None;
+        for preset in candidates {
+            let config = RsConfig {
+                interval: (1, preset.fps),
+                resolution: (preset.width, preset.height),
+                format: &preset.format,
+                ..Default::default()
+            };
+            match camera.start(&config) {
+                Ok(()) => {
+                    return Ok(Self {
+                        camera,
+                        device_path,
+                        width: preset.width,
+                        height: preset.height,
+                        format: preset.format,
+                    });
+                }
+                Err(err) => {
+                    last_error = Some(format!(
+                        "{}x{}@{} {} rejected by {}: {}",
+                        preset.width,
+                        preset.height,
+                        preset.fps,
+                        String::from_utf8_lossy(&preset.format),
+                        device_path,
+                        err
+                    ));
+                }
+            }
+        }
+
+        bail!(
+            "failed to start V4L2 stream on {}. Last attempted mode: {}",
+            device_path,
+            last_error.unwrap_or_else(|| "no capture modes attempted".to_string())
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl OpenCamera for V4l2OpenCamera {
+    fn set_auto_features(&mut self) -> Result<()> {
+        if let Err(err) = self.camera.set_control(CID_FOCUS_AUTO, &1i32) {
+            info!(?err, device = %self.device_path, "failed to enable autofocus");
+        }
+        if let Err(err) = self.camera.set_control(CID_EXPOSURE_AUTO, &3i32) {
+            info!(?err, device = %self.device_path, "failed to enable auto exposure");
+        }
+        Ok(())
+    }
+
+    fn capture_jpeg(&mut self) -> Result<Vec<u8>> {
+        let frame = self
+            .camera
+            .capture()
+            .with_context(|| format!("failed to capture frame from {}", self.device_path))?;
+
+        if self.format == *b"MJPG" {
+            return Ok(frame.to_vec());
+        }
+        if self.format == *b"YUYV" {
+            return yuyv_to_jpeg(self.width, self.height, &frame)
+                .with_context(|| format!("failed to encode YUYV frame from {}", self.device_path));
+        }
+
+        bail!(
+            "unsupported frame format '{}' from {}",
+            String::from_utf8_lossy(&self.format),
+            self.device_path
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone)]
+struct CapturePreset {
+    width: u32,
+    height: u32,
+    fps: u32,
+    format: [u8; 4],
+}
+
+#[cfg(target_os = "linux")]
+fn find_video_capture_device(index: u32) -> Option<String> {
+    let primary = format!("/dev/video{index}");
+    if device_supports_video_capture(&primary) {
+        return Some(primary);
+    }
+
+    let mut candidates = fs::read_dir("/dev")
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(suffix) = name.strip_prefix("video") {
+                let parsed = suffix.parse::<u32>().ok()?;
+                Some((parsed, format!("/dev/{name}")))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(idx, _)| *idx);
+
+    for (_, path) in candidates {
+        if device_supports_video_capture(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn device_supports_video_capture(path: &str) -> bool {
+    let Ok(output) = std::process::Command::new("v4l2-ctl")
+        .args(["-D", "-d", path])
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.contains("Video Capture")
 }
 
 pub fn print_help() -> Result<()> {
@@ -234,7 +445,7 @@ pub fn list_cameras_with_backend(backend: &dyn CameraBackend) -> Result<Vec<Came
 }
 
 fn list_cameras_cmd() -> Result<()> {
-    let cams = list_cameras_with_backend(&NokhwaBackend)?;
+    let cams = list_cameras_with_backend(&NativeBackend)?;
     if cams.is_empty() {
         println!("No cameras found.");
     } else {
@@ -254,7 +465,7 @@ pub async fn start_daemon(requested_camera: Option<String>, bind: SocketAddr) ->
         }
     }
 
-    let backend = NokhwaBackend;
+    let backend = NativeBackend;
     let cams = list_cameras_with_backend(&backend)?;
     let chosen = choose_camera(&cams, requested_camera.as_deref())?;
 
@@ -348,22 +559,46 @@ pub fn parse_http_response(buf: &[u8]) -> Result<Vec<u8>> {
         .map(|i| i + 4)
         .ok_or_else(|| anyhow!("invalid HTTP response"))?;
     let headers = String::from_utf8_lossy(&buf[..split]);
-    let status_ok = headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200");
-    if !status_ok {
-        let first_line = headers.lines().next().unwrap_or("HTTP error").to_string();
-        bail!(first_line);
+    let status_line = headers.lines().next().unwrap_or("HTTP error").to_string();
+    let body = &buf[split..];
+    if !(headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200")) {
+        let detailed = parse_error_response_body(body).unwrap_or_default();
+        if detailed.is_empty() {
+            bail!(status_line);
+        }
+        bail!("{status_line}: {detailed}");
     }
-    Ok(buf[split..].to_vec())
+    Ok(body.to_vec())
+}
+
+fn parse_error_response_body(body: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = json.get("error")?.as_str()?.to_string();
+    let details = json
+        .get("details")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+    if details.is_empty() {
+        Some(error)
+    } else {
+        Some(format!("{error} [{details}]"))
+    }
 }
 
 pub async fn run_daemon_from_env() -> Result<()> {
     fs::create_dir_all(runtime_dir())?;
     let bind: SocketAddr = env::var("AEYES_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:43210".to_string())
+        .unwrap_or_else(|_| DEFAULT_BIND.to_string())
         .parse()
         .context("invalid AEYES_BIND")?;
     let selected_camera = env::var("AEYES_CAMERA").context("AEYES_CAMERA missing")?;
-    run_daemon(bind, selected_camera, Box::new(NokhwaBackend)).await
+    run_daemon(bind, selected_camera, Box::new(NativeBackend)).await
 }
 
 pub async fn run_daemon(
@@ -375,10 +610,12 @@ pub async fn run_daemon(
     let cameras = backend.list_cameras()?;
     let chosen = choose_camera(&cameras, Some(&selected_camera))?;
     let latest_jpeg: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
+    let last_error: Arc<RwLock<Option<DaemonErrorState>>> = Arc::new(RwLock::new(None));
     let latest_jpeg_task = latest_jpeg.clone();
+    let last_error_task = last_error.clone();
     let chosen_id = chosen.id.clone();
     tokio::spawn(async move {
-        if let Err(err) = camera_loop(backend, chosen_id, latest_jpeg_task).await {
+        if let Err(err) = camera_loop(backend, chosen_id, latest_jpeg_task, last_error_task).await {
             warn!(?err, "camera loop exited");
         }
     });
@@ -390,6 +627,7 @@ pub async fn run_daemon(
         selected_camera: chosen.id.clone(),
         latest_jpeg,
         cameras: Arc::new(cameras),
+        last_error,
     };
     let app = Router::new()
         .route("/cams", get(list_cams_http))
@@ -406,15 +644,40 @@ async fn camera_loop(
     backend: Box<dyn CameraBackend>,
     selected_camera: String,
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
+    last_error: Arc<RwLock<Option<DaemonErrorState>>>,
 ) -> Result<()> {
-    let mut camera = backend.open(&selected_camera)?;
-    camera.set_auto_features()?;
+    let mut camera = match backend.open(&selected_camera) {
+        Ok(camera) => camera,
+        Err(err) => {
+            let state = DaemonErrorState::new("failed to open selected camera")
+                .with_detail(format!("camera id: {selected_camera}"))
+                .with_detail(format!("error: {err:#}"));
+            *last_error.write().await = Some(state);
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = camera.set_auto_features() {
+        let state = DaemonErrorState::new("failed to configure autofocus/auto-exposure")
+            .with_detail(format!("camera id: {selected_camera}"))
+            .with_detail(format!("error: {err:#}"));
+        *last_error.write().await = Some(state);
+        warn!(?err, "failed to set auto features");
+    }
+
     loop {
         match camera.capture_jpeg() {
             Ok(bytes) => {
                 *latest_jpeg.write().await = Some(bytes);
+                *last_error.write().await = None;
             }
-            Err(err) => warn!(?err, "failed to capture frame"),
+            Err(err) => {
+                let state = DaemonErrorState::new("failed to capture frame from camera")
+                    .with_detail(format!("camera id: {selected_camera}"))
+                    .with_detail(format!("error: {err:#}"));
+                *last_error.write().await = Some(state);
+                warn!(?err, "failed to capture frame");
+            }
         }
         sleep(Duration::from_millis(30)).await;
     }
@@ -434,16 +697,15 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
         id
     };
     if requested != state.selected_camera {
-        return (
+        return error_response(
             StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("camera '{requested}' is not active in this daemon"),
-            }),
-        )
-            .into_response();
+            DaemonErrorState::new(format!("camera '{requested}' is not active in this daemon"))
+                .with_detail(format!("active camera: {}", state.selected_camera))
+                .with_detail("start another daemon if you need a different active camera"),
+        );
     }
 
-    for _ in 0..50 {
+    for _ in 0..FRAME_WAIT_RETRIES {
         if let Some(bytes) = state.latest_jpeg.read().await.clone() {
             return Response::builder()
                 .status(StatusCode::OK)
@@ -451,24 +713,26 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
                 .body(Body::from(bytes))
                 .unwrap();
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(FRAME_WAIT_MS)).await;
     }
 
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            error: "camera has not produced a frame yet".to_string(),
-        }),
-    )
-        .into_response()
+    let error = state.last_error.read().await.clone().unwrap_or_else(|| {
+        DaemonErrorState::new("camera has not produced a frame yet")
+            .with_detail("no frame was available before the request timeout expired")
+            .with_detail(format!(
+                "waited approximately {} ms",
+                FRAME_WAIT_RETRIES as u64 * FRAME_WAIT_MS
+            ))
+    });
+    error_response(StatusCode::SERVICE_UNAVAILABLE, error)
 }
 
-pub fn encode_frame_as_jpeg(frame: &Buffer) -> Result<Vec<u8>> {
-    let img: RgbImage = frame.decode_image::<RgbFormat>()?;
-    let mut bytes = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
-    encoder.encode_image(&img)?;
-    Ok(bytes)
+fn error_response(status: StatusCode, error: DaemonErrorState) -> Response {
+    let body = Json(ErrorResponse {
+        error: error.message,
+        details: error.details,
+    });
+    (status, body).into_response()
 }
 
 pub fn encode_rgb_to_jpeg(width: u32, height: u32, bytes: Vec<u8>) -> Result<Vec<u8>> {
@@ -477,6 +741,36 @@ pub fn encode_rgb_to_jpeg(width: u32, height: u32, bytes: Vec<u8>) -> Result<Vec
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95);
     encoder.encode_image(&img)?;
     Ok(out)
+}
+
+pub fn yuyv_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+    let expected = (width as usize) * (height as usize) * 2;
+    if bytes.len() != expected {
+        bail!(
+            "invalid YUYV buffer length: expected {expected} bytes for {width}x{height}, got {}",
+            bytes.len()
+        );
+    }
+
+    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for chunk in bytes.chunks_exact(4) {
+        let y0 = chunk[0] as f32;
+        let u = chunk[1] as f32 - 128.0;
+        let y1 = chunk[2] as f32;
+        let v = chunk[3] as f32 - 128.0;
+        push_yuv_pixel(&mut rgb, y0, u, v);
+        push_yuv_pixel(&mut rgb, y1, u, v);
+    }
+    encode_rgb_to_jpeg(width, height, rgb)
+}
+
+fn push_yuv_pixel(rgb: &mut Vec<u8>, y: f32, u: f32, v: f32) {
+    let r = (y + 1.402 * v).round().clamp(0.0, 255.0) as u8;
+    let g = (y - 0.344_136 * u - 0.714_136 * v)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    let b = (y + 1.772 * u).round().clamp(0.0, 255.0) as u8;
+    rgb.extend_from_slice(&[r, g, b]);
 }
 
 #[cfg(test)]
@@ -488,10 +782,13 @@ mod tests {
     struct FakeBackend {
         cameras: Vec<CameraDescriptor>,
         frame: Vec<u8>,
+        fail_open: Option<String>,
+        fail_capture: Option<String>,
     }
 
     struct FakeOpenCamera {
         frame: Vec<u8>,
+        fail_capture: Option<String>,
     }
 
     impl CameraBackend for FakeBackend {
@@ -502,9 +799,13 @@ mod tests {
             Ok(self.cameras.clone())
         }
         fn open(&self, id: &str) -> Result<Box<dyn OpenCamera>> {
+            if let Some(message) = &self.fail_open {
+                bail!(message.clone());
+            }
             if self.cameras.iter().any(|c| c.id == id) {
                 Ok(Box::new(FakeOpenCamera {
                     frame: self.frame.clone(),
+                    fail_capture: self.fail_capture.clone(),
                 }))
             } else {
                 bail!("camera not found")
@@ -517,6 +818,9 @@ mod tests {
             Ok(())
         }
         fn capture_jpeg(&mut self) -> Result<Vec<u8>> {
+            if let Some(message) = &self.fail_capture {
+                bail!(message.clone());
+            }
             Ok(self.frame.clone())
         }
     }
@@ -562,16 +866,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_http_response_rejects_non_200() {
-        let err = parse_http_response(b"HTTP/1.1 404 Not Found\r\n\r\nnope")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("404"));
+    fn parse_http_response_rejects_non_200_with_details() {
+        let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\r\n{\"error\":\"failed to capture\",\"details\":[\"camera id: cam-a\",\"device busy\"]}";
+        let err = parse_http_response(response).unwrap_err().to_string();
+        assert!(err.contains("503"));
+        assert!(err.contains("failed to capture"));
+        assert!(err.contains("device busy"));
     }
 
     #[test]
     fn rgb_to_jpeg_encodes() {
         let jpeg = encode_rgb_to_jpeg(2, 1, vec![255, 0, 0, 0, 255, 0]).unwrap();
+        assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+
+    #[test]
+    fn yuyv_to_jpeg_encodes() {
+        let jpeg = yuyv_to_jpeg(2, 1, &[80, 90, 81, 240]).unwrap();
         assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
     }
 
@@ -584,6 +895,8 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
+            fail_open: None,
+            fail_capture: None,
         };
 
         let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
@@ -619,6 +932,35 @@ mod tests {
         assert_eq!(frame_resp.headers()["content-type"], "image/jpeg");
         let bytes = frame_resp.bytes().await.unwrap();
         assert!(bytes.starts_with(&[0xFF, 0xD8, 0xFF]));
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_reports_detailed_capture_errors() {
+        let bind: SocketAddr = "127.0.0.1:43220".parse().unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame: vec![],
+            fail_open: None,
+            fail_capture: Some("simulated capture failure".into()),
+        };
+
+        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        sleep(Duration::from_millis(400)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{bind}/cams/default/frame"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), ReqwestStatus::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "failed to capture frame from camera");
+        assert!(body.to_string().contains("simulated capture failure"));
 
         handle.abort();
         let _ = handle.await;
