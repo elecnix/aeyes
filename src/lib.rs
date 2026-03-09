@@ -190,8 +190,8 @@ impl V4l2OpenCamera {
         let index = id
             .parse::<u32>()
             .with_context(|| format!("camera id '{id}' is not a Linux V4L2 device index"))?;
-        let device_path = find_video_capture_device(index)
-            .unwrap_or_else(|| format!("/dev/video{index}"));
+        let device_path =
+            find_video_capture_device(index).unwrap_or_else(|| format!("/dev/video{index}"));
         let mut camera = RsCamera::new(&device_path)
             .with_context(|| format!("failed to open V4L2 device {device_path}"))?;
 
@@ -358,12 +358,10 @@ fn find_video_capture_device(index: u32) -> Option<String> {
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(idx, _)| *idx);
 
-    for (_, path) in candidates {
-        if device_supports_video_capture(&path) {
-            return Some(path);
-        }
-    }
-    None
+    candidates
+        .into_iter()
+        .map(|(_, path)| path)
+        .find(|path| device_supports_video_capture(path))
 }
 
 #[cfg(target_os = "linux")]
