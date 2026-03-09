@@ -27,3 +27,4 @@ the daemon should respond with comprehensive error messages
 the daemon should auto-start on the first frame grab request
 the daemon should auto-stop after a period of inactivity (configurable, default to 1 hour)
 GitHub actions should test linux, windows, macos on every push
+The CLI should support opening multiple streams, so the user can request from any webcam with no fuss.

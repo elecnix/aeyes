@@ -14,7 +14,7 @@ use nokhwa::{
     query,
     utils::{ApiBackend, CameraIndex},
 };
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 #[cfg(target_os = "linux")]
 use rscam::{Camera as RsCamera, Config as RsConfig};
@@ -122,9 +122,15 @@ fn list_v4l2_cameras() -> Result<Vec<CameraDescriptor>> {
                         .ok();
                     let info_text = if let Some(out) = output {
                         if out.status.success() {
-                            String::from_utf8_lossy(&out.stdout).lines()
+                            String::from_utf8_lossy(&out.stdout)
+                                .lines()
                                 .find(|l| l.contains("Card type"))
-                                .map(|l| l.split(':').nth(1).map(|s| s.trim().to_string()).unwrap_or(fname.to_string()))
+                                .map(|l| {
+                                    l.split(':')
+                                        .nth(1)
+                                        .map(|s| s.trim().to_string())
+                                        .unwrap_or(fname.to_string())
+                                })
                                 .unwrap_or(fname.to_string())
                         } else {
                             fname.to_string()
@@ -163,10 +169,15 @@ impl DaemonErrorState {
 #[derive(Clone)]
 pub struct AppState {
     selected_camera: String,
-    latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
+    streams: Arc<HashMap<String, CameraStreamState>>,
     cameras: Arc<Vec<CameraDescriptor>>,
-    last_error: Arc<RwLock<Option<DaemonErrorState>>>,
     last_activity: Arc<RwLock<Instant>>,
+}
+
+#[derive(Clone)]
+struct CameraStreamState {
+    latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
+    last_error: Arc<RwLock<Option<DaemonErrorState>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,7 +251,9 @@ struct V4l2OpenCamera {
 #[cfg(target_os = "linux")]
 impl V4l2OpenCamera {
     fn open(id: &str) -> Result<Self> {
-        let index: u32 = id.parse().with_context(|| format!("camera ID '{id}' must be numeric like '0'"))?;
+        let index: u32 = id
+            .parse()
+            .with_context(|| format!("camera ID '{id}' must be numeric like '0'"))?;
         let device_path = format!("/dev/video{index}");
         let mut camera = RsCamera::new(&device_path)
             .with_context(|| format!("failed to open V4L2 device {device_path}"))?;
@@ -376,8 +389,6 @@ impl OpenCamera for V4l2OpenCamera {
     }
 }
 
-
-
 #[cfg(target_os = "linux")]
 #[derive(Copy, Clone)]
 struct CapturePreset {
@@ -510,6 +521,16 @@ pub async fn start_daemon(requested_camera: Option<String>, bind: SocketAddr) ->
 }
 
 pub async fn stop_daemon() -> Result<()> {
+    if let Ok(addr) = daemon_addr().await {
+        let _ = http_get_bytes(addr, "/shutdown").await;
+        for _ in 0..20 {
+            if !daemon_responding(addr).await {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     if let Ok(pid_str) = fs::read_to_string(pid_path()) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             #[cfg(unix)]
@@ -552,10 +573,14 @@ pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
         _ => {
             let backend = NativeBackend;
             let cams = backend.list_cameras().context("no cameras found")?;
-            let chosen = choose_camera(&cams, camera.as_deref()).context("could not auto-select camera (specify --camera <id-or-name> if multiple)")?;
+            let chosen = choose_camera(&cams, camera.as_deref()).context(
+                "could not auto-select camera (specify --camera <id-or-name> if multiple)",
+            )?;
             let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-            let bind: SocketAddr = bind_str.parse().context("invalid AEYES_BIND env")?; 
-            start_daemon(Some(chosen.id.clone()), bind).await.context("failed to auto-start daemon")?;
+            let bind: SocketAddr = bind_str.parse().context("invalid AEYES_BIND env")?;
+            start_daemon(Some(chosen.id.clone()), bind)
+                .await
+                .context("failed to auto-start daemon")?;
             let mut retries = 100;
             let mut ready_addr = None;
             while retries > 0 {
@@ -651,27 +676,37 @@ pub async fn run_daemon(
     backend: Box<dyn CameraBackend>,
 ) -> Result<()> {
     fs::create_dir_all(runtime_dir())?;
+    let backend: Arc<dyn CameraBackend> = Arc::from(backend);
     let cameras = backend.list_cameras()?;
     let chosen = choose_camera(&cameras, Some(&selected_camera))?;
-    let latest_jpeg: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
-    let last_error: Arc<RwLock<Option<DaemonErrorState>>> = Arc::new(RwLock::new(None));
     let last_activity: Arc<RwLock<Instant>> = Arc::new(RwLock::new(Instant::now()));
-    let latest_jpeg_task = latest_jpeg.clone();
-    let last_error_task = last_error.clone();
-    let last_activity_task = last_activity.clone();
-    let chosen_id = chosen.id.clone();
-    tokio::spawn(async move {
-        if let Err(err) = camera_loop(backend, chosen_id, latest_jpeg_task, last_error_task).await {
-            warn!(?err, "camera loop exited");
-        }
-    });
+    let mut streams = HashMap::new();
+
+    for camera in &cameras {
+        let latest_jpeg: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
+        let last_error: Arc<RwLock<Option<DaemonErrorState>>> = Arc::new(RwLock::new(None));
+        let stream_state = CameraStreamState {
+            latest_jpeg: latest_jpeg.clone(),
+            last_error: last_error.clone(),
+        };
+        streams.insert(camera.id.clone(), stream_state);
+
+        let backend = backend.clone();
+        let camera_id = camera.id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = camera_loop(backend, camera_id.clone(), latest_jpeg, last_error).await
+            {
+                warn!(?err, camera = %camera_id, "camera loop exited");
+            }
+        });
+    }
 
     let idle_timeout_secs: u64 = env::var("AEYES_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3600);
     {
-        let last_activity = last_activity_task.clone();
+        let last_activity = last_activity.clone();
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(idle_timeout_secs)).await;
@@ -688,15 +723,15 @@ pub async fn run_daemon(
 
     let state = AppState {
         selected_camera: chosen.id.clone(),
-        latest_jpeg,
+        streams: Arc::new(streams),
         cameras: Arc::new(cameras),
-        last_error,
         last_activity,
     };
     let app = Router::new()
         .route("/cams", get(list_cams_http))
         .route("/cams/{id}/frame", get(frame_http))
         .route("/health", get(health_handler))
+        .route("/shutdown", get(shutdown_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -706,7 +741,7 @@ pub async fn run_daemon(
 }
 
 async fn camera_loop(
-    backend: Box<dyn CameraBackend>,
+    backend: Arc<dyn CameraBackend>,
     selected_camera: String,
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
     last_error: Arc<RwLock<Option<DaemonErrorState>>>,
@@ -763,17 +798,23 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
     } else {
         id
     };
-    if requested != state.selected_camera {
+
+    let Some(stream) = state.streams.get(&requested).cloned() else {
         return error_response(
             StatusCode::NOT_FOUND,
-            DaemonErrorState::new(format!("camera '{requested}' is not active in this daemon"))
-                .with_detail(format!("active camera: {}", state.selected_camera))
-                .with_detail("start another daemon if you need a different active camera"),
+            DaemonErrorState::new(format!(
+                "camera '{requested}' is not managed by this daemon"
+            ))
+            .with_detail(format!(
+                "available cameras: {}",
+                state.streams.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+            .with_detail("request one of the IDs returned by GET /cams"),
         );
-    }
+    };
 
     for _ in 0..FRAME_WAIT_RETRIES {
-        if let Some(bytes) = state.latest_jpeg.read().await.clone() {
+        if let Some(bytes) = stream.latest_jpeg.read().await.clone() {
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/jpeg")
@@ -783,8 +824,9 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
         sleep(Duration::from_millis(FRAME_WAIT_MS)).await;
     }
 
-    let error = state.last_error.read().await.clone().unwrap_or_else(|| {
+    let error = stream.last_error.read().await.clone().unwrap_or_else(|| {
         DaemonErrorState::new("camera has not produced a frame yet")
+            .with_detail(format!("camera id: {requested}"))
             .with_detail("no frame was available before the request timeout expired")
             .with_detail(format!(
                 "waited approximately {} ms",
@@ -797,6 +839,15 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
 async fn health_handler(State(state): State<AppState>) -> &'static str {
     *state.last_activity.write().await = Instant::now();
     "ok"
+}
+
+async fn shutdown_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    *state.last_activity.write().await = Instant::now();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(50)).await;
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "status": "stopping" }))
 }
 
 fn error_response(status: StatusCode, error: DaemonErrorState) -> Response {
@@ -927,11 +978,25 @@ mod tests {
     }
 
     fn default_state() -> AppState {
+        let mut streams = HashMap::new();
+        streams.insert(
+            "cam-a".to_string(),
+            CameraStreamState {
+                latest_jpeg: Arc::new(RwLock::new(None)),
+                last_error: Arc::new(RwLock::new(None)),
+            },
+        );
+        streams.insert(
+            "cam-b".to_string(),
+            CameraStreamState {
+                latest_jpeg: Arc::new(RwLock::new(None)),
+                last_error: Arc::new(RwLock::new(None)),
+            },
+        );
         AppState {
             selected_camera: "cam-a".to_string(),
-            latest_jpeg: Arc::new(RwLock::new(None)),
+            streams: Arc::new(streams),
             cameras: Arc::new(fake_cameras()),
-            last_error: Arc::new(RwLock::new(None)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
         }
     }
@@ -1111,15 +1176,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_cams_http() {
+        let mut streams = HashMap::new();
+        streams.insert(
+            "cam-a".to_string(),
+            CameraStreamState {
+                latest_jpeg: Arc::new(RwLock::new(None)),
+                last_error: Arc::new(RwLock::new(None)),
+            },
+        );
         let state = AppState {
             selected_camera: "cam-a".to_string(),
-            latest_jpeg: Arc::new(RwLock::new(None)),
+            streams: Arc::new(streams),
             cameras: Arc::new(vec![CameraDescriptor {
                 id: "cam-a".to_string(),
                 name: "Test Cam".to_string(),
                 backend: "test".to_string(),
             }]),
-            last_error: Arc::new(RwLock::new(None)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
         };
         let Json(response) = list_cams_http(State(state)).await;
@@ -1130,11 +1202,18 @@ mod tests {
     #[tokio::test]
     async fn test_frame_http_success_default() {
         let jpeg = vec![0xff, 0xd8, 0xff];
+        let mut streams = HashMap::new();
+        streams.insert(
+            "cam-a".to_string(),
+            CameraStreamState {
+                latest_jpeg: Arc::new(RwLock::new(Some(jpeg.clone()))),
+                last_error: Arc::new(RwLock::new(None)),
+            },
+        );
         let state = AppState {
             selected_camera: "cam-a".to_string(),
-            latest_jpeg: Arc::new(RwLock::new(Some(jpeg.clone()))),
+            streams: Arc::new(streams),
             cameras: Arc::new(vec![]),
-            last_error: Arc::new(RwLock::new(None)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
         };
         let resp = frame_http(AxumPath("default".to_string()), State(state)).await;
@@ -1148,9 +1227,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_frame_http_wrong_camera_not_found() {
+    async fn test_frame_http_other_camera_success() {
         let state = default_state();
+        {
+            let stream = state.streams.get("cam-b").unwrap();
+            *stream.latest_jpeg.write().await = Some(vec![0xff, 0xd8, 0xff]);
+        }
         let resp = frame_http(AxumPath("cam-b".to_string()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_frame_http_unknown_camera_not_found() {
+        let state = default_state();
+        let resp = frame_http(AxumPath("cam-z".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1255,6 +1345,40 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"], "failed to capture frame from camera");
         assert!(body.to_string().contains("simulated capture failure"));
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_shutdown_handler_stops_daemon() {
+        let bind: SocketAddr = "127.0.0.1:43222".parse().unwrap();
+        let frame = encode_rgb_to_jpeg(1, 1, vec![0, 0, 0]).unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame,
+            fail_open: None,
+            fail_capture: None,
+        };
+
+        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        let resp = client
+            .get(format!("http://{bind}/shutdown"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), ReqwestStatus::OK);
 
         handle.abort();
         let _ = handle.await;
