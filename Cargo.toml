@@ -6,10 +6,11 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
 image = "0.25"
-nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
+nokhwa = { version = "0.11", features = ["input-native", "output-threaded", "utils"] }
 serde = { version = "1.0", features = ["derive"] }
-socket2 = { version = "0.5", features = ["all"] }
+thiserror = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
