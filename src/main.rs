@@ -3,9 +3,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use image::RgbImage;
 use nokhwa::{
     pixel_format::RgbFormat,
-    utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+    utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
     Camera,
 };
+use nokhwa::Frame;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +32,7 @@ struct Cli {
 enum Commands {
     /// Start the daemon
     Start,
-    /// Capture image from daemon
+    /// Capture image from daemon (auto-starts if not running)
     #[command(arg_required_else_help = false)]
     Capture {
         /// Output path, default /tmp/aeyes-last.jpg
@@ -91,7 +92,7 @@ async fn start_daemon() -> Result<()> {
         .kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
-    let pid = child.id();
+    let pid = child.id().expect("child has PID");
     std::fs::write(PID_PATH, pid.to_string().as_bytes())?;
 
     info!("Daemon started with PID {}", pid);
@@ -127,7 +128,9 @@ async fn status() -> Result<()> {
 
 async fn capture(output: &Path) -> Result<()> {
     if !is_running().await {
-        anyhow::bail!("Daemon is not running. Run `aeyes start` first.");
+        info!("Daemon not running, auto-starting...");
+        start_daemon().await?;
+        sleep(Duration::from_millis(1500)).await;  // Wait for camera init
     }
 
     let mut stream = UnixStream::connect(SOCKET_PATH).await?;
@@ -157,14 +160,15 @@ async fn run_daemon() -> Result<()> {
 
     info!("Daemon running, listening on {}", SOCKET_PATH);
 
-    let latest_image: Arc<RwLock<Option<Arc<RgbImage>>>> = Arc::new(RwLock::new(None));
+    let latest_frame: Arc<RwLock<Option<Arc<Frame>>>> = Arc::new(RwLock::new(None));
 
     // Camera task
-    let camera_latest = Arc::clone(&latest_image);
+    let camera_latest: Arc<RwLock<Option<Arc<Frame>>>> = Arc::clone(&latest_frame);
     tokio::spawn(async move {
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Nearest)
-            .with_width(1280)
-            .with_height(720);
+        let resolution = Resolution::new(1280u32, 720u32);
+        let frame_format = FrameFormat::Rgb;
+        let camera_format = CameraFormat::new(resolution, frame_format, 30);
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(camera_format));
         let mut camera = match Camera::new(CameraIndex::Index(0), requested) {
             Ok(c) => c,
             Err(e) => {
@@ -180,14 +184,9 @@ async fn run_daemon() -> Result<()> {
         loop {
             match camera.frame() {
                 Ok(frame) => {
-                    match frame.decode_image::<image::Rgb<u8>>() {
-                        Ok(img) => {
-                            let arc_img = Arc::new(img);
-                            let mut latest = camera_latest.write().await;
-                            *latest = Some(arc_img);
-                        }
-                        Err(e) => warn!("Decode error: {:?}", e),
-                    }
+                    let arc_frame = Arc::new(frame);
+                    let mut latest = camera_latest.write().await;
+                    *latest = Some(arc_frame);
                 }
                 Err(e) => warn!("Frame error: {:?}", e),
             }
@@ -205,7 +204,7 @@ async fn run_daemon() -> Result<()> {
                 continue;
             }
         };
-        let latest_clone = Arc::clone(&latest_image);
+        let latest_clone: Arc<RwLock<Option<Arc<Frame>>>> = Arc::clone(&latest_frame);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let n = match stream.read(&mut buf).await {
@@ -216,12 +215,15 @@ async fn run_daemon() -> Result<()> {
             if let Some(path_str) = cmd.strip_prefix("capture ").and_then(|s| s.strip_suffix('\n')) {
                 let path = PathBuf::from(path_str.trim());
                 let guard = latest_clone.read().await;
-                if let Some(arc_img) = guard.as_ref().cloned() {
+                if let Some(arc_frame) = guard.as_ref().cloned() {
                     drop(guard);
-                    if let Err(e) = arc_img.save(&path) {
-                        let _ = stream.write_all(format!("ERROR: {}", e).as_bytes()).await;
-                    } else {
-                        let _ = stream.write_all(b"OK").await;
+                    match save_frame(&arc_frame, &path) {
+                        Ok(_) => {
+                            let _ = stream.write_all(b"OK").await;
+                        }
+                        Err(e) => {
+                            let _ = stream.write_all(format!("ERROR: {}", e).as_bytes()).await;
+                        }
                     }
                 } else {
                     let _ = stream.write_all(b"NOFRAME").await;
@@ -230,4 +232,11 @@ async fn run_daemon() -> Result<()> {
             let _ = stream.shutdown().await;
         });
     }
+}
+
+fn save_frame(frame: &Frame, path: &Path) -> Result<()> {
+    let img: RgbImage = frame.decode_image::<RgbFormat>()?;
+    img.save(path)
+        .with_context(|| format!("Failed to save to {:?}", path))?;
+    Ok(())
 }
