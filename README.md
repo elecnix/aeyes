@@ -68,6 +68,17 @@ Use `http://localhost:43210/web/default` for the daemon-selected camera.
 
 Multiple clients can view the same stream simultaneously without affecting each other.
 
+### Inspecting the Webcam
+You can view the live webcam feed directly in your browser while the daemon is running:
+
+| Camera | URL |
+|--------|-----|
+| Camera 0 | http://localhost:43210/web/0 |
+| Camera 1 | http://localhost:43210/web/1 |
+| Default camera | http://localhost:43210/web/default |
+
+Click any link above or ask me to open the browser for you.
+
 ### Status & stop
 ```bash
 aeyes status
