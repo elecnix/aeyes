@@ -7,7 +7,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use bytes;
 use clap::{CommandFactory, Parser, Subcommand};
 use image::{load_from_memory, RgbImage};
 #[cfg(not(target_os = "linux"))]
