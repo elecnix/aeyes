@@ -70,9 +70,9 @@ pub enum Commands {
         /// Camera stable ID or name. Required if more than one camera is present.
         #[arg(long)]
         camera: Option<String>,
-        /// Bind address for the daemon HTTP API
+        /// Bind address or IP for the daemon HTTP API (e.g. "0.0.0.0", "0.0.0.0:43210")
         #[arg(long, default_value = DEFAULT_BIND)]
-        bind: SocketAddr,
+        bind: String,
     },
     /// List available cameras
     Cams,
@@ -676,7 +676,21 @@ fn list_cameras_cmd() -> Result<()> {
     Ok(())
 }
 
-pub async fn start_daemon(requested_camera: Option<String>, bind: SocketAddr) -> Result<()> {
+fn parse_bind_address(input: &str) -> Result<SocketAddr> {
+    if let Ok(addr) = input.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = input.parse::<std::net::IpAddr>() {
+        let default_port: u16 = DEFAULT_BIND.rsplit(':').next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(43210);
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+    bail!("invalid bind address '{input}'; expected an IP like \"0.0.0.0\" or a full address like \"0.0.0.0:43210\"");
+}
+
+pub async fn start_daemon(requested_camera: Option<String>, bind: String) -> Result<()> {
+    let bind = parse_bind_address(&bind)?;
     fs::create_dir_all(runtime_dir())?;
     if let Ok(addr) = daemon_addr().await {
         if daemon_responding(addr).await {
@@ -765,8 +779,7 @@ pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
                 "could not auto-select camera (specify --camera <id-or-name> if multiple)",
             )?;
             let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-            let bind: SocketAddr = bind_str.parse().context("invalid AEYES_BIND env")?;
-            start_daemon(Some(chosen.id.clone()), bind)
+            start_daemon(Some(chosen.id.clone()), bind_str)
                 .await
                 .context("failed to auto-start daemon")?;
             let mut retries = 100;
@@ -815,8 +828,7 @@ pub async fn video_cmd(
                 "could not auto-select camera (specify --camera <id-or-name> if multiple)",
             )?;
             let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-            let bind: SocketAddr = bind_str.parse().context("invalid AEYES_BIND env")?;
-            start_daemon(Some(chosen.id.clone()), bind)
+            start_daemon(Some(chosen.id.clone()), bind_str)
                 .await
                 .context("failed to auto-start daemon")?;
             let mut retries = 100;
@@ -971,6 +983,7 @@ pub async fn run_daemon(
         .route("/cams/{id}/video", get(video_http))
         .route("/health", get(health_handler))
         .route("/shutdown", get(shutdown_handler))
+        .route("/", get(openapi_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -1174,82 +1187,104 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
     let img = load_from_memory(&frames[0])?;
     let width = img.width();
     let height = img.height();
+    let num_frames = frames.len() as u32;
 
-    let mut avi = Vec::new();
+    // Calculate total frame data size (each frame chunk is: 4+4 bytes header + data + optional padding)
+    let total_frame_data: u32 = frames
+        .iter()
+        .map(|f| {
+            let size = f.len() as u32;
+            let padding = size % 2; // AVI requires even-sized chunks
+            8 + size + padding // chunk header (4+4) + data + padding
+        })
+        .sum();
 
-    // Calculate sizes
-    let frame_data_size: u32 = frames.iter().map(|f| {
-        // Each frame chunk needs to be padded to even size
-        let size = f.len() as u32;
-        size + (size % 2)
-    }).sum();
-    
-    let movi_list_size = 4 + frame_data_size + (frames.len() as u32 * 16); // 'movi' + frames + headers
-    let total_file_size = 4 + 8 + 112 + 8 + movi_list_size; // RIFF + hdrl + movi (no index for simplicity)
+    // Structure sizes
+    let avih_size: u32 = 56;
+    let strh_size: u32 = 56;
+    let strf_size: u32 = 40;
+
+    // strl LIST size: 4 (identifier) + 8 + strh_size + 8 + strf_size
+    let strl_list_size: u32 = 4 + 8 + strh_size + 8 + strf_size;
+
+    // hdrl LIST size: 4 (identifier) + 8 + avih_size + 8 + strl_list_size
+    let hdrl_list_size: u32 = 4 + 8 + avih_size + 8 + strl_list_size;
+
+    // movi LIST size: 4 (identifier) + total_frame_data
+    let movi_list_size: u32 = 4 + total_frame_data;
+
+    // Total RIFF size: 4 (AVI ) + 8 + hdrl_list_size + 8 + movi_list_size
+    let riff_size: u32 = 4 + 8 + hdrl_list_size + 8 + movi_list_size;
+
+    let mut avi = Vec::with_capacity(riff_size as usize);
+    let microseconds_per_frame = 1_000_000u32 / fps;
 
     // RIFF header
     avi.extend_from_slice(b"RIFF");
-    avi.extend_from_slice(&(total_file_size).to_le_bytes());
+    avi.extend_from_slice(&riff_size.to_le_bytes());
     avi.extend_from_slice(b"AVI ");
 
     // hdrl LIST
     avi.extend_from_slice(b"LIST");
-    avi.extend_from_slice(&112u32.to_le_bytes()); // hdrl size
+    avi.extend_from_slice(&hdrl_list_size.to_le_bytes());
     avi.extend_from_slice(b"hdrl");
 
-    // avih chunk (56 bytes)
+    // avih chunk
     avi.extend_from_slice(b"avih");
-    avi.extend_from_slice(&56u32.to_le_bytes());
-    avi.extend_from_slice(&(1_000_000u32 / fps).to_le_bytes()); // microseconds per frame
-    avi.extend_from_slice(&0u32.to_le_bytes()); // max bytes per sec
-    avi.extend_from_slice(&0u32.to_le_bytes()); // padding
-    avi.extend_from_slice(&0x10u32.to_le_bytes()); // flags (AVIF_HASINDEX)
-    avi.extend_from_slice(&(frames.len() as u32).to_le_bytes()); // total frames
-    avi.extend_from_slice(&0u32.to_le_bytes()); // initial frames
-    avi.extend_from_slice(&1u32.to_le_bytes()); // number of streams
-    avi.extend_from_slice(&0u32.to_le_bytes()); // suggested buffer size
-    avi.extend_from_slice(&width.to_le_bytes()); // width
-    avi.extend_from_slice(&height.to_le_bytes()); // height
-    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    avi.extend_from_slice(&avih_size.to_le_bytes());
+    avi.extend_from_slice(&microseconds_per_frame.to_le_bytes()); // dwMicroSecPerFrame
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwMaxBytesPerSec
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwPaddingGranularity
+    avi.extend_from_slice(&0x10u32.to_le_bytes()); // dwFlags (AVIF_HASINDEX)
+    avi.extend_from_slice(&num_frames.to_le_bytes()); // dwTotalFrames
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwInitialFrames
+    avi.extend_from_slice(&1u32.to_le_bytes()); // dwStreams
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwSuggestedBufferSize
+    avi.extend_from_slice(&width.to_le_bytes()); // dwWidth
+    avi.extend_from_slice(&height.to_le_bytes()); // dwHeight
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwReserved[0]
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwReserved[1]
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwReserved[2]
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwReserved[3]
 
     // strl LIST
     avi.extend_from_slice(b"LIST");
-    avi.extend_from_slice(&52u32.to_le_bytes()); // strl size
+    avi.extend_from_slice(&strl_list_size.to_le_bytes());
     avi.extend_from_slice(b"strl");
 
-    // strh chunk (48 bytes for video stream)
+    // strh chunk (AVISTREAMHEADER)
     avi.extend_from_slice(b"strh");
-    avi.extend_from_slice(&48u32.to_le_bytes());
-    avi.extend_from_slice(b"vids"); // stream type: video
-    avi.extend_from_slice(b"MJPG"); // codec
-    avi.extend_from_slice(&0u32.to_le_bytes()); // flags
-    avi.extend_from_slice(&0u16.to_le_bytes()); // priority
-    avi.extend_from_slice(&0u16.to_le_bytes()); // language
-    avi.extend_from_slice(&0u32.to_le_bytes()); // initial frames
-    avi.extend_from_slice(&1u32.to_le_bytes()); // scale
-    avi.extend_from_slice(&fps.to_le_bytes()); // rate (fps)
-    avi.extend_from_slice(&0u32.to_le_bytes()); // start
-    avi.extend_from_slice(&(frames.len() as u32).to_le_bytes()); // length (total frames)
-    avi.extend_from_slice(&frame_data_size.to_le_bytes()); // suggested buffer size
-    avi.extend_from_slice(&10000u32.to_le_bytes()); // quality
-    avi.extend_from_slice(&0u32.to_le_bytes()); // sample size
-    avi.extend_from_slice(&0u16.to_le_bytes()); // left
-    avi.extend_from_slice(&0u16.to_le_bytes()); // top
-    avi.extend_from_slice(&(width as u16).to_le_bytes()); // right (width)
-    avi.extend_from_slice(&(height as u16).to_le_bytes()); // bottom (height)
+    avi.extend_from_slice(&strh_size.to_le_bytes());
+    avi.extend_from_slice(b"vids"); // fccType (video stream)
+    avi.extend_from_slice(b"MJPG"); // fccHandler
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwFlags
+    avi.extend_from_slice(&0u16.to_le_bytes()); // wPriority
+    avi.extend_from_slice(&0u16.to_le_bytes()); // wLanguage
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwInitialFrames
+    avi.extend_from_slice(&1u32.to_le_bytes()); // dwScale
+    avi.extend_from_slice(&fps.to_le_bytes()); // dwRate
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwStart
+    avi.extend_from_slice(&num_frames.to_le_bytes()); // dwLength
+    avi.extend_from_slice(&total_frame_data.to_le_bytes()); // dwSuggestedBufferSize
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwQuality
+    avi.extend_from_slice(&0u32.to_le_bytes()); // dwSampleSize
+    avi.extend_from_slice(&0u32.to_le_bytes()); // rcFrame (left, top)
+    avi.extend_from_slice(&(width as u16).to_le_bytes()); // rcFrame (right)
+    avi.extend_from_slice(&(height as u16).to_le_bytes()); // rcFrame (bottom)
 
-    // strf chunk (bitmap info header for MJPEG)
+    // strf chunk (BITMAPINFOHEADER)
     avi.extend_from_slice(b"strf");
-    avi.extend_from_slice(&40u32.to_le_bytes()); // strf size
-    avi.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    avi.extend_from_slice(&strf_size.to_le_bytes());
+    avi.extend_from_slice(&strf_size.to_le_bytes()); // biSize
     avi.extend_from_slice(&width.to_le_bytes()); // biWidth
     avi.extend_from_slice(&height.to_le_bytes()); // biHeight
     avi.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
     avi.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
-    avi.extend_from_slice(b"MJPG"); // biCompression
+    avi.extend_from_slice(&0u32.to_le_bytes()); // biCompression (0 = BI_RGB, but MJPEG uses FCC)
+    // Actually for MJPEG we need the FCC code
+    // Let's use the bytes 'MJPG' as the compression type
+    avi.truncate(avi.len() - 4); // remove the 0 we just wrote
+    avi.extend_from_slice(b"MJPG"); // biCompression = MJPG FCC
     avi.extend_from_slice(&((width * height * 3) as u32).to_le_bytes()); // biSizeImage
     avi.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
     avi.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
@@ -1261,13 +1296,14 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
     avi.extend_from_slice(&movi_list_size.to_le_bytes());
     avi.extend_from_slice(b"movi");
 
-    // Frame data
+    // Frame data chunks
     for frame in frames {
-        avi.extend_from_slice(b"00db"); // stream 0, uncompressed DIB
-        avi.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        avi.extend_from_slice(b"00db"); // Stream 0, DIB frame
+        let size = frame.len() as u32;
+        avi.extend_from_slice(&size.to_le_bytes());
         avi.extend_from_slice(frame);
         // Pad to even boundary
-        if frame.len() % 2 != 0 {
+        if size % 2 != 0 {
             avi.push(0);
         }
     }
@@ -1287,6 +1323,203 @@ async fn shutdown_handler(State(state): State<AppState>) -> Json<serde_json::Val
         std::process::exit(0);
     });
     Json(serde_json::json!({ "status": "stopping" }))
+}
+
+async fn openapi_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "aeyes",
+            "description": "AI Eyes – non-interactive webcam daemon",
+            "version": "0.1.0"
+        },
+        "paths": {
+            "/cams": {
+                "get": {
+                    "summary": "List cameras",
+                    "operationId": "listCams",
+                    "responses": {
+                        "200": {
+                            "description": "Available cameras",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/CamerasResponse"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/cams/{id}/frame": {
+                "get": {
+                    "summary": "Capture a JPEG frame",
+                    "operationId": "captureFrame",
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "description": "Camera ID or \"default\" for the selected camera",
+                            "schema": { "type": "string" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "JPEG image",
+                            "content": {
+                                "image/jpeg": {
+                                    "schema": { "type": "string", "format": "binary" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Camera not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "503": {
+                            "description": "Frame unavailable",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/cams/{id}/video": {
+                "get": {
+                    "summary": "Capture an AVI MJPEG video clip",
+                    "operationId": "captureVideo",
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "description": "Camera ID or \"default\" for the selected camera",
+                            "schema": { "type": "string" }
+                        },
+                        {
+                            "name": "max_length",
+                            "in": "query",
+                            "description": "Maximum video length in seconds (0.1–60, default 5.0)",
+                            "schema": { "type": "number", "default": 5.0 }
+                        },
+                        {
+                            "name": "fps",
+                            "in": "query",
+                            "description": "Frames per second (1–60, default 15)",
+                            "schema": { "type": "integer", "default": 15 }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "AVI video",
+                            "content": {
+                                "video/x-msvideo": {
+                                    "schema": { "type": "string", "format": "binary" }
+                                }
+                            }
+                        },
+                        "404": {
+                            "description": "Camera not found",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        },
+                        "503": {
+                            "description": "Frame unavailable",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/health": {
+                "get": {
+                    "summary": "Health check",
+                    "operationId": "health",
+                    "responses": {
+                        "200": {
+                            "description": "Daemon is healthy",
+                            "content": {
+                                "text/plain": {
+                                    "schema": { "type": "string", "example": "ok" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/shutdown": {
+                "get": {
+                    "summary": "Stop the daemon",
+                    "operationId": "shutdown",
+                    "responses": {
+                        "200": {
+                            "description": "Daemon is stopping",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": { "type": "string", "example": "stopping" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "CameraDescriptor": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "backend": { "type": "string" }
+                    },
+                    "required": ["id", "name", "backend"]
+                },
+                "CamerasResponse": {
+                    "type": "object",
+                    "properties": {
+                        "selected_camera": { "type": "string" },
+                        "cameras": {
+                            "type": "array",
+                            "items": { "$ref": "#/components/schemas/CameraDescriptor" }
+                        }
+                    },
+                    "required": ["selected_camera", "cameras"]
+                },
+                "ErrorResponse": {
+                    "type": "object",
+                    "properties": {
+                        "error": { "type": "string" },
+                        "details": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["error", "details"]
+                }
+            }
+        }
+    }))
 }
 
 fn error_response(status: StatusCode, error: DaemonErrorState) -> Response {
