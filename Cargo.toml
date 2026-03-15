@@ -2,6 +2,11 @@
 name = "aeyes"
 version = "0.1.0"
 edition = "2021"
+description = "Non-interactive webcam daemon for instant frame and video capture with live streaming"
+license = "MIT"
+repository = "https://github.com/elecnix/aeyes"
+keywords = ["webcam", "camera", "video", "streaming", "daemon"]
+categories = ["command-line-utilities", "multimedia::video"]
 
 [dependencies]
 anyhow = "1.0"
