@@ -45,10 +45,15 @@ const DEFAULT_VIDEO_MAX_LENGTH_SECS: f64 = 5.0;
 const DEFAULT_VIDEO_FPS: u32 = 15;
 const FRAME_WAIT_RETRIES: usize = 50;
 const FRAME_WAIT_MS: u64 = 100;
+#[cfg(target_os = "linux")]
 const EXPOSURE_SAMPLE_INTERVAL: u32 = 8;
+#[cfg(target_os = "linux")]
 const EXPOSURE_SETTLE_FRAMES: u32 = 6;
+#[cfg(target_os = "linux")]
 const EXPOSURE_WARMUP_FRAMES: u32 = 8;
+#[cfg(target_os = "linux")]
 const HIGHLIGHT_CLIP_LUMA: u8 = 250;
+#[cfg(target_os = "linux")]
 const SHADOW_LUMA_THRESHOLD: u8 = 40;
 
 #[derive(Parser, Debug)]
@@ -130,6 +135,7 @@ pub struct DaemonErrorState {
     details: Vec<String>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 struct FrameLumaStats {
     average_luma: f32,
@@ -273,6 +279,7 @@ impl CameraBackend for NativeBackend {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = id;
             bail!("native frame capture backend is not implemented for this OS yet")
         }
     }
@@ -1539,6 +1546,7 @@ pub fn encode_rgb_to_jpeg(width: u32, height: u32, bytes: Vec<u8>) -> Result<Vec
     Ok(out)
 }
 
+#[cfg(target_os = "linux")]
 fn analyze_rgb_frame(bytes: &[u8]) -> FrameLumaStats {
     let mut histogram = [0u32; 256];
     let mut samples = 0u64;
@@ -1642,6 +1650,7 @@ fn analyze_yuyv_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn recommend_exposure_value(
     minimum: i32,
     maximum: i32,
@@ -1689,6 +1698,7 @@ fn recommend_exposure_value(
     None
 }
 
+#[cfg(target_os = "linux")]
 fn quantize_exposure_value(minimum: i32, maximum: i32, step: i32, value: i32) -> i32 {
     let step = step.max(1);
     let clamped = value.clamp(minimum, maximum);
@@ -1938,6 +1948,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_analyze_rgb_frame_detects_bright_highlights() {
         let stats = analyze_rgb_frame(&[
             255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 20, 20, 20, 20, 20, 20, 20,
@@ -1948,6 +1959,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_recommend_exposure_value_reduces_blown_highlights() {
         let next = recommend_exposure_value(
             2,
@@ -1966,6 +1978,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_recommend_exposure_value_increases_dark_scene() {
         let next = recommend_exposure_value(
             2,
@@ -1984,6 +1997,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_recommend_exposure_value_keeps_balanced_frame() {
         let next = recommend_exposure_value(
             2,
