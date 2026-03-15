@@ -39,6 +39,7 @@ use tokio::{
 use tracing::{info, warn, Level};
 
 const DEFAULT_BIND: &str = "127.0.0.1:43210";
+const DEFAULT_PORT: u16 = 43210;
 const DEFAULT_OUTPUT: &str = "aeyes-frame.jpg";
 const FRAME_WAIT_RETRIES: usize = 50;
 const FRAME_WAIT_MS: u64 = 100;
@@ -67,9 +68,9 @@ pub enum Commands {
         /// Camera stable ID or name. Required if more than one camera is present.
         #[arg(long)]
         camera: Option<String>,
-        /// Bind address for the daemon HTTP API
+        /// Bind address for the daemon HTTP API (host:port or just host)
         #[arg(long, default_value = DEFAULT_BIND)]
-        bind: SocketAddr,
+        bind: String,
         /// Allowed remote IP prefixes (repeatable). Empty = allow all.
         #[arg(long)]
         allow_hosts: Vec<String>,
@@ -583,6 +584,18 @@ fn device_supports_video_capture(path: &str) -> bool {
     stdout.contains("Video Capture")
 }
 
+pub fn parse_bind_addr(s: &str) -> Result<SocketAddr> {
+    // Try parsing as full socket address first
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    // Try parsing as IP only, add default port
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, DEFAULT_PORT));
+    }
+    bail!("invalid bind address '{s}'; use HOST:PORT or just HOST (defaults to port {DEFAULT_PORT})")
+}
+
 pub fn print_help() -> Result<()> {
     Cli::command().print_help()?;
     println!();
@@ -597,7 +610,10 @@ pub async fn run_cli() -> Result<()> {
             camera,
             bind,
             allow_hosts,
-        }) => start_daemon(camera, bind, allow_hosts).await,
+        }) => {
+            let addr = parse_bind_addr(&bind)?;
+            start_daemon(camera, addr, allow_hosts).await
+        }
         Some(Commands::Cams) => list_cameras_cmd(),
         Some(Commands::Frame { camera, output }) => frame_cmd(camera, &output).await,
         Some(Commands::Stop) => stop_daemon().await,
@@ -1660,6 +1676,35 @@ mod tests {
     #[test]
     fn test_print_help_works() {
         print_help().unwrap();
+    }
+
+    #[test]
+    fn test_parse_bind_addr_full_address() {
+        let addr = parse_bind_addr("0.0.0.0:8080").unwrap();
+        assert_eq!(addr, "0.0.0.0:8080".parse().unwrap());
+    }
+
+    #[test]
+    fn test_parse_bind_addr_ip_only_uses_default_port() {
+        let addr = parse_bind_addr("0.0.0.0").unwrap();
+        assert_eq!(addr, "0.0.0.0:43210".parse().unwrap());
+    }
+
+    #[test]
+    fn test_parse_bind_addr_ipv6() {
+        let addr = parse_bind_addr("[::1]:8080").unwrap();
+        assert_eq!(addr, "[::1]:8080".parse().unwrap());
+    }
+
+    #[test]
+    fn test_parse_bind_addr_ipv6_only_uses_default_port() {
+        let addr = parse_bind_addr("::1").unwrap();
+        assert_eq!(addr, "[::1]:43210".parse().unwrap());
+    }
+
+    #[test]
+    fn test_parse_bind_addr_invalid() {
+        assert!(parse_bind_addr("not-an-address").is_err());
     }
 
     #[test]
