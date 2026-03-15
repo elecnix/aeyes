@@ -1304,7 +1304,7 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
         avi.extend_from_slice(&size.to_le_bytes());
         avi.extend_from_slice(frame);
         // Pad to even boundary
-        if size % 2 != 0 {
+        if !size.is_multiple_of(2) {
             avi.push(0);
         }
     }
