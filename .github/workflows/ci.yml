@@ -25,7 +25,6 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Coverage
         if: runner.os == 'Linux'
-        uses: actions-rs/tarpaulin@v0.1
-        with:
-          version: '0.27.0'
-          args: '--lib --ignore-tests --skip-clean --no-fail-fast'
+        run: |
+          cargo install cargo-tarpaulin
+          cargo tarpaulin --lib --ignore-tests --skip-clean --no-fail-fast --out xml
