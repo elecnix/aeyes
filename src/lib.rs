@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -40,6 +40,9 @@ use tracing::{info, warn, Level};
 
 const DEFAULT_BIND: &str = "127.0.0.1:43210";
 const DEFAULT_OUTPUT: &str = "aeyes-frame.jpg";
+const DEFAULT_VIDEO_OUTPUT: &str = "aeyes-video.avi";
+const DEFAULT_VIDEO_MAX_LENGTH_SECS: f64 = 5.0;
+const DEFAULT_VIDEO_FPS: u32 = 15;
 const FRAME_WAIT_RETRIES: usize = 50;
 const FRAME_WAIT_MS: u64 = 100;
 const EXPOSURE_SAMPLE_INTERVAL: u32 = 8;
@@ -81,6 +84,21 @@ pub enum Commands {
         /// Output file path
         #[arg(short, long, default_value = DEFAULT_OUTPUT)]
         output: PathBuf,
+    },
+    /// Capture a video clip through the daemon HTTP API
+    Video {
+        /// Camera stable ID or name; defaults to the daemon-selected camera.
+        #[arg(long)]
+        camera: Option<String>,
+        /// Output file path (AVI MJPEG format)
+        #[arg(short, long, default_value = DEFAULT_VIDEO_OUTPUT)]
+        output: PathBuf,
+        /// Maximum video length in seconds
+        #[arg(long, default_value_t = DEFAULT_VIDEO_MAX_LENGTH_SECS)]
+        max_length: f64,
+        /// Frames per second
+        #[arg(long, default_value_t = DEFAULT_VIDEO_FPS)]
+        fps: u32,
     },
     /// Stop the daemon
     Stop,
@@ -590,6 +608,12 @@ pub async fn run_cli() -> Result<()> {
         Some(Commands::Start { camera, bind }) => start_daemon(camera, bind).await,
         Some(Commands::Cams) => list_cameras_cmd(),
         Some(Commands::Frame { camera, output }) => frame_cmd(camera, &output).await,
+        Some(Commands::Video {
+            camera,
+            output,
+            max_length,
+            fps,
+        }) => video_cmd(camera, &output, max_length, fps).await,
         Some(Commands::Stop) => stop_daemon().await,
         Some(Commands::Status) => status_cmd().await,
         None => print_help(),
@@ -776,6 +800,56 @@ pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
     Ok(())
 }
 
+pub async fn video_cmd(
+    camera: Option<String>,
+    output: &Path,
+    max_length: f64,
+    fps: u32,
+) -> Result<()> {
+    let addr = match daemon_addr().await {
+        Ok(addr) if daemon_responding(addr).await => addr,
+        _ => {
+            let backend = NativeBackend;
+            let cams = backend.list_cameras().context("no cameras found")?;
+            let chosen = choose_camera(&cams, camera.as_deref()).context(
+                "could not auto-select camera (specify --camera <id-or-name> if multiple)",
+            )?;
+            let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+            let bind: SocketAddr = bind_str.parse().context("invalid AEYES_BIND env")?;
+            start_daemon(Some(chosen.id.clone()), bind)
+                .await
+                .context("failed to auto-start daemon")?;
+            let mut retries = 100;
+            let mut ready_addr = None;
+            while retries > 0 {
+                match daemon_addr().await {
+                    Ok(addr) if daemon_responding(addr).await => {
+                        ready_addr = Some(addr);
+                        break;
+                    }
+                    _ => {
+                        sleep(Duration::from_millis(100)).await;
+                        retries -= 1;
+                    }
+                }
+            }
+            ready_addr.context("daemon failed to become ready")?
+        }
+    };
+    let path = if let Some(cam) = &camera {
+        format!("/cams/{}/video?max_length={}&fps={}", cam, max_length, fps)
+    } else {
+        format!("/cams/default/video?max_length={}&fps={}", max_length, fps)
+    };
+    let bytes = http_get_bytes(addr, &path).await?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output, bytes)?;
+    println!("Saved video to {}", output.display());
+    Ok(())
+}
+
 async fn http_get_bytes(addr: SocketAddr, path: &str) -> Result<Vec<u8>> {
     let mut stream = TcpStream::connect(addr).await?;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
@@ -894,6 +968,7 @@ pub async fn run_daemon(
     let app = Router::new()
         .route("/cams", get(list_cams_http))
         .route("/cams/{id}/frame", get(frame_http))
+        .route("/cams/{id}/video", get(video_http))
         .route("/health", get(health_handler))
         .route("/shutdown", get(shutdown_handler))
         .with_state(state);
@@ -998,6 +1073,206 @@ async fn frame_http(AxumPath(id): AxumPath<String>, State(state): State<AppState
             ))
     });
     error_response(StatusCode::SERVICE_UNAVAILABLE, error)
+}
+
+async fn video_http(
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Response {
+    *state.last_activity.write().await = Instant::now();
+    let requested = if id == "default" {
+        state.selected_camera.clone()
+    } else {
+        id
+    };
+
+    let max_length: f64 = params
+        .get("max_length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_VIDEO_MAX_LENGTH_SECS)
+        .clamp(0.1, 60.0);
+    let fps: u32 = params
+        .get("fps")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_VIDEO_FPS)
+        .clamp(1, 60);
+
+    let Some(stream) = state.streams.get(&requested).cloned() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            DaemonErrorState::new(format!(
+                "camera '{requested}' is not managed by this daemon"
+            ))
+            .with_detail(format!(
+                "available cameras: {}",
+                state.streams.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+            .with_detail("request one of the IDs returned by GET /cams"),
+        );
+    };
+
+    let frame_count = (max_length * fps as f64).ceil() as usize;
+    let frame_interval = Duration::from_millis(1000 / fps as u64);
+    let mut frames = Vec::with_capacity(frame_count);
+    let start_time = Instant::now();
+
+    // Wait for first frame
+    for _ in 0..FRAME_WAIT_RETRIES {
+        if let Some(bytes) = stream.latest_jpeg.read().await.clone() {
+            frames.push(bytes);
+            break;
+        }
+        sleep(Duration::from_millis(FRAME_WAIT_MS)).await;
+    }
+
+    if frames.is_empty() {
+        let error = stream.last_error.read().await.clone().unwrap_or_else(|| {
+            DaemonErrorState::new("camera has not produced a frame yet")
+                .with_detail(format!("camera id: {requested}"))
+                .with_detail("no frame was available before video capture started")
+        });
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, error);
+    }
+
+    // Capture remaining frames
+    for _ in 1..frame_count {
+        let elapsed = start_time.elapsed();
+        if elapsed >= Duration::from_secs_f64(max_length) {
+            break;
+        }
+
+        sleep(frame_interval).await;
+
+        if let Some(bytes) = stream.latest_jpeg.read().await.clone() {
+            frames.push(bytes);
+        }
+    }
+
+    // Generate AVI MJPEG video
+    match create_avi_mjpeg(&frames, fps) {
+        Ok(avi_data) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "video/x-msvideo")
+            .body(Body::from(avi_data))
+            .unwrap(),
+        Err(err) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            DaemonErrorState::new("failed to create video")
+                .with_detail(format!("error: {err:#}")),
+        ),
+    }
+}
+
+/// Create an AVI MJPEG video from a sequence of JPEG frames
+pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        bail!("no frames to encode");
+    }
+
+    // Get dimensions from first frame
+    let img = load_from_memory(&frames[0])?;
+    let width = img.width();
+    let height = img.height();
+
+    let mut avi = Vec::new();
+
+    // Calculate sizes
+    let frame_data_size: u32 = frames.iter().map(|f| {
+        // Each frame chunk needs to be padded to even size
+        let size = f.len() as u32;
+        size + (size % 2)
+    }).sum();
+    
+    let movi_list_size = 4 + frame_data_size + (frames.len() as u32 * 16); // 'movi' + frames + headers
+    let total_file_size = 4 + 8 + 112 + 8 + movi_list_size; // RIFF + hdrl + movi (no index for simplicity)
+
+    // RIFF header
+    avi.extend_from_slice(b"RIFF");
+    avi.extend_from_slice(&(total_file_size).to_le_bytes());
+    avi.extend_from_slice(b"AVI ");
+
+    // hdrl LIST
+    avi.extend_from_slice(b"LIST");
+    avi.extend_from_slice(&112u32.to_le_bytes()); // hdrl size
+    avi.extend_from_slice(b"hdrl");
+
+    // avih chunk (56 bytes)
+    avi.extend_from_slice(b"avih");
+    avi.extend_from_slice(&56u32.to_le_bytes());
+    avi.extend_from_slice(&(1_000_000u32 / fps).to_le_bytes()); // microseconds per frame
+    avi.extend_from_slice(&0u32.to_le_bytes()); // max bytes per sec
+    avi.extend_from_slice(&0u32.to_le_bytes()); // padding
+    avi.extend_from_slice(&0x10u32.to_le_bytes()); // flags (AVIF_HASINDEX)
+    avi.extend_from_slice(&(frames.len() as u32).to_le_bytes()); // total frames
+    avi.extend_from_slice(&0u32.to_le_bytes()); // initial frames
+    avi.extend_from_slice(&1u32.to_le_bytes()); // number of streams
+    avi.extend_from_slice(&0u32.to_le_bytes()); // suggested buffer size
+    avi.extend_from_slice(&width.to_le_bytes()); // width
+    avi.extend_from_slice(&height.to_le_bytes()); // height
+    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    avi.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+    // strl LIST
+    avi.extend_from_slice(b"LIST");
+    avi.extend_from_slice(&52u32.to_le_bytes()); // strl size
+    avi.extend_from_slice(b"strl");
+
+    // strh chunk (48 bytes for video stream)
+    avi.extend_from_slice(b"strh");
+    avi.extend_from_slice(&48u32.to_le_bytes());
+    avi.extend_from_slice(b"vids"); // stream type: video
+    avi.extend_from_slice(b"MJPG"); // codec
+    avi.extend_from_slice(&0u32.to_le_bytes()); // flags
+    avi.extend_from_slice(&0u16.to_le_bytes()); // priority
+    avi.extend_from_slice(&0u16.to_le_bytes()); // language
+    avi.extend_from_slice(&0u32.to_le_bytes()); // initial frames
+    avi.extend_from_slice(&1u32.to_le_bytes()); // scale
+    avi.extend_from_slice(&fps.to_le_bytes()); // rate (fps)
+    avi.extend_from_slice(&0u32.to_le_bytes()); // start
+    avi.extend_from_slice(&(frames.len() as u32).to_le_bytes()); // length (total frames)
+    avi.extend_from_slice(&frame_data_size.to_le_bytes()); // suggested buffer size
+    avi.extend_from_slice(&10000u32.to_le_bytes()); // quality
+    avi.extend_from_slice(&0u32.to_le_bytes()); // sample size
+    avi.extend_from_slice(&0u16.to_le_bytes()); // left
+    avi.extend_from_slice(&0u16.to_le_bytes()); // top
+    avi.extend_from_slice(&(width as u16).to_le_bytes()); // right (width)
+    avi.extend_from_slice(&(height as u16).to_le_bytes()); // bottom (height)
+
+    // strf chunk (bitmap info header for MJPEG)
+    avi.extend_from_slice(b"strf");
+    avi.extend_from_slice(&40u32.to_le_bytes()); // strf size
+    avi.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    avi.extend_from_slice(&width.to_le_bytes()); // biWidth
+    avi.extend_from_slice(&height.to_le_bytes()); // biHeight
+    avi.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    avi.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
+    avi.extend_from_slice(b"MJPG"); // biCompression
+    avi.extend_from_slice(&((width * height * 3) as u32).to_le_bytes()); // biSizeImage
+    avi.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
+    avi.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
+    avi.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    avi.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+
+    // movi LIST
+    avi.extend_from_slice(b"LIST");
+    avi.extend_from_slice(&movi_list_size.to_le_bytes());
+    avi.extend_from_slice(b"movi");
+
+    // Frame data
+    for frame in frames {
+        avi.extend_from_slice(b"00db"); // stream 0, uncompressed DIB
+        avi.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        avi.extend_from_slice(frame);
+        // Pad to even boundary
+        if frame.len() % 2 != 0 {
+            avi.push(0);
+        }
+    }
+
+    Ok(avi)
 }
 
 async fn health_handler(State(state): State<AppState>) -> &'static str {
@@ -1763,6 +2038,182 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), ReqwestStatus::OK);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn test_create_avi_mjpeg_basic() {
+        let frame = encode_rgb_to_jpeg(4, 4, vec![255; 48]).unwrap();
+        let frames = vec![frame.clone(), frame];
+        let avi = create_avi_mjpeg(&frames, 15).unwrap();
+
+        // Check RIFF header
+        assert!(avi.starts_with(b"RIFF"));
+        // Check AVI signature at offset 8
+        assert_eq!(&avi[8..12], b"AVI ");
+        // Check for hdrl list
+        assert!(avi.windows(4).any(|w| w == b"hdrl"));
+        // Check for movi list
+        assert!(avi.windows(4).any(|w| w == b"movi"));
+        // Check for MJPG codec
+        assert!(avi.windows(4).any(|w| w == b"MJPG"));
+    }
+
+    #[test]
+    fn test_create_avi_mjpeg_empty_frames() {
+        let err = create_avi_mjpeg(&[], 15).unwrap_err().to_string();
+        assert!(err.contains("no frames"));
+    }
+
+    #[test]
+    fn test_create_avi_mjpeg_single_frame() {
+        let frame = encode_rgb_to_jpeg(2, 2, vec![0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 0]).unwrap();
+        let avi = create_avi_mjpeg(&[frame], 30).unwrap();
+        assert!(avi.starts_with(b"RIFF"));
+        assert_eq!(&avi[8..12], b"AVI ");
+    }
+
+    #[tokio::test]
+    async fn test_video_http_unknown_camera() {
+        let state = default_state();
+        let params = std::collections::HashMap::new();
+        let resp = video_http(
+            AxumPath("cam-z".to_string()),
+            Query(params),
+            State(state),
+        ).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_daemon_serves_video_with_fake_backend() {
+        let bind: SocketAddr = "127.0.0.1:43223".parse().unwrap();
+        let frame =
+            encode_rgb_to_jpeg(4, 4, vec![128; 48]).unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame,
+            fail_open: None,
+            fail_capture: None,
+        };
+
+        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    ready = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "daemon did not become ready in time");
+
+        // Request a short video (0.2 seconds at 10 fps = 2 frames)
+        let video_resp = client
+            .get(format!("http://{bind}/cams/default/video?max_length=0.2&fps=10"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(video_resp.status(), ReqwestStatus::OK);
+        assert_eq!(video_resp.headers()["content-type"], "video/x-msvideo");
+
+        let bytes = video_resp.bytes().await.unwrap();
+        // Verify it's a valid AVI file
+        assert!(bytes.starts_with(b"RIFF"));
+        assert_eq!(&bytes[8..12], b"AVI ");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_daemon_serves_video_default_params() {
+        let bind: SocketAddr = "127.0.0.1:43226".parse().unwrap();
+        let frame =
+            encode_rgb_to_jpeg(2, 2, vec![100; 12]).unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame,
+            fail_open: None,
+            fail_capture: None,
+        };
+
+        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    ready = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "daemon did not become ready in time");
+
+        // Request video with default params (using a short max_length for test speed)
+        let video_resp = client
+            .get(format!("http://{bind}/cams/default/video?max_length=0.1&fps=5"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(video_resp.status(), ReqwestStatus::OK);
+        assert_eq!(video_resp.headers()["content-type"], "video/x-msvideo");
+
+        let bytes = video_resp.bytes().await.unwrap();
+        assert!(bytes.len() > 100, "video should have content");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_video_command_camera_not_found() {
+        let bind: SocketAddr = "127.0.0.1:43227".parse().unwrap();
+        let frame =
+            encode_rgb_to_jpeg(2, 2, vec![0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 0]).unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame,
+            fail_open: None,
+            fail_capture: None,
+        };
+
+        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    ready = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "daemon did not become ready in time");
+
+        // Request video for non-existent camera
+        let video_resp = client
+            .get(format!("http://{bind}/cams/nonexistent/video?max_length=0.1&fps=5"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(video_resp.status(), ReqwestStatus::NOT_FOUND);
+        let body: serde_json::Value = video_resp.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("not managed"));
 
         handle.abort();
         let _ = handle.await;
