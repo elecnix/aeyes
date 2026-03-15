@@ -681,7 +681,9 @@ fn parse_bind_address(input: &str) -> Result<SocketAddr> {
         return Ok(addr);
     }
     if let Ok(ip) = input.parse::<std::net::IpAddr>() {
-        let default_port: u16 = DEFAULT_BIND.rsplit(':').next()
+        let default_port: u16 = DEFAULT_BIND
+            .rsplit(':')
+            .next()
             .and_then(|p| p.parse().ok())
             .unwrap_or(43210);
         return Ok(SocketAddr::new(ip, default_port));
@@ -1171,8 +1173,7 @@ async fn video_http(
             .unwrap(),
         Err(err) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            DaemonErrorState::new("failed to create video")
-                .with_detail(format!("error: {err:#}")),
+            DaemonErrorState::new("failed to create video").with_detail(format!("error: {err:#}")),
         ),
     }
 }
@@ -1281,8 +1282,8 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
     avi.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
     avi.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
     avi.extend_from_slice(&0u32.to_le_bytes()); // biCompression (0 = BI_RGB, but MJPEG uses FCC)
-    // Actually for MJPEG we need the FCC code
-    // Let's use the bytes 'MJPG' as the compression type
+                                                // Actually for MJPEG we need the FCC code
+                                                // Let's use the bytes 'MJPG' as the compression type
     avi.truncate(avi.len() - 4); // remove the 0 we just wrote
     avi.extend_from_slice(b"MJPG"); // biCompression = MJPG FCC
     avi.extend_from_slice(&((width * height * 3) as u32).to_le_bytes()); // biSizeImage
@@ -2302,7 +2303,8 @@ mod tests {
 
     #[test]
     fn test_create_avi_mjpeg_single_frame() {
-        let frame = encode_rgb_to_jpeg(2, 2, vec![0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 0]).unwrap();
+        let frame =
+            encode_rgb_to_jpeg(2, 2, vec![0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 255, 0]).unwrap();
         let avi = create_avi_mjpeg(&[frame], 30).unwrap();
         assert!(avi.starts_with(b"RIFF"));
         assert_eq!(&avi[8..12], b"AVI ");
@@ -2312,11 +2314,7 @@ mod tests {
     async fn test_video_http_unknown_camera() {
         let state = default_state();
         let params = std::collections::HashMap::new();
-        let resp = video_http(
-            AxumPath("cam-z".to_string()),
-            Query(params),
-            State(state),
-        ).await;
+        let resp = video_http(AxumPath("cam-z".to_string()), Query(params), State(state)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2324,8 +2322,7 @@ mod tests {
     #[serial]
     async fn test_daemon_serves_video_with_fake_backend() {
         let bind: SocketAddr = "127.0.0.1:43223".parse().unwrap();
-        let frame =
-            encode_rgb_to_jpeg(4, 4, vec![128; 48]).unwrap();
+        let frame = encode_rgb_to_jpeg(4, 4, vec![128; 48]).unwrap();
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
@@ -2350,7 +2347,9 @@ mod tests {
 
         // Request a short video (0.2 seconds at 10 fps = 2 frames)
         let video_resp = client
-            .get(format!("http://{bind}/cams/default/video?max_length=0.2&fps=10"))
+            .get(format!(
+                "http://{bind}/cams/default/video?max_length=0.2&fps=10"
+            ))
             .send()
             .await
             .unwrap();
@@ -2370,8 +2369,7 @@ mod tests {
     #[serial]
     async fn test_daemon_serves_video_default_params() {
         let bind: SocketAddr = "127.0.0.1:43226".parse().unwrap();
-        let frame =
-            encode_rgb_to_jpeg(2, 2, vec![100; 12]).unwrap();
+        let frame = encode_rgb_to_jpeg(2, 2, vec![100; 12]).unwrap();
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
@@ -2396,7 +2394,9 @@ mod tests {
 
         // Request video with default params (using a short max_length for test speed)
         let video_resp = client
-            .get(format!("http://{bind}/cams/default/video?max_length=0.1&fps=5"))
+            .get(format!(
+                "http://{bind}/cams/default/video?max_length=0.1&fps=5"
+            ))
             .send()
             .await
             .unwrap();
@@ -2440,7 +2440,9 @@ mod tests {
 
         // Request video for non-existent camera
         let video_resp = client
-            .get(format!("http://{bind}/cams/nonexistent/video?max_length=0.1&fps=5"))
+            .get(format!(
+                "http://{bind}/cams/nonexistent/video?max_length=0.1&fps=5"
+            ))
             .send()
             .await
             .unwrap();
