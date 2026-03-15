@@ -9,8 +9,11 @@
 - Daemon mode: Open webcam continuously (~30 FPS latest frame buffer).
 - Fast CLI capture: Save latest frame in <100ms.
 - **Video capture**: Record short video clips in AVI MJPEG format.
+- **Live streaming**: Real-time MJPEG stream via HTTP with web UI.
+- Multiple clients can stream from the same camera simultaneously.
+- Multiple webcams can stream in parallel.
 - Adaptive Linux exposure control to keep bright screens readable in dark rooms.
-- HTTP API for frame and video capture.
+- HTTP API for frame, video, and stream capture.
 - Linux V4L2 backend. Pluggable for Windows/Mac.
 
 ## Installation
@@ -54,7 +57,16 @@ curl -o frame.jpg http://localhost:43210/cams/default/frame
 
 # Capture a video (query params: max_length, fps)
 curl -o video.avi http://localhost:43210/cams/default/video?max_length=5&fps=15
+
+# Live stream (MJPEG multipart)
+curl http://localhost:43210/cams/default/stream
 ```
+
+### Live Web UI
+Open `http://localhost:43210/web/0` in a browser to see a live view from camera 0.
+Use `http://localhost:43210/web/default` for the daemon-selected camera.
+
+Multiple clients can view the same stream simultaneously without affecting each other.
 
 ### Status & stop
 ```bash

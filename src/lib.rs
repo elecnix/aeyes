@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use bytes;
 use clap::{CommandFactory, Parser, Subcommand};
 use image::{load_from_memory, RgbImage};
 #[cfg(not(target_os = "linux"))]
@@ -33,7 +34,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::RwLock,
+    sync::{broadcast, RwLock},
     time::sleep,
 };
 use tracing::{info, warn, Level};
@@ -228,6 +229,7 @@ pub struct AppState {
 struct CameraStreamState {
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
     last_error: Arc<RwLock<Option<DaemonErrorState>>>,
+    frame_tx: broadcast::Sender<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -944,16 +946,18 @@ pub async fn run_daemon(
     for camera in &cameras {
         let latest_jpeg: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
         let last_error: Arc<RwLock<Option<DaemonErrorState>>> = Arc::new(RwLock::new(None));
+        let (frame_tx, _) = broadcast::channel::<Vec<u8>>(60);
         let stream_state = CameraStreamState {
             latest_jpeg: latest_jpeg.clone(),
             last_error: last_error.clone(),
+            frame_tx: frame_tx.clone(),
         };
         streams.insert(camera.id.clone(), stream_state);
 
         let backend = backend.clone();
         let camera_id = camera.id.clone();
         tokio::spawn(async move {
-            if let Err(err) = camera_loop(backend, camera_id.clone(), latest_jpeg, last_error).await
+            if let Err(err) = camera_loop(backend, camera_id.clone(), latest_jpeg, last_error, frame_tx).await
             {
                 warn!(?err, camera = %camera_id, "camera loop exited");
             }
@@ -990,6 +994,8 @@ pub async fn run_daemon(
         .route("/cams", get(list_cams_http))
         .route("/cams/{id}/frame", get(frame_http))
         .route("/cams/{id}/video", get(video_http))
+        .route("/cams/{id}/stream", get(stream_http))
+        .route("/web/{id}", get(web_ui_handler))
         .route("/health", get(health_handler))
         .route("/shutdown", get(shutdown_handler))
         .route("/", get(openapi_handler))
@@ -1006,6 +1012,7 @@ async fn camera_loop(
     selected_camera: String,
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
     last_error: Arc<RwLock<Option<DaemonErrorState>>>,
+    frame_tx: broadcast::Sender<Vec<u8>>,
 ) -> Result<()> {
     let mut camera = match backend.open(&selected_camera) {
         Ok(camera) => camera,
@@ -1029,8 +1036,10 @@ async fn camera_loop(
     loop {
         match camera.capture_jpeg() {
             Ok(bytes) => {
-                *latest_jpeg.write().await = Some(bytes);
+                *latest_jpeg.write().await = Some(bytes.clone());
                 *last_error.write().await = None;
+                // Broadcast to all stream subscribers (ignore if no receivers)
+                let _ = frame_tx.send(bytes);
             }
             Err(err) => {
                 let state = DaemonErrorState::new("failed to capture frame from camera")
@@ -1183,6 +1192,180 @@ async fn video_http(
             DaemonErrorState::new("failed to create video").with_detail(format!("error: {err:#}")),
         ),
     }
+}
+
+async fn stream_http(AxumPath(id): AxumPath<String>, State(state): State<AppState>) -> Response {
+    *state.last_activity.write().await = Instant::now();
+    let requested = if id == "default" {
+        state.selected_camera.clone()
+    } else {
+        id
+    };
+
+    let Some(stream) = state.streams.get(&requested).cloned() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            DaemonErrorState::new(format!(
+                "camera '{requested}' is not managed by this daemon"
+            ))
+            .with_detail(format!(
+                "available cameras: {}",
+                state.streams.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+            .with_detail("request one of the IDs returned by GET /cams"),
+        );
+    };
+
+    let mut frame_rx = stream.frame_tx.subscribe();
+
+    let body = Body::from_stream(async_stream::stream! {
+        // Send initial boundary
+        yield Ok::<_, axum::Error>(bytes::Bytes::from("--frame\r\n"));
+
+        loop {
+            match frame_rx.recv().await {
+                Ok(frame_data) => {
+                    let header = format!(
+                        "Content-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                        frame_data.len()
+                    );
+                    yield Ok(bytes::Bytes::from(header));
+                    yield Ok(bytes::Bytes::from(frame_data));
+                    yield Ok(bytes::Bytes::from("\r\n--frame\r\n"));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Skip lagged frames, continue with next
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame")
+        .body(body)
+        .unwrap()
+}
+
+async fn web_ui_handler(AxumPath(id): AxumPath<String>, State(state): State<AppState>) -> Response {
+    *state.last_activity.write().await = Instant::now();
+    let requested = if id == "default" {
+        state.selected_camera.clone()
+    } else {
+        id.clone()
+    };
+
+    // Validate camera exists
+    let camera_name = state
+        .streams
+        .get(&requested)
+        .and_then(|_| state.cameras.iter().find(|c| c.id == requested))
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| requested.clone());
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>aeyes - {camera_name}</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            background: #1a1a1a;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }}
+        header {{
+            width: 100%;
+            padding: 1rem 2rem;
+            background: #2a2a2a;
+            border-bottom: 1px solid #3a3a3a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        h1 {{
+            font-size: 1.25rem;
+            font-weight: 500;
+            color: #ffffff;
+        }}
+        .camera-info {{
+            font-size: 0.875rem;
+            color: #888;
+        }}
+        .stream-container {{
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 1rem;
+            width: 100%;
+        }}
+        .stream-container img {{
+            max-width: 100%;
+            max-height: calc(100vh - 80px);
+            border-radius: 4px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }}
+        .status {{
+            position: fixed;
+            bottom: 1rem;
+            right: 1rem;
+            padding: 0.5rem 1rem;
+            background: #2a2a2a;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            color: #888;
+        }}
+        .status.connected {{
+            color: #4caf50;
+        }}
+        .status.error {{
+            color: #f44336;
+        }}
+    </style>
+</head>
+<body>
+    <header>
+        <h1>aeyes</h1>
+        <span class="camera-info">{camera_name}</span>
+    </header>
+    <div class="stream-container">
+        <img src="/cams/{id}/stream" alt="Live stream from {camera_name}" onerror="setStatus('error', 'Stream error')" onload="setStatus('connected', 'Connected')">
+    </div>
+    <div class="status" id="status">Connecting...</div>
+    <script>
+        function setStatus(cls, text) {{
+            const el = document.getElementById('status');
+            el.className = 'status ' + cls;
+            el.textContent = text;
+        }}
+    </script>
+</body>
+</html>"#,
+        camera_name = camera_name,
+        id = id
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap()
 }
 
 /// Create an AVI MJPEG video from a sequence of JPEG frames
@@ -1819,18 +2002,22 @@ mod tests {
 
     fn default_state() -> AppState {
         let mut streams = HashMap::new();
+        let (tx_a, _) = broadcast::channel(60);
         streams.insert(
             "cam-a".to_string(),
             CameraStreamState {
                 latest_jpeg: Arc::new(RwLock::new(None)),
                 last_error: Arc::new(RwLock::new(None)),
+                frame_tx: tx_a,
             },
         );
+        let (tx_b, _) = broadcast::channel(60);
         streams.insert(
             "cam-b".to_string(),
             CameraStreamState {
                 latest_jpeg: Arc::new(RwLock::new(None)),
                 last_error: Arc::new(RwLock::new(None)),
+                frame_tx: tx_b,
             },
         );
         AppState {
@@ -2084,11 +2271,13 @@ mod tests {
     #[tokio::test]
     async fn test_list_cams_http() {
         let mut streams = HashMap::new();
+        let (tx, _) = broadcast::channel(60);
         streams.insert(
             "cam-a".to_string(),
             CameraStreamState {
                 latest_jpeg: Arc::new(RwLock::new(None)),
                 last_error: Arc::new(RwLock::new(None)),
+                frame_tx: tx,
             },
         );
         let state = AppState {
@@ -2110,11 +2299,13 @@ mod tests {
     async fn test_frame_http_success_default() {
         let jpeg = vec![0xff, 0xd8, 0xff];
         let mut streams = HashMap::new();
+        let (tx, _) = broadcast::channel(60);
         streams.insert(
             "cam-a".to_string(),
             CameraStreamState {
                 latest_jpeg: Arc::new(RwLock::new(Some(jpeg.clone()))),
                 last_error: Arc::new(RwLock::new(None)),
+                frame_tx: tx,
             },
         );
         let state = AppState {
