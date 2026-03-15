@@ -5,8 +5,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+async-stream = "0.3"
 axum = "0.8"
+bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "service"] }
 image = "0.25"
