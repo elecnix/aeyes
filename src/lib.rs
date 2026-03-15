@@ -957,7 +957,14 @@ pub async fn run_daemon(
         let backend = backend.clone();
         let camera_id = camera.id.clone();
         tokio::spawn(async move {
-            if let Err(err) = camera_loop(backend, camera_id.clone(), latest_jpeg, last_error, frame_tx).await
+            if let Err(err) = camera_loop(
+                backend,
+                camera_id.clone(),
+                latest_jpeg,
+                last_error,
+                frame_tx,
+            )
+            .await
             {
                 warn!(?err, camera = %camera_id, "camera loop exited");
             }
@@ -1246,7 +1253,10 @@ async fn stream_http(AxumPath(id): AxumPath<String>, State(state): State<AppStat
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame")
+        .header(
+            header::CONTENT_TYPE,
+            "multipart/x-mixed-replace; boundary=frame",
+        )
         .body(body)
         .unwrap()
 }
