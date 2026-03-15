@@ -32,7 +32,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::RwLock,
     time::sleep,
 };
@@ -70,6 +70,9 @@ pub enum Commands {
         /// Bind address for the daemon HTTP API
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: SocketAddr,
+        /// Allowed remote IP prefixes (repeatable). Empty = allow all.
+        #[arg(long)]
+        allow_hosts: Vec<String>,
     },
     /// List available cameras
     Cams,
@@ -198,6 +201,9 @@ pub struct AppState {
     streams: Arc<HashMap<String, CameraStreamState>>,
     cameras: Arc<Vec<CameraDescriptor>>,
     last_activity: Arc<RwLock<Instant>>,
+    bind_addr: Arc<RwLock<SocketAddr>>,
+    listener: Arc<RwLock<Option<TcpListener>>>,
+    allow_hosts: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -587,7 +593,11 @@ pub async fn run_cli() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     let cli = Cli::parse();
     match cli.command {
-        Some(Commands::Start { camera, bind }) => start_daemon(camera, bind).await,
+        Some(Commands::Start {
+            camera,
+            bind,
+            allow_hosts,
+        }) => start_daemon(camera, bind, allow_hosts).await,
         Some(Commands::Cams) => list_cameras_cmd(),
         Some(Commands::Frame { camera, output }) => frame_cmd(camera, &output).await,
         Some(Commands::Stop) => stop_daemon().await,
@@ -652,7 +662,11 @@ fn list_cameras_cmd() -> Result<()> {
     Ok(())
 }
 
-pub async fn start_daemon(requested_camera: Option<String>, bind: SocketAddr) -> Result<()> {
+pub async fn start_daemon(
+    requested_camera: Option<String>,
+    bind: SocketAddr,
+    allow_hosts: Vec<String>,
+) -> Result<()> {
     fs::create_dir_all(runtime_dir())?;
     if let Ok(addr) = daemon_addr().await {
         if daemon_responding(addr).await {
@@ -673,6 +687,9 @@ pub async fn start_daemon(requested_camera: Option<String>, bind: SocketAddr) ->
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if !allow_hosts.is_empty() {
+        cmd.env("AEYES_ALLOW_HOSTS", allow_hosts.join(","));
+    }
     let child = cmd.spawn().context("failed to spawn daemon")?;
     let pid = child.id().context("missing daemon pid")?;
     fs::write(pid_path(), pid.to_string())?;
@@ -742,7 +759,7 @@ pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
             )?;
             let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
             let bind: SocketAddr = bind_str.parse().context("invalid AEYES_BIND env")?;
-            start_daemon(Some(chosen.id.clone()), bind)
+            start_daemon(Some(chosen.id.clone()), bind, vec![])
                 .await
                 .context("failed to auto-start daemon")?;
             let mut retries = 100;
@@ -831,12 +848,17 @@ pub async fn run_daemon_from_env() -> Result<()> {
         .parse()
         .context("invalid AEYES_BIND")?;
     let selected_camera = env::var("AEYES_CAMERA").context("AEYES_CAMERA missing")?;
-    run_daemon(bind, selected_camera, Box::new(NativeBackend)).await
+    let allow_hosts: Vec<String> = env::var("AEYES_ALLOW_HOSTS")
+        .ok()
+        .map(|s| s.split(',').map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+    run_daemon(bind, selected_camera, allow_hosts, Box::new(NativeBackend)).await
 }
 
 pub async fn run_daemon(
     bind: SocketAddr,
     selected_camera: String,
+    allow_hosts: Vec<String>,
     backend: Box<dyn CameraBackend>,
 ) -> Result<()> {
     fs::create_dir_all(runtime_dir())?;
@@ -882,7 +904,9 @@ pub async fn run_daemon(
         });
     }
 
-    fs::write(addr_path(), bind.to_string())?;
+    let listener = TcpListener::bind(bind).await?;
+    let resolved_addr = listener.local_addr()?;
+    fs::write(addr_path(), resolved_addr.to_string())?;
     fs::write(pid_path(), std::process::id().to_string())?;
 
     let state = AppState {
@@ -890,17 +914,89 @@ pub async fn run_daemon(
         streams: Arc::new(streams),
         cameras: Arc::new(cameras),
         last_activity,
+        bind_addr: Arc::new(RwLock::new(resolved_addr)),
+        listener: Arc::new(RwLock::new(Some(listener))),
+        allow_hosts,
     };
-    let app = Router::new()
+    let router = Router::new()
         .route("/cams", get(list_cams_http))
         .route("/cams/{id}/frame", get(frame_http))
         .route("/health", get(health_handler))
         .route("/shutdown", get(shutdown_handler))
-        .with_state(state);
+        .route("/rebind", get(rebind_handler))
+        .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!("daemon listening on http://{bind}");
-    axum::serve(listener, app).await?;
+    serve_forever(state, router).await
+}
+
+async fn serve_forever(state: AppState, router: Router) -> Result<()> {
+    loop {
+        // Take the listener out of state to use it (rebind puts a new one back in)
+        let listener = {
+            let mut guard = state.listener.write().await;
+            match guard.take() {
+                Some(l) => l,
+                None => break,
+            }
+        };
+        let addr = *state.bind_addr.read().await;
+        info!("listening on http://{addr}");
+
+        loop {
+            // Check if rebind was requested before accepting
+            if state.listener.read().await.is_some() {
+                info!("rebind detected, switching listener");
+                break;
+            }
+
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((tcp_stream, remote_addr)) => {
+                            let state = state.clone();
+                            let router = router.clone();
+                            let allow_hosts = state.allow_hosts.clone();
+
+                            if !allow_hosts.is_empty() {
+                                let ip_str = remote_addr.ip().to_string();
+                                if !allow_hosts.iter().any(|prefix| ip_str.starts_with(prefix)) {
+                                    info!("rejected connection from {remote_addr} (not in allow_hosts)");
+                                    continue;
+                                }
+                            }
+
+                            tokio::spawn(async move {
+                                let hyper_service =
+                                    hyper_util::service::TowerToHyperService::new(router.into_service());
+                                let io = hyper_util::rt::TokioIo::new(tcp_stream);
+                                if let Err(err) = hyper_util::server::conn::auto::Builder::new(
+                                    hyper_util::rt::TokioExecutor::new(),
+                                )
+                                .serve_connection(io, hyper_service)
+                                .await
+                                {
+                                    warn!(?err, %remote_addr, "HTTP connection error");
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            warn!(?err, "listener accept error");
+                            // Check if we should switch to a new listener (rebind)
+                            if state.listener.read().await.is_some() {
+                                info!("switching to new listener after accept error");
+                                break;
+                            }
+                            return Err(err.into());
+                        }
+                    }
+                }
+                _ = sleep(Duration::from_millis(200)) => {
+                    // Timeout - loop back to check for rebind
+                    continue;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1012,6 +1108,61 @@ async fn shutdown_handler(State(state): State<AppState>) -> Json<serde_json::Val
         std::process::exit(0);
     });
     Json(serde_json::json!({ "status": "stopping" }))
+}
+
+async fn rebind_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    *state.last_activity.write().await = Instant::now();
+    let Some(addr_str) = params.get("addr") else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            DaemonErrorState::new("missing 'addr' query parameter")
+                .with_detail("usage: GET /rebind?addr=0.0.0.0:43210"),
+        );
+    };
+    let new_addr: SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                DaemonErrorState::new(format!("invalid address '{addr_str}'"))
+                    .with_detail(format!("parse error: {e}")),
+            );
+        }
+    };
+
+    let new_listener = match TcpListener::bind(new_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                DaemonErrorState::new(format!("failed to bind to {new_addr}"))
+                    .with_detail(format!("error: {e}")),
+            );
+        }
+    };
+    let resolved_addr = new_listener
+        .local_addr()
+        .unwrap_or(new_addr);
+
+    // Replace the listener (drops old one, existing connections finish gracefully)
+    {
+        let mut guard = state.listener.write().await;
+        *guard = Some(new_listener);
+    }
+    *state.bind_addr.write().await = resolved_addr;
+    if let Err(e) = fs::write(addr_path(), resolved_addr.to_string()) {
+        warn!(?e, "failed to write new daemon address file");
+    }
+
+    Json(serde_json::json!({
+        "status": "rebound",
+        "old_addr": params.get("addr").cloned().unwrap_or_default(),
+        "new_addr": resolved_addr.to_string()
+    }))
+    .into_response()
 }
 
 fn error_response(status: StatusCode, error: DaemonErrorState) -> Response {
@@ -1319,6 +1470,9 @@ mod tests {
             streams: Arc::new(streams),
             cameras: Arc::new(fake_cameras()),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+            bind_addr: Arc::new(RwLock::new("127.0.0.1:0".parse().unwrap())),
+            listener: Arc::new(RwLock::new(None)),
+            allow_hosts: vec![],
         }
     }
 
@@ -1577,6 +1731,9 @@ mod tests {
                 backend: "test".to_string(),
             }]),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+            bind_addr: Arc::new(RwLock::new("127.0.0.1:0".parse().unwrap())),
+            listener: Arc::new(RwLock::new(None)),
+            allow_hosts: vec![],
         };
         let Json(response) = list_cams_http(State(state)).await;
         assert_eq!(response.selected_camera, "cam-a");
@@ -1599,6 +1756,9 @@ mod tests {
             streams: Arc::new(streams),
             cameras: Arc::new(vec![]),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+            bind_addr: Arc::new(RwLock::new("127.0.0.1:0".parse().unwrap())),
+            listener: Arc::new(RwLock::new(None)),
+            allow_hosts: vec![],
         };
         let resp = frame_http(AxumPath("default".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1641,7 +1801,12 @@ mod tests {
             fail_capture: None,
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            vec![],
+            Box::new(backend),
+        ));
 
         let client = reqwest::Client::new();
         let mut ready = false;
@@ -1689,7 +1854,12 @@ mod tests {
             fail_open: Some("simulated open failure".into()),
             fail_capture: None,
         };
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            vec![],
+            Box::new(backend),
+        ));
         tokio::time::sleep(Duration::from_millis(500)).await;
         let client = reqwest::Client::new();
         let resp = client
@@ -1716,7 +1886,12 @@ mod tests {
             fail_capture: Some("simulated capture failure".into()),
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            vec![],
+            Box::new(backend),
+        ));
         sleep(Duration::from_millis(400)).await;
 
         let client = reqwest::Client::new();
@@ -1746,7 +1921,12 @@ mod tests {
             fail_capture: None,
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            vec![],
+            Box::new(backend),
+        ));
         let client = reqwest::Client::new();
         for _ in 0..20 {
             if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
@@ -1762,6 +1942,108 @@ mod tests {
             .send()
             .await
             .unwrap();
+        assert_eq!(resp.status(), ReqwestStatus::OK);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_rebind_changes_listener_address() {
+        let bind: SocketAddr = "127.0.0.1:43223".parse().unwrap();
+        let new_bind: SocketAddr = "127.0.0.1:43224".parse().unwrap();
+        let frame = encode_rgb_to_jpeg(1, 1, vec![0, 0, 0]).unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame,
+            fail_open: None,
+            fail_capture: None,
+        };
+
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            vec![],
+            Box::new(backend),
+        ));
+        let client = reqwest::Client::new();
+
+        // Wait for original server
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        // Verify original works
+        let resp = client.get(format!("http://{bind}/health")).send().await.unwrap();
+        assert_eq!(resp.status(), ReqwestStatus::OK);
+
+        // Rebind to new address
+        let resp = client
+            .get(format!("http://{bind}/rebind?addr={new_bind}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), ReqwestStatus::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "rebound");
+
+        // Wait for new server to be ready
+        sleep(Duration::from_millis(300)).await;
+
+        // Verify new address works
+        let resp = client.get(format!("http://{new_bind}/health")).send().await.unwrap();
+        assert_eq!(resp.status(), ReqwestStatus::OK);
+
+        // Verify camera stream still works through new address
+        let resp = client
+            .get(format!("http://{new_bind}/cams"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), ReqwestStatus::OK);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_allow_hosts_allows_matching_prefix() {
+        let bind: SocketAddr = "127.0.0.1:43225".parse().unwrap();
+        let frame = encode_rgb_to_jpeg(1, 1, vec![0, 0, 0]).unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame,
+            fail_open: None,
+            fail_capture: None,
+        };
+
+        // Allow connections from 127.0.0.x
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            vec!["127.0.0".to_string()],
+            Box::new(backend),
+        ));
+        let client = reqwest::Client::new();
+
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        // Localhost (127.0.0.1) should be allowed
+        let resp = client.get(format!("http://{bind}/health")).send().await.unwrap();
         assert_eq!(resp.status(), ReqwestStatus::OK);
 
         handle.abort();
