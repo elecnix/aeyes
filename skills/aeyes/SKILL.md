@@ -32,9 +32,15 @@ ls ~/.cargo/bin/aeyes 2>/dev/null
 ls /usr/local/bin/aeyes 2>/dev/null
 ```
 
-## Installing from source
+## Installing
 
-If aeyes is not installed, build it from GitHub:
+Install from crates.io (recommended):
+
+```bash
+cargo install aeyes
+```
+
+Or build from source:
 
 ```bash
 git clone https://github.com/elecnix/aeyes.git /tmp/aeyes
