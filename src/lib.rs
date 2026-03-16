@@ -13,8 +13,11 @@ use image::{load_from_memory, RgbImage};
 use nokhwa::{
     pixel_format::RgbFormat,
     query,
-    utils::{ApiBackend, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType},
-    Camera,
+    utils::{
+        ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl,
+        RequestedFormat, RequestedFormatType, Resolution,
+    },
+    Buffer, Camera,
 };
 use std::{collections::HashMap, time::Instant};
 
@@ -282,7 +285,7 @@ impl CameraBackend for NativeBackend {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Ok(Box::new(NativeOpenCamera::open(id)?))
+            Ok(Box::new(NokhwaOpenCamera::open(id)?))
         }
     }
 }
@@ -292,62 +295,59 @@ fn camera_index_to_id(index: &CameraIndex) -> String {
     index.as_string()
 }
 
+/// Nokhwa-based camera backend for macOS and other non-Linux platforms
 #[cfg(not(target_os = "linux"))]
-struct NativeOpenCamera {
-    camera_id: String,
+struct NokhwaOpenCamera {
+    camera: Camera,
 }
 
 #[cfg(not(target_os = "linux"))]
-impl NativeOpenCamera {
+impl NokhwaOpenCamera {
     fn open(id: &str) -> Result<Self> {
-        query(ApiBackend::Auto)
-            .context("failed to query cameras")?
-            .into_iter()
-            .find(|cam| camera_index_to_id(cam.index()) == id || cam.human_name() == id)
-            .with_context(|| format!("camera '{id}' not found"))?;
-        Ok(Self {
-            camera_id: id.to_string(),
-        })
+        let camera_index = if let Ok(index) = id.parse::<u32>() {
+            CameraIndex::Index(index)
+        } else {
+            CameraIndex::String(id.to_string())
+        };
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
+            CameraFormat::new(Resolution::new(1920, 1080), FrameFormat::MJPEG, 30),
+        ));
+        let mut camera = Camera::new(camera_index, requested).context("failed to create camera")?;
+        camera
+            .open_stream()
+            .context("failed to open camera stream")?;
+        Ok(Self { camera })
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-impl OpenCamera for NativeOpenCamera {
+impl OpenCamera for NokhwaOpenCamera {
     fn set_auto_features(&mut self) -> Result<()> {
+        for control in [KnownCameraControl::Exposure, KnownCameraControl::Focus] {
+            if let Err(err) = self
+                .camera
+                .set_camera_control(control, ControlValueSetter::Boolean(true))
+            {
+                info!(?control, ?err, "camera control not enabled automatically");
+            }
+        }
         Ok(())
     }
 
     fn capture_jpeg(&mut self) -> Result<Vec<u8>> {
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-        let camera_info = query(ApiBackend::Auto)
-            .context("failed to query cameras")?
-            .into_iter()
-            .find(|cam| camera_index_to_id(cam.index()) == self.camera_id || cam.human_name() == self.camera_id)
-            .with_context(|| format!("camera '{}' not found", self.camera_id))?;
-        let mut camera = Camera::new(camera_info.index().clone(), requested)
-            .with_context(|| format!("failed to create native camera for '{}'", self.camera_id))?;
-        camera
-            .open_stream()
-            .with_context(|| format!("failed to open native camera stream for '{}'", self.camera_id))?;
-        let frame = camera
-            .frame()
-            .context("failed to capture frame from native camera")?;
-        match frame.source_frame_format() {
-            FrameFormat::MJPEG => {
-                let image = image::load_from_memory(frame.buffer())
-                    .context("failed to decode MJPEG frame from native camera")?
-                    .to_rgb8();
-                encode_rgb_to_jpeg(image.width(), image.height(), image.into_raw())
-                    .context("failed to encode MJPEG frame as jpeg")
-            }
-            FrameFormat::RAWRGB => {
-                let resolution = frame.resolution();
-                encode_rgb_to_jpeg(resolution.width_x, resolution.height_y, frame.buffer().to_vec())
-                    .context("failed to encode raw RGB frame as jpeg")
-            }
-            other => bail!("unsupported native frame format: {other}"),
-        }
+        let frame = self.camera.frame().context("failed to read camera frame")?;
+        encode_frame_as_jpeg(&frame)
     }
+}
+
+/// Encode a nokhwa Buffer as JPEG
+#[cfg(not(target_os = "linux"))]
+fn encode_frame_as_jpeg(buffer: &Buffer) -> Result<Vec<u8>> {
+    let img: RgbImage = buffer.decode_image::<RgbFormat>()?;
+    let mut bytes = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
+    encoder.encode_image(&img)?;
+    Ok(bytes)
 }
 
 #[cfg(target_os = "linux")]
