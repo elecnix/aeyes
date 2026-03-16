@@ -29,6 +29,13 @@ This installs the skill for popular AI coding agents (Pi, Claude Code, Cursor, C
 - Linux V4L2 backend. Pluggable for Windows/Mac.
 
 ## Installation
+
+### From crates.io (recommended)
+```bash
+cargo install aeyes
+```
+
+### From source
 ```bash
 git clone https://github.com/elecnix/aeyes.git
 cd aeyes
