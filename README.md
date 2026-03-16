@@ -26,7 +26,7 @@ This installs the skill for popular AI coding agents (Pi, Claude Code, Cursor, C
 - Multiple webcams can stream in parallel.
 - Adaptive Linux exposure control to keep bright screens readable in dark rooms.
 - HTTP API for frame, video, and stream capture.
-- Linux V4L2 backend. Pluggable for Windows/Mac.
+- Linux V4L2 backend. macOS support via nokhwa/AVFoundation.
 
 ## Installation
 
