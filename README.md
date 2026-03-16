@@ -1,9 +1,21 @@
-# A-Eyes 🖼️
+# A-Eyes 👀
 
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-blue.svg)](https://www.rust-lang.org/)
 [![Crates.io](https://img.shields.io/badge/crates.io-aeyes-orange.svg)](https://crates.io/crates/aeyes)
 
 **A-Eyes** (AI's eyes) is a CLI daemon that keeps your webcam open for **instant captures** without auto-exposure/focus delays. Perfect for AI agents needing quick "eyes".
+
+## For AI Agents
+
+A-Eyes is published as a skill on [skills.sh](https://skills.sh), making it easy to add webcam capabilities to your AI agent.
+
+### Install the skill
+
+```bash
+npx skills add elecnix/aeyes
+```
+
+This installs the skill for popular AI coding agents (Pi, Claude Code, Cursor, Copilot, Cline, Codex, and more). Once installed, your agent will know how to use `aeyes` for capturing photos, recording videos, and viewing live webcam streams.
 
 ## Features
 - Daemon mode: Open webcam continuously (~30 FPS latest frame buffer).
