@@ -11,8 +11,13 @@ use clap::{CommandFactory, Parser, Subcommand};
 use image::{load_from_memory, RgbImage};
 #[cfg(not(target_os = "linux"))]
 use nokhwa::{
+    pixel_format::RgbFormat,
     query,
-    utils::{ApiBackend, CameraIndex},
+    utils::{
+        ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl,
+        RequestedFormat, RequestedFormatType, Resolution,
+    },
+    Buffer, Camera,
 };
 use std::{collections::HashMap, time::Instant};
 
@@ -280,8 +285,7 @@ impl CameraBackend for NativeBackend {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = id;
-            bail!("native frame capture backend is not implemented for this OS yet")
+            Ok(Box::new(NokhwaOpenCamera::open(id)?))
         }
     }
 }
@@ -289,6 +293,61 @@ impl CameraBackend for NativeBackend {
 #[cfg(not(target_os = "linux"))]
 fn camera_index_to_id(index: &CameraIndex) -> String {
     index.as_string()
+}
+
+/// Nokhwa-based camera backend for macOS and other non-Linux platforms
+#[cfg(not(target_os = "linux"))]
+struct NokhwaOpenCamera {
+    camera: Camera,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl NokhwaOpenCamera {
+    fn open(id: &str) -> Result<Self> {
+        let camera_index = if let Ok(index) = id.parse::<u32>() {
+            CameraIndex::Index(index)
+        } else {
+            CameraIndex::String(id.to_string())
+        };
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
+            CameraFormat::new(Resolution::new(1920, 1080), FrameFormat::MJPEG, 30),
+        ));
+        let mut camera = Camera::new(camera_index, requested).context("failed to create camera")?;
+        camera
+            .open_stream()
+            .context("failed to open camera stream")?;
+        Ok(Self { camera })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OpenCamera for NokhwaOpenCamera {
+    fn set_auto_features(&mut self) -> Result<()> {
+        for control in [KnownCameraControl::Exposure, KnownCameraControl::Focus] {
+            if let Err(err) = self
+                .camera
+                .set_camera_control(control, ControlValueSetter::Boolean(true))
+            {
+                info!(?control, ?err, "camera control not enabled automatically");
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_jpeg(&mut self) -> Result<Vec<u8>> {
+        let frame = self.camera.frame().context("failed to read camera frame")?;
+        encode_frame_as_jpeg(&frame)
+    }
+}
+
+/// Encode a nokhwa Buffer as JPEG
+#[cfg(not(target_os = "linux"))]
+fn encode_frame_as_jpeg(buffer: &Buffer) -> Result<Vec<u8>> {
+    let img: RgbImage = buffer.decode_image::<RgbFormat>()?;
+    let mut bytes = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95);
+    encoder.encode_image(&img)?;
+    Ok(bytes)
 }
 
 #[cfg(target_os = "linux")]
