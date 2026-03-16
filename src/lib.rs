@@ -11,8 +11,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use image::{load_from_memory, RgbImage};
 #[cfg(not(target_os = "linux"))]
 use nokhwa::{
+    pixel_format::RgbFormat,
     query,
-    utils::{ApiBackend, CameraIndex},
+    utils::{ApiBackend, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType},
+    Camera,
 };
 use std::{collections::HashMap, time::Instant};
 
@@ -280,8 +282,7 @@ impl CameraBackend for NativeBackend {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = id;
-            bail!("native frame capture backend is not implemented for this OS yet")
+            Ok(Box::new(NativeOpenCamera::open(id)?))
         }
     }
 }
@@ -289,6 +290,64 @@ impl CameraBackend for NativeBackend {
 #[cfg(not(target_os = "linux"))]
 fn camera_index_to_id(index: &CameraIndex) -> String {
     index.as_string()
+}
+
+#[cfg(not(target_os = "linux"))]
+struct NativeOpenCamera {
+    camera_id: String,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl NativeOpenCamera {
+    fn open(id: &str) -> Result<Self> {
+        query(ApiBackend::Auto)
+            .context("failed to query cameras")?
+            .into_iter()
+            .find(|cam| camera_index_to_id(cam.index()) == id || cam.human_name() == id)
+            .with_context(|| format!("camera '{id}' not found"))?;
+        Ok(Self {
+            camera_id: id.to_string(),
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OpenCamera for NativeOpenCamera {
+    fn set_auto_features(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn capture_jpeg(&mut self) -> Result<Vec<u8>> {
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        let camera_info = query(ApiBackend::Auto)
+            .context("failed to query cameras")?
+            .into_iter()
+            .find(|cam| camera_index_to_id(cam.index()) == self.camera_id || cam.human_name() == self.camera_id)
+            .with_context(|| format!("camera '{}' not found", self.camera_id))?;
+        let mut camera = Camera::new(camera_info.index().clone(), requested)
+            .with_context(|| format!("failed to create native camera for '{}'", self.camera_id))?;
+        camera
+            .open_stream()
+            .with_context(|| format!("failed to open native camera stream for '{}'", self.camera_id))?;
+        let frame = camera
+            .frame()
+            .context("failed to capture frame from native camera")?;
+        match frame.source_frame_format() {
+            FrameFormat::MJPEG => {
+                let image = image::load_from_memory(frame.buffer())
+                    .context("failed to decode MJPEG frame from native camera")?
+                    .to_rgb8();
+                encode_rgb_to_jpeg(image.width(), image.height(), image.into_raw())
+                    .context("failed to encode MJPEG frame as jpeg")
+            }
+            FrameFormat::RAWRGB => {
+                let resolution = frame.resolution();
+                encode_rgb_to_jpeg(resolution.width_x, resolution.height_y, frame.buffer().to_vec())
+                    .context("failed to encode raw RGB frame as jpeg")
+            }
+            other => bail!("unsupported native frame format: {other}"),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
