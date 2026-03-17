@@ -200,7 +200,51 @@ curl http://localhost:43210/cams/default/stream
 ## Platform notes
 
 - **Linux**: Primary supported platform (uses V4L2/nokhwa)
-- **Windows/Mac**: Planned but not yet supported (see [roadmap](https://github.com/elecnix/aeyes#roadmap))
+- **macOS**: Supported via nokhwa/AVFoundation backend
+- **Windows**: Supported via nokhwa/MSMF backend
+- **Chrome screenshots**: Works on all platforms with Chrome remote debugging enabled
+
+## Chrome screenshot capture
+
+A-Eyes can capture screenshots from Chrome tabs using the Chrome DevTools Protocol.
+
+### Requirements
+
+Chrome must have remote debugging enabled:
+- Open `chrome://inspect/#remote-debugging` and toggle the switch
+- Or launch Chrome with `--remote-debugging-port=9222`
+
+### Capturing Chrome screenshots
+
+```bash
+# List all open tabs
+aeyes chrome --list-tabs
+
+# Capture screenshot from first available tab
+aeyes chrome -o /tmp/chrome-shot.jpg
+
+# Capture with custom quality (1-100)
+aeyes chrome --quality 95 -o /tmp/chrome-shot.jpg
+```
+
+### Alternative: chrome-cdp skill
+
+For more advanced Chrome interaction (clicking, typing, evaluating JS, accessibility snapshots), install the chrome-cdp skill:
+
+```bash
+# Install chrome-cdp skill for Pi/Claude Code
+pip install pi  # or install via pi-mono
+# Then install chrome-cdp from: https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent
+```
+
+The chrome-cdp skill provides:
+- Lightweight Chrome DevTools Protocol CLI
+- Direct WebSocket connection — no Puppeteer
+- Works with 100+ tabs, instant connection
+- Screenshot capture, accessibility tree snapshots, JavaScript evaluation
+- Click, type, and navigate commands
+
+**Important**: Only interact with Chrome when explicitly approved by the user after being asked to inspect, debug, or interact with a page open in Chrome.
 
 ## IPC details
 
