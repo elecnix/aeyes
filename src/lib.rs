@@ -271,82 +271,88 @@ struct CdpCommand {
 }
 
 /// Spawn a persistent CDP connection that stays open in a background thread.
-/// This keeps Chrome's "Allow debugging" permission active.
+/// The WebSocket stays connected so Chrome's "Allow debugging" only prompts once.
 fn spawn_persistent_chrome_session(ws_url: String, target_id: String) -> Result<ChromeSession> {
     use tungstenite::{connect, Message};
     
-    // Channel for sending commands
+    // Channel for sending commands - using unbounded so senders don't block
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CdpCommand>();
     
-    // Spawn background thread that holds the WebSocket
+    // Connect to Chrome ONCE before spawning the thread
+    let (ws, _) = connect(&ws_url)
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    
+    // Spawn background thread that owns the WebSocket
     std::thread::spawn(move || {
-        // Connect once to the browser
-        let (mut ws, _) = match connect(&ws_url) {
-            Ok(ws) => ws,
-            Err(e) => {
-                eprintln!("Chrome daemon: failed to connect to {ws_url}: {e}");
-                return;
-            }
-        };
+        let mut ws = ws;
+        let mut next_id: u64 = 1;
+        let mut session_id: Option<String> = None;
         
-        // Attach to target once
-        let attach_msg = json!({
-            "id": 1,
-            "method": "Target.attachToTarget",
-            "params": { "targetId": &target_id, "flatten": true }
-        });
-        if let Err(e) = ws.send(Message::Text(attach_msg.to_string().into())) {
-            eprintln!("Chrome daemon: failed to send attach: {e}");
-            return;
-        }
-        
-        // Wait for attach response
-        let session_id = loop {
-            match ws.read() {
-                Ok(msg) => {
-                    if let Ok(text) = msg.to_text() {
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                            if value.get("id") == Some(&json!(1)) {
-                                match value["result"]["sessionId"].as_str() {
-                                    Some(sid) => break sid.to_string(),
-                                    None => {
-                                        eprintln!("Chrome daemon: no sessionId in attach response");
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Chrome daemon: failed to read attach response: {e}");
-                    return;
-                }
-            }
-        };
-        
-        eprintln!("Chrome daemon: attached to target {target_id}, session {session_id}");
-        
-        // Process commands from the main daemon
-        let mut next_id: u64 = 2;
+        // Process commands
         while let Ok(cmd) = cmd_rx.recv() {
             let cmd_id = next_id;
             next_id += 1;
             
-            // Send command to Chrome
+            // If we don't have a session yet, attach first
+            if session_id.is_none() {
+                let attach_msg = json!({
+                    "id": cmd_id,
+                    "method": "Target.attachToTarget",
+                    "params": { "targetId": &target_id, "flatten": true }
+                });
+                if let Err(e) = ws.send(Message::Text(attach_msg.to_string().into())) {
+                    let _ = cmd.respond_to.send(Err(anyhow::anyhow!("attach send: {e}")));
+                    continue;
+                }
+                
+                // Read until we get the attach response
+                loop {
+                    match ws.read() {
+                        Ok(msg) => {
+                            if let Ok(text) = msg.to_text() {
+                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                                    if value.get("id") == Some(&json!(cmd_id)) {
+                                        if let Some(err) = value.get("error") {
+                                            let _ = cmd.respond_to.send(Err(anyhow::anyhow!("attach: {err}")));
+                                            break;
+                                        }
+                                        if let Some(sid) = value["result"]["sessionId"].as_str() {
+                                            session_id = Some(sid.to_string());
+                                            eprintln!("Chrome daemon: attached, session {sid}");
+                                        }
+                                        break;
+                                    }
+                                    // Skip events
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = cmd.respond_to.send(Err(anyhow::anyhow!("attach read: {e}")));
+                            break;
+                        }
+                    }
+                }
+                
+                // If attach failed, skip to next command
+                if session_id.is_none() {
+                    continue;
+                }
+            }
+            
+            // Now send the actual command
             let cmd_msg = json!({
                 "id": cmd_id,
-                "sessionId": session_id,
+                "sessionId": session_id.as_ref().unwrap(),
                 "method": cmd.method,
                 "params": cmd.params
             });
             
             if let Err(e) = ws.send(Message::Text(cmd_msg.to_string().into())) {
-                let _ = cmd.respond_to.send(Err(anyhow::anyhow!("send failed: {e}")));
+                let _ = cmd.respond_to.send(Err(anyhow::anyhow!("send: {e}")));
                 break;
             }
             
-            // Wait for response
+            // Read until we get our response (skip events)
             let result = loop {
                 match ws.read() {
                     Ok(msg) => {
@@ -358,12 +364,11 @@ fn spawn_persistent_chrome_session(ws_url: String, target_id: String) -> Result<
                                     }
                                     break Ok(value["result"].clone());
                                 }
+                                // Skip events
                             }
                         }
                     }
-                    Err(e) => {
-                        break Err(anyhow::anyhow!("read failed: {e}"));
-                    }
+                    Err(e) => break Err(anyhow::anyhow!("read: {e}")),
                 }
             };
             
