@@ -9,3 +9,5 @@ coverage/
 .aeyes/
 .CHANGES
 *.avi
+
+tarpaulin-report.*

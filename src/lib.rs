@@ -23,6 +23,8 @@ use std::{collections::HashMap, time::Instant};
 
 #[cfg(target_os = "linux")]
 use rscam::{Camera as RsCamera, Config as RsConfig};
+
+pub mod chrome_capture;
 #[cfg(target_os = "linux")]
 use rscam::{
     Control as RsControl, CtrlData, CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO, CID_FOCUS_AUTO,
@@ -114,6 +116,18 @@ pub enum Commands {
     Stop,
     /// Show daemon status
     Status,
+    /// Capture a screenshot from Chrome via DevTools Protocol
+    Chrome {
+        /// JPEG quality (1-100)
+        #[arg(long, default_value_t = 85)]
+        quality: u32,
+        /// Output file path
+        #[arg(short, long, default_value = "aeyes-chrome.jpg")]
+        output: PathBuf,
+        /// List available Chrome tabs
+        #[arg(long)]
+        list_tabs: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -683,6 +697,11 @@ pub async fn run_cli() -> Result<()> {
         }) => video_cmd(camera, &output, max_length, fps).await,
         Some(Commands::Stop) => stop_daemon().await,
         Some(Commands::Status) => status_cmd().await,
+        Some(Commands::Chrome {
+            quality,
+            output,
+            list_tabs,
+        }) => chrome_cmd(quality, &output, list_tabs),
         None => print_help(),
     }
 }
@@ -836,6 +855,45 @@ pub async fn status_cmd() -> Result<()> {
 
 async fn daemon_responding(addr: SocketAddr) -> bool {
     TcpStream::connect(addr).await.is_ok()
+}
+
+/// Handle the chrome command - capture screenshot from Chrome via CDP
+fn chrome_cmd(
+    quality: u32,
+    output: &Path,
+    list_tabs: bool,
+) -> Result<()> {
+    if list_tabs {
+        println!("Chrome debug targets:");
+        println!();
+        let targets = chrome_capture::list_targets()
+            .context("failed to list Chrome targets")?;
+        
+        if targets.is_empty() {
+            println!("  No targets found.");
+            println!();
+            println!("Make sure Chrome is running with remote debugging enabled.");
+        } else {
+            for (i, target) in targets.iter().enumerate() {
+                let short_id = &target.target_id[..8.min(target.target_id.len())];
+                println!("  {} {}", short_id, target.title);
+                println!("      {}", target.url);
+                println!();
+            }
+        }
+        return Ok(());
+    }
+
+    println!("Capturing screenshot from Chrome...");
+    
+    let jpeg = chrome_capture::capture_screenshot(quality)
+        .context("failed to capture Chrome screenshot")?;
+    
+    std::fs::write(output, &jpeg)
+        .with_context(|| format!("failed to write screenshot to {}", output.display()))?;
+    
+    println!("Screenshot saved to {} ({} bytes)", output.display(), jpeg.len());
+    Ok(())
 }
 
 pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
