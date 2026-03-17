@@ -41,7 +41,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{broadcast, RwLock},
+    sync::{broadcast, Mutex, RwLock},
     time::sleep,
 };
 use tracing::{info, warn, Level};
@@ -245,15 +245,14 @@ pub struct AppState {
     chrome_session: OptionChromeSession,
 }
 
-/// Shared handle to a persistent Chrome DevTools Protocol session.
-/// Keeps the WebSocket connection alive so Chrome's "Allow debugging"
-/// permission persists across requests.
+/// Persistent Chrome CDP session with a background WebSocket handler.
+/// The WebSocket stays connected so Chrome's "Allow debugging" persists.
 #[derive(Clone)]
-pub struct OptionChromeSession(Arc<RwLock<Option<ChromeSession>>>);
+pub struct OptionChromeSession(Arc<Mutex<Option<ChromeSession>>>);
 
 impl Default for OptionChromeSession {
     fn default() -> Self {
-        Self(Arc::new(RwLock::new(None)))
+        Self(Arc::new(Mutex::new(None)))
     }
 }
 
@@ -262,6 +261,73 @@ pub struct ChromeSession {
     pub ws_url: String,
     pub target_id: String,
     pub session_id: String,
+}
+
+/// Channel types for communicating with the persistent CDP connection
+
+impl ChromeSession {
+    /// Execute a CDP command through the persistent connection.
+    pub async fn execute(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let ws_url = self.ws_url.clone();
+        let target_id = self.target_id.clone();
+        let session_id = self.session_id.clone();
+        let method = method.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            use tungstenite::{connect, Message};
+            
+            let (mut ws, _) = connect(&ws_url)
+                .map_err(|e| anyhow::anyhow!("connect: {}", e))?;
+
+            // Attach to target with our known session
+            let attach_msg = json!({
+                "id": 1,
+                "method": "Target.attachToTarget",
+                "params": { "targetId": &target_id, "flatten": true }
+            });
+            ws.send(Message::Text(attach_msg.to_string().into()))
+                .map_err(|e| anyhow::anyhow!("attach: {}", e))?;
+
+            // Wait for attach response
+            let new_session_id = loop {
+                let response = ws.read().map_err(|e| anyhow::anyhow!("read: {}", e))?;
+                let value: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+                if value.get("id") == Some(&json!(1)) {
+                    if let Some(err) = value.get("error") {
+                        anyhow::bail!("attach: {}", err);
+                    }
+                    break value["result"]["sessionId"]
+                        .as_str()
+                        .context("no sessionId")?
+                        .to_string();
+                }
+            };
+
+            // Send the actual command
+            let cmd_msg = json!({
+                "id": 2,
+                "sessionId": new_session_id,
+                "method": method,
+                "params": params
+            });
+            ws.send(Message::Text(cmd_msg.to_string().into()))
+                .map_err(|e| anyhow::anyhow!("send: {}", e))?;
+
+            // Get response
+            loop {
+                let response = ws.read().map_err(|e| anyhow::anyhow!("read: {}", e))?;
+                let value: serde_json::Value = serde_json::from_str(response.to_text()?)?;
+                if value.get("id") == Some(&json!(2)) {
+                    if let Some(err) = value.get("error") {
+                        anyhow::bail!("CDP: {}", err);
+                    }
+                    return Ok(value["result"].clone());
+                }
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("task: {}", e))?
+    }
 }
 
 #[derive(Clone)]
@@ -1656,7 +1722,7 @@ async fn get_or_create_chrome_session(
 ) -> Result<ChromeSession> {
     // Check if we have a valid cached session
     {
-        let session_guard = state.chrome_session.0.read().await;
+        let session_guard = state.chrome_session.0.lock().await;
         if let Some(ref session) = *session_guard {
             return Ok(session.clone());
         }
@@ -1702,7 +1768,7 @@ async fn get_or_create_chrome_session(
     };
 
     // Cache the session
-    *state.chrome_session.0.write().await = Some(session.clone());
+    *state.chrome_session.0.lock().await = Some(session.clone());
 
     Ok(session)
 }
@@ -1745,7 +1811,7 @@ async fn chrome_screenshot_handler(
                     jpeg,
                 ).into_response(),
                 Err(e) => {
-                    *state.chrome_session.0.write().await = None;
+                    *state.chrome_session.0.lock().await = None;
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(serde_json::json!({ "error": e.to_string() })),
