@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
@@ -1862,14 +1863,31 @@ async fn chrome_screenshot_handler(
         .unwrap_or(85);
 
     match get_or_create_chrome_session(&state).await {
-        Ok(_session) => {
-            match chrome_capture::capture_screenshot(quality) {
-                Ok(jpeg) => (
-                    StatusCode::OK,
-                    [("Content-Type", "image/jpeg")],
-                    jpeg,
-                ).into_response(),
+        Ok(session) => {
+            // Use the persistent session to capture
+            let result = session.execute("Page.captureScreenshot", json!({
+                "format": "jpeg",
+                "quality": quality,
+                "fromSurface": true
+            })).await;
+
+            match result {
+                Ok(data) => {
+                    let img_data = data["data"].as_str().unwrap_or("");
+                    match base64::engine::general_purpose::STANDARD.decode(img_data) {
+                        Ok(jpeg) => (
+                            StatusCode::OK,
+                            [("Content-Type", "image/jpeg")],
+                            jpeg,
+                        ).into_response(),
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": format!("decode: {e}") })),
+                        ).into_response(),
+                    }
+                }
                 Err(e) => {
+                    // Clear session on error
                     *state.chrome_session.0.lock().await = None;
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1878,19 +1896,10 @@ async fn chrome_screenshot_handler(
                 }
             }
         }
-        Err(e) => {
-            match chrome_capture::capture_screenshot(quality) {
-                Ok(jpeg) => (
-                    StatusCode::OK,
-                    [("Content-Type", "image/jpeg")],
-                    jpeg,
-                ).into_response(),
-                Err(_) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                ).into_response(),
-            }
-        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ).into_response(),
     }
 }
 
