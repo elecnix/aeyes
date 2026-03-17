@@ -30,6 +30,7 @@ use rscam::{
     Control as RsControl, CtrlData, CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO, CID_FOCUS_AUTO,
 };
 use serde::Serialize;
+use serde_json::json;
 use std::{
     env, fs,
     net::SocketAddr,
@@ -241,6 +242,26 @@ pub struct AppState {
     streams: Arc<HashMap<String, CameraStreamState>>,
     cameras: Arc<Vec<CameraDescriptor>>,
     last_activity: Arc<RwLock<Instant>>,
+    chrome_session: OptionChromeSession,
+}
+
+/// Shared handle to a persistent Chrome DevTools Protocol session.
+/// Keeps the WebSocket connection alive so Chrome's "Allow debugging"
+/// permission persists across requests.
+#[derive(Clone)]
+pub struct OptionChromeSession(Arc<RwLock<Option<ChromeSession>>>);
+
+impl Default for OptionChromeSession {
+    fn default() -> Self {
+        Self(Arc::new(RwLock::new(None)))
+    }
+}
+
+#[derive(Clone)]
+pub struct ChromeSession {
+    pub ws_url: String,
+    pub target_id: String,
+    pub session_id: String,
 }
 
 #[derive(Clone)]
@@ -701,7 +722,7 @@ pub async fn run_cli() -> Result<()> {
             quality,
             output,
             list_tabs,
-        }) => chrome_cmd(quality, &output, list_tabs),
+        }) => chrome_cmd(quality, &output, list_tabs).await,
         None => print_help(),
     }
 }
@@ -857,41 +878,63 @@ async fn daemon_responding(addr: SocketAddr) -> bool {
     TcpStream::connect(addr).await.is_ok()
 }
 
-/// Handle the chrome command - capture screenshot from Chrome via CDP
-fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> {
+/// Handle the chrome command - uses daemon's persistent CDP session
+async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> {
+    let addr = daemon_addr()
+        .await
+        .context("daemon not running. Start with: aeyes start")?;
+
+    if !daemon_responding(addr).await {
+        anyhow::bail!("daemon not responding at {addr}. Start with: aeyes start");
+    }
+
+    let client = reqwest::Client::new();
+
     if list_tabs {
         println!("Chrome debug targets:");
         println!();
-        let targets = chrome_capture::list_targets().context("failed to list Chrome targets")?;
 
-        if targets.is_empty() {
-            println!("  No targets found.");
-            println!();
-            println!("Make sure Chrome is running with remote debugging enabled.");
-        } else {
-            for target in targets.iter() {
-                let short_id = &target.target_id[..8.min(target.target_id.len())];
-                println!("  {} {}", short_id, target.title);
-                println!("      {}", target.url);
-                println!();
+        let resp = client.get(format!("http://{addr}/chrome/tabs"))
+            .send()
+            .await
+            .context("failed to query daemon")?;
+
+        let json: serde_json::Value = resp.json().await
+            .context("failed to parse response")?;
+
+        if let Some(tabs) = json["tabs"].as_array() {
+            for target in tabs {
+                let target_id = target["target_id"].as_str().unwrap_or("");
+                let short_id = &target_id[..8.min(target_id.len())];
+                let title = target["title"].as_str().unwrap_or("");
+                let url = target["url"].as_str().unwrap_or("");
+                if !title.is_empty() {
+                    println!("  {} {}", short_id, title);
+                    println!("      {}", url);
+                    println!();
+                }
             }
         }
         return Ok(());
     }
 
-    println!("Capturing screenshot from Chrome...");
+    // Use daemon's persistent session (Chrome permission stays active)
+    println!("Capturing screenshot via daemon (persistent session)...");
+    let resp = client.get(format!("http://{addr}/chrome/screenshot?quality={quality}"))
+        .send()
+        .await
+        .context("failed to capture via daemon")?;
 
-    let jpeg = chrome_capture::capture_screenshot(quality)
-        .context("failed to capture Chrome screenshot")?;
+    if resp.status().is_success() {
+        let jpeg = resp.bytes().await?.to_vec();
+        std::fs::write(output, &jpeg)
+            .with_context(|| format!("failed to write screenshot to {}", output.display()))?;
+        println!("Screenshot saved to {} ({} bytes)", output.display(), jpeg.len());
+    } else {
+        let err: serde_json::Value = resp.json().await?;
+        anyhow::bail!("daemon error: {}", err["error"].as_str().unwrap_or("unknown"));
+    }
 
-    std::fs::write(output, &jpeg)
-        .with_context(|| format!("failed to write screenshot to {}", output.display()))?;
-
-    println!(
-        "Screenshot saved to {} ({} bytes)",
-        output.display(),
-        jpeg.len()
-    );
     Ok(())
 }
 
@@ -1111,6 +1154,7 @@ pub async fn run_daemon(
         streams: Arc::new(streams),
         cameras: Arc::new(cameras),
         last_activity,
+        chrome_session: OptionChromeSession::default(),
     };
     let app = Router::new()
         .route("/cams", get(list_cams_http))
@@ -1118,6 +1162,8 @@ pub async fn run_daemon(
         .route("/cams/{id}/video", get(video_http))
         .route("/cams/{id}/stream", get(stream_http))
         .route("/web/{id}", get(web_ui_handler))
+        .route("/chrome/tabs", get(chrome_tabs_handler))
+        .route("/chrome/screenshot", get(chrome_screenshot_handler))
         .route("/health", get(health_handler))
         .route("/shutdown", get(shutdown_handler))
         .route("/", get(openapi_handler))
@@ -1625,6 +1671,129 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
     }
 
     Ok(avi)
+}
+
+// ============================================================================
+// Chrome DevTools Protocol handlers - maintains persistent sessions
+// ============================================================================
+
+/// Get or create a Chrome CDP session.
+async fn get_or_create_chrome_session(
+    state: &AppState,
+) -> Result<ChromeSession> {
+    // Check if we have a valid cached session
+    {
+        let session_guard = state.chrome_session.0.read().await;
+        if let Some(ref session) = *session_guard {
+            return Ok(session.clone());
+        }
+    }
+
+    // Need to create a new session
+    let ws_url = chrome_capture::get_browser_ws_url()?;
+    let (mut ws, _) = tungstenite::connect(&ws_url)
+        .map_err(|e| anyhow::anyhow!("failed to connect to Chrome: {}", e))?;
+
+    // Get targets
+    let response = chrome_capture::cdp_send_raw(&mut ws, "Target.getTargets", json!({}))?;
+    let targets = response["result"]["targetInfos"]
+        .as_array()
+        .context("no targets in response")?;
+
+    let page = targets
+        .iter()
+        .find(|t| t["type"] == "page")
+        .context("no Chrome page found")?;
+
+    let target_id = page["targetId"].as_str().context("targetId not a string")?;
+
+    // Attach to target
+    let attach_response = chrome_capture::cdp_send_raw(
+        &mut ws,
+        "Target.attachToTarget",
+        json!({
+            "targetId": target_id,
+            "flatten": true
+        }),
+    )?;
+
+    let session_id = attach_response["result"]["sessionId"]
+        .as_str()
+        .context("sessionId not found")?
+        .to_string();
+
+    let session = ChromeSession {
+        ws_url: ws_url.to_string(),
+        target_id: target_id.to_string(),
+        session_id,
+    };
+
+    // Cache the session
+    *state.chrome_session.0.write().await = Some(session.clone());
+
+    Ok(session)
+}
+
+/// GET /chrome/tabs - List Chrome tabs
+async fn chrome_tabs_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    *state.last_activity.write().await = Instant::now();
+
+    match chrome_capture::list_targets() {
+        Ok(targets) => {
+            let tabs: Vec<_> = targets.into_iter().filter(|t| t.target_type == "page").collect();
+            Json(serde_json::json!({ "tabs": tabs })).into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ).into_response(),
+    }
+}
+
+/// GET /chrome/screenshot - Capture screenshot from Chrome
+async fn chrome_screenshot_handler(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    *state.last_activity.write().await = Instant::now();
+
+    let quality = params.get("quality")
+        .and_then(|q| q.parse::<u32>().ok())
+        .unwrap_or(85);
+
+    match get_or_create_chrome_session(&state).await {
+        Ok(_session) => {
+            match chrome_capture::capture_screenshot(quality) {
+                Ok(jpeg) => (
+                    StatusCode::OK,
+                    [("Content-Type", "image/jpeg")],
+                    jpeg,
+                ).into_response(),
+                Err(e) => {
+                    *state.chrome_session.0.write().await = None;
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    ).into_response()
+                }
+            }
+        }
+        Err(e) => {
+            match chrome_capture::capture_screenshot(quality) {
+                Ok(jpeg) => (
+                    StatusCode::OK,
+                    [("Content-Type", "image/jpeg")],
+                    jpeg,
+                ).into_response(),
+                Err(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                ).into_response(),
+            }
+        }
+    }
 }
 
 async fn health_handler(State(state): State<AppState>) -> &'static str {
@@ -2150,6 +2319,7 @@ mod tests {
             streams: Arc::new(streams),
             cameras: Arc::new(fake_cameras()),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+        chrome_session: OptionChromeSession::default(),
         }
     }
 
@@ -2414,6 +2584,7 @@ mod tests {
                 backend: "test".to_string(),
             }]),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+        chrome_session: OptionChromeSession::default(),
         };
         let Json(response) = list_cams_http(State(state)).await;
         assert_eq!(response.selected_camera, "cam-a");
@@ -2438,6 +2609,7 @@ mod tests {
             streams: Arc::new(streams),
             cameras: Arc::new(vec![]),
             last_activity: Arc::new(RwLock::new(Instant::now())),
+        chrome_session: OptionChromeSession::default(),
         };
         let resp = frame_http(AxumPath("default".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
