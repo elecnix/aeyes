@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 /// Common Chrome debugging ports to try.
@@ -42,11 +43,8 @@ fn try_port_json_version(port: u16) -> Option<String> {
 }
 
 /// Get Chrome's DevTools WebSocket URL.
-///
-/// Tries multiple discovery methods:
-/// 1. DevToolsActivePort file
-/// 2. Common debugging ports (9222, 9223, 9224)
-fn get_browser_ws_url() -> Result<String> {
+/// Tries DevToolsActivePort first, then common ports.
+pub fn get_browser_ws_url() -> Result<String> {
     // Method 1: Try DevToolsActivePort file first
     if let Some(ws_url) = try_devtools_active_port() {
         return Ok(ws_url);
@@ -81,7 +79,7 @@ fn get_browser_ws_url() -> Result<String> {
 }
 
 /// Send a CDP command and receive the response.
-fn cdp_send(
+pub fn cdp_send_raw(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
     method: &str,
     params: Value,
@@ -124,7 +122,7 @@ pub fn capture_screenshot(quality: u32) -> Result<Vec<u8>> {
     let (mut ws, _) = connect(&ws_url).context("failed to connect to Chrome DevTools")?;
 
     // Get list of targets
-    let response = cdp_send(&mut ws, "Target.getTargets", json!({}))?;
+    let response = cdp_send_raw(&mut ws, "Target.getTargets", json!({}))?;
     let targets = response["result"]["targetInfos"]
         .as_array()
         .context("no targets in response")?;
@@ -138,7 +136,7 @@ pub fn capture_screenshot(quality: u32) -> Result<Vec<u8>> {
     let target_id = page["targetId"].as_str().context("targetId not a string")?;
 
     // Attach to target
-    let attach_response = cdp_send(
+    let attach_response = cdp_send_raw(
         &mut ws,
         "Target.attachToTarget",
         json!({
@@ -187,7 +185,7 @@ pub fn capture_screenshot(quality: u32) -> Result<Vec<u8>> {
 }
 
 /// Information about a Chrome debug target.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TargetInfo {
     pub target_id: String,
     pub title: String,
@@ -202,7 +200,7 @@ pub fn list_targets() -> Result<Vec<TargetInfo>> {
     let ws_url = get_browser_ws_url()?;
     let (mut ws, _) = connect(&ws_url).context("failed to connect to Chrome DevTools")?;
 
-    let response = cdp_send(&mut ws, "Target.getTargets", json!({}))?;
+    let response = cdp_send_raw(&mut ws, "Target.getTargets", json!({}))?;
     let targets = response["result"]["targetInfos"]
         .as_array()
         .context("no targets in response")?;
