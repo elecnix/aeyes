@@ -270,79 +270,76 @@ struct CdpCommand {
     respond_to: std::sync::mpsc::Sender<Result<serde_json::Value>>,
 }
 
-/// Spawn a persistent CDP connection that stays open in a background thread.
-/// The WebSocket stays connected so Chrome's "Allow debugging" only prompts once.
-fn spawn_persistent_chrome_session(ws_url: String, target_id: String) -> Result<ChromeSession> {
+/// Spawn a persistent CDP connection - ONE connection for everything.
+fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
     use tungstenite::{connect, Message};
     
     // Channel for sending commands - using unbounded so senders don't block
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CdpCommand>();
     
-    // Connect to Chrome ONCE before spawning the thread
-    let (ws, _) = connect(&ws_url)
+    // Connect to Chrome ONCE
+    let (mut ws, _) = connect(&ws_url)
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
     
-    // Spawn background thread that owns the WebSocket
+    // Get targets using the SAME connection
+    let targets_msg = json!({"id": 1, "method": "Target.getTargets", "params": {}});
+    ws.send(Message::Text(targets_msg.to_string().into()))
+        .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+    
+    let target_id = loop {
+        let msg = ws.read().map_err(|e| anyhow::anyhow!("read: {e}"))?;
+        if let Ok(text) = msg.to_text() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                if value.get("id") == Some(&json!(1)) {
+                    let targets = value["result"]["targetInfos"].as_array()
+                        .context("no targets")?;
+                    let page = targets.iter()
+                        .find(|t| t["type"] == "page")
+                        .context("no Chrome page found")?;
+                    break page["targetId"].as_str().context("no targetId")?.to_string();
+                }
+            }
+        }
+    };
+    
+    // Attach using the SAME connection
+    let attach_msg = json!({
+        "id": 2,
+        "method": "Target.attachToTarget",
+        "params": { "targetId": &target_id, "flatten": true }
+    });
+    ws.send(Message::Text(attach_msg.to_string().into()))
+        .map_err(|e| anyhow::anyhow!("attach: {e}"))?;
+    
+    let session_id = loop {
+        let msg = ws.read().map_err(|e| anyhow::anyhow!("read: {e}"))?;
+        if let Ok(text) = msg.to_text() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                if value.get("id") == Some(&json!(2)) {
+                    if let Some(err) = value.get("error") {
+                        anyhow::bail!("attach: {err}");
+                    }
+                    break value["result"]["sessionId"].as_str().context("no sessionId")?.to_string();
+                }
+            }
+        }
+    };
+    
+    eprintln!("Chrome: ONE connection for targets+attach+commands, session {session_id}");
+    
+    // Channel for commands
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CdpCommand>();
+    
+    // Spawn background thread that owns this ONE connection
     std::thread::spawn(move || {
-        let mut ws = ws;
-        let mut next_id: u64 = 1;
-        let mut session_id: Option<String> = None;
+        let mut next_id: u64 = 3;
         
-        // Process commands
         while let Ok(cmd) = cmd_rx.recv() {
             let cmd_id = next_id;
             next_id += 1;
-            
-            // If we don't have a session yet, attach first
-            if session_id.is_none() {
-                let attach_msg = json!({
-                    "id": cmd_id,
-                    "method": "Target.attachToTarget",
-                    "params": { "targetId": &target_id, "flatten": true }
-                });
-                if let Err(e) = ws.send(Message::Text(attach_msg.to_string().into())) {
-                    let _ = cmd.respond_to.send(Err(anyhow::anyhow!("attach send: {e}")));
-                    continue;
-                }
-                
-                // Read until we get the attach response
-                loop {
-                    match ws.read() {
-                        Ok(msg) => {
-                            if let Ok(text) = msg.to_text() {
-                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                                    if value.get("id") == Some(&json!(cmd_id)) {
-                                        if let Some(err) = value.get("error") {
-                                            let _ = cmd.respond_to.send(Err(anyhow::anyhow!("attach: {err}")));
-                                            break;
-                                        }
-                                        if let Some(sid) = value["result"]["sessionId"].as_str() {
-                                            session_id = Some(sid.to_string());
-                                            eprintln!("Chrome daemon: attached, session {sid}");
-                                        }
-                                        break;
-                                    }
-                                    // Skip events
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = cmd.respond_to.send(Err(anyhow::anyhow!("attach read: {e}")));
-                            break;
-                        }
-                    }
-                }
-                
-                // If attach failed, skip to next command
-                if session_id.is_none() {
-                    continue;
-                }
-            }
-            
-            // Now send the actual command
             let cmd_msg = json!({
                 "id": cmd_id,
-                "sessionId": session_id.as_ref().unwrap(),
+                "sessionId": session_id.as_str(),
                 "method": cmd.method,
                 "params": cmd.params
             });
@@ -1784,7 +1781,7 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
 // Chrome DevTools Protocol handlers - maintains persistent sessions
 // ============================================================================
 
-/// Get or create a Chrome CDP session.
+/// Get or create a Chrome CDP session - connects ONCE.
 async fn get_or_create_chrome_session(
     state: &AppState,
 ) -> Result<ChromeSession> {
@@ -1792,45 +1789,17 @@ async fn get_or_create_chrome_session(
     {
         let session_guard = state.chrome_session.0.lock().await;
         if let Some(ref session) = *session_guard {
+            eprintln!("Chrome: reusing existing session");
             return Ok(session.clone());
         }
     }
 
-    // Need to create a new session
+    // Create new session - single connection for everything
+    eprintln!("Chrome: creating NEW session (one connection only)");
     let ws_url = chrome_capture::get_browser_ws_url()?;
-    let (mut ws, _) = tungstenite::connect(&ws_url)
-        .map_err(|e| anyhow::anyhow!("failed to connect to Chrome: {}", e))?;
-
-    // Get targets
-    let response = chrome_capture::cdp_send_raw(&mut ws, "Target.getTargets", json!({}))?;
-    let targets = response["result"]["targetInfos"]
-        .as_array()
-        .context("no targets in response")?;
-
-    let page = targets
-        .iter()
-        .find(|t| t["type"] == "page")
-        .context("no Chrome page found")?;
-
-    let target_id = page["targetId"].as_str().context("targetId not a string")?;
-
-    // Attach to target
-    let attach_response = chrome_capture::cdp_send_raw(
-        &mut ws,
-        "Target.attachToTarget",
-        json!({
-            "targetId": target_id,
-            "flatten": true
-        }),
-    )?;
-
-    let session_id = attach_response["result"]["sessionId"]
-        .as_str()
-        .context("sessionId not found")?
-        .to_string();
-
-    // Spawn persistent background connection
-    let session = spawn_persistent_chrome_session(ws_url, target_id.to_string())?;
+    
+    // spawn_persistent_chrome_session connects ONCE, gets targets, attaches, keeps connection
+    let session = spawn_persistent_chrome_session(ws_url)?;
 
     // Cache the session
     *state.chrome_session.0.lock().await = Some(session.clone());
