@@ -246,7 +246,8 @@ pub struct AppState {
 }
 
 /// Persistent Chrome CDP session with a background WebSocket handler.
-/// The WebSocket stays connected so Chrome's "Allow debugging" persists.
+/// The WebSocket stays connected in a background thread so Chrome's 
+/// "Allow debugging" permission persists across requests.
 #[derive(Clone)]
 pub struct OptionChromeSession(Arc<Mutex<Option<ChromeSession>>>);
 
@@ -258,75 +259,136 @@ impl Default for OptionChromeSession {
 
 #[derive(Clone)]
 pub struct ChromeSession {
-    pub ws_url: String,
-    pub target_id: String,
-    pub session_id: String,
+    /// Channel to send CDP commands to the background thread
+    cmd_tx: std::sync::mpsc::Sender<CdpCommand>,
 }
 
-/// Channel types for communicating with the persistent CDP connection
+struct CdpCommand {
+    method: String,
+    params: serde_json::Value,
+    respond_to: std::sync::mpsc::Sender<Result<serde_json::Value>>,
+}
 
-impl ChromeSession {
-    /// Execute a CDP command through the persistent connection.
-    pub async fn execute(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        let ws_url = self.ws_url.clone();
-        let target_id = self.target_id.clone();
-        let session_id = self.session_id.clone();
-        let method = method.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            use tungstenite::{connect, Message};
-            
-            let (mut ws, _) = connect(&ws_url)
-                .map_err(|e| anyhow::anyhow!("connect: {}", e))?;
-
-            // Attach to target with our known session
-            let attach_msg = json!({
-                "id": 1,
-                "method": "Target.attachToTarget",
-                "params": { "targetId": &target_id, "flatten": true }
-            });
-            ws.send(Message::Text(attach_msg.to_string().into()))
-                .map_err(|e| anyhow::anyhow!("attach: {}", e))?;
-
-            // Wait for attach response
-            let new_session_id = loop {
-                let response = ws.read().map_err(|e| anyhow::anyhow!("read: {}", e))?;
-                let value: serde_json::Value = serde_json::from_str(response.to_text()?)?;
-                if value.get("id") == Some(&json!(1)) {
-                    if let Some(err) = value.get("error") {
-                        anyhow::bail!("attach: {}", err);
+/// Spawn a persistent CDP connection that stays open in a background thread.
+/// This keeps Chrome's "Allow debugging" permission active.
+fn spawn_persistent_chrome_session(ws_url: String, target_id: String) -> Result<ChromeSession> {
+    use tungstenite::{connect, Message};
+    
+    // Channel for sending commands
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CdpCommand>();
+    
+    // Spawn background thread that holds the WebSocket
+    std::thread::spawn(move || {
+        // Connect once to the browser
+        let (mut ws, _) = match connect(&ws_url) {
+            Ok(ws) => ws,
+            Err(e) => {
+                eprintln!("Chrome daemon: failed to connect to {ws_url}: {e}");
+                return;
+            }
+        };
+        
+        // Attach to target once
+        let attach_msg = json!({
+            "id": 1,
+            "method": "Target.attachToTarget",
+            "params": { "targetId": &target_id, "flatten": true }
+        });
+        if let Err(e) = ws.send(Message::Text(attach_msg.to_string().into())) {
+            eprintln!("Chrome daemon: failed to send attach: {e}");
+            return;
+        }
+        
+        // Wait for attach response
+        let session_id = loop {
+            match ws.read() {
+                Ok(msg) => {
+                    if let Ok(text) = msg.to_text() {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                            if value.get("id") == Some(&json!(1)) {
+                                match value["result"]["sessionId"].as_str() {
+                                    Some(sid) => break sid.to_string(),
+                                    None => {
+                                        eprintln!("Chrome daemon: no sessionId in attach response");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    break value["result"]["sessionId"]
-                        .as_str()
-                        .context("no sessionId")?
-                        .to_string();
                 }
-            };
-
-            // Send the actual command
-            let cmd_msg = json!({
-                "id": 2,
-                "sessionId": new_session_id,
-                "method": method,
-                "params": params
-            });
-            ws.send(Message::Text(cmd_msg.to_string().into()))
-                .map_err(|e| anyhow::anyhow!("send: {}", e))?;
-
-            // Get response
-            loop {
-                let response = ws.read().map_err(|e| anyhow::anyhow!("read: {}", e))?;
-                let value: serde_json::Value = serde_json::from_str(response.to_text()?)?;
-                if value.get("id") == Some(&json!(2)) {
-                    if let Some(err) = value.get("error") {
-                        anyhow::bail!("CDP: {}", err);
-                    }
-                    return Ok(value["result"].clone());
+                Err(e) => {
+                    eprintln!("Chrome daemon: failed to read attach response: {e}");
+                    return;
                 }
             }
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("task: {}", e))?
+        };
+        
+        eprintln!("Chrome daemon: attached to target {target_id}, session {session_id}");
+        
+        // Process commands from the main daemon
+        let mut next_id: u64 = 2;
+        while let Ok(cmd) = cmd_rx.recv() {
+            let cmd_id = next_id;
+            next_id += 1;
+            
+            // Send command to Chrome
+            let cmd_msg = json!({
+                "id": cmd_id,
+                "sessionId": session_id,
+                "method": cmd.method,
+                "params": cmd.params
+            });
+            
+            if let Err(e) = ws.send(Message::Text(cmd_msg.to_string().into())) {
+                let _ = cmd.respond_to.send(Err(anyhow::anyhow!("send failed: {e}")));
+                break;
+            }
+            
+            // Wait for response
+            let result = loop {
+                match ws.read() {
+                    Ok(msg) => {
+                        if let Ok(text) = msg.to_text() {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                                if value.get("id") == Some(&json!(cmd_id)) {
+                                    if let Some(err) = value.get("error") {
+                                        break Err(anyhow::anyhow!("CDP error: {err}"));
+                                    }
+                                    break Ok(value["result"].clone());
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        break Err(anyhow::anyhow!("read failed: {e}"));
+                    }
+                }
+            };
+            
+            let _ = cmd.respond_to.send(result);
+        }
+        
+        eprintln!("Chrome daemon: connection closed");
+    });
+    
+    Ok(ChromeSession { cmd_tx })
+}
+
+impl ChromeSession {
+    /// Execute a CDP command through the persistent background connection.
+    pub async fn execute(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        
+        self.cmd_tx.send(CdpCommand {
+            method: method.to_string(),
+            params,
+            respond_to,
+        }).map_err(|_| anyhow::anyhow!("chrome session thread not running"))?;
+        
+        tokio::task::spawn_blocking(move || {
+            response_rx.recv().map_err(|_| anyhow::anyhow!("chrome session thread dropped"))?
+        }).await?
     }
 }
 
@@ -1761,11 +1823,8 @@ async fn get_or_create_chrome_session(
         .context("sessionId not found")?
         .to_string();
 
-    let session = ChromeSession {
-        ws_url: ws_url.to_string(),
-        target_id: target_id.to_string(),
-        session_id,
-    };
+    // Spawn persistent background connection
+    let session = spawn_persistent_chrome_session(ws_url, target_id.to_string())?;
 
     // Cache the session
     *state.chrome_session.0.lock().await = Some(session.clone());
