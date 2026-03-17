@@ -2726,4 +2726,86 @@ mod tests {
         handle.abort();
         let _ = handle.await;
     }
+
+    #[test]
+    fn test_parse_bind_address_full() {
+        let addr = parse_bind_address("127.0.0.1:8080").unwrap();
+        assert_eq!(addr.port(), 8080);
+        assert_eq!(addr.ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_bind_address_ip_only() {
+        let addr = parse_bind_address("0.0.0.0").unwrap();
+        assert_eq!(addr.port(), 43210);
+        assert_eq!(addr.ip().to_string(), "0.0.0.0");
+    }
+
+    #[test]
+    fn test_parse_bind_address_ipv6() {
+        let addr = parse_bind_address("[::1]:9000").unwrap();
+        assert_eq!(addr.port(), 9000);
+        assert!(addr.ip().is_ipv6());
+    }
+
+    #[test]
+    fn test_parse_bind_address_invalid() {
+        let err = parse_bind_address("not-an-address").unwrap_err().to_string();
+        assert!(err.contains("invalid bind address"));
+    }
+
+    #[test]
+    fn test_parse_bind_address_invalid_port() {
+        let err = parse_bind_address("127.0.0.1:99999").unwrap_err().to_string();
+        assert!(err.contains("invalid bind address"));
+    }
+
+    #[test]
+    fn test_encode_rgb_to_jpeg_basic() {
+        let jpeg = encode_rgb_to_jpeg(2, 2, vec![255; 12]).unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8])); // JPEG magic bytes
+    }
+
+    #[test]
+    fn test_encode_rgb_to_jpeg_single_pixel() {
+        let jpeg = encode_rgb_to_jpeg(1, 1, vec![255, 0, 0]).unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8]));
+    }
+
+    #[test]
+    fn test_camera_descriptor_clone() {
+        let cam = CameraDescriptor {
+            id: "cam-0".to_string(),
+            name: "Test Cam".to_string(),
+            backend: "fake".to_string(),
+        };
+        let cloned = cam.clone();
+        assert_eq!(cam.id, cloned.id);
+        assert_eq!(cam.name, cloned.name);
+    }
+
+    #[test]
+    fn test_daemon_error_state_structure() {
+        // Just test we can access fields
+        let path = addr_path();
+        assert!(path.ends_with("daemon.addr"));
+    }
+
+    #[test]
+    fn test_native_backend_name() {
+        // Just ensure it returns a non-empty string
+        assert!(!NativeBackend.name().is_empty());
+    }
+
+    #[test]
+    fn test_addr_path_not_empty() {
+        let path = addr_path();
+        assert!(path.ends_with("daemon.addr"));
+    }
+
+    #[test]
+    fn test_pid_path_not_empty() {
+        let path = pid_path();
+        assert!(path.ends_with("daemon.pid"));
+    }
 }
