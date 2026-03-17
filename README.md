@@ -22,6 +22,7 @@ This installs the skill for popular AI coding agents (Pi, Claude Code, Cursor, C
 - Fast CLI capture: Save latest frame in <100ms.
 - **Video capture**: Record short video clips in AVI MJPEG format.
 - **Live streaming**: Real-time MJPEG stream via HTTP with web UI.
+- **Chrome screenshots**: Capture any Chrome tab via DevTools Protocol (no Puppeteer).
 - Multiple clients can stream from the same camera simultaneously.
 - Multiple webcams can stream in parallel.
 - Adaptive Linux exposure control to keep bright screens readable in dark rooms.
@@ -103,6 +104,20 @@ Click any link above or ask me to open the browser for you.
 aeyes status
 aeyes stop
 ```
+
+### Chrome screenshot
+
+Capture screenshots from any open Chrome tab using the Chrome DevTools Protocol. No Puppeteer or heavy dependencies — just WebSocket.
+
+```bash
+aeyes chrome --list-tabs              # List all Chrome tabs
+aeyes chrome -o screenshot.jpg        # Capture screenshot (JPEG)
+aeyes chrome --quality 95 -o img.jpg  # High quality capture
+```
+
+**Requirements**: Chrome must be running with remote debugging enabled:
+- **Linux**: Open `chrome://inspect/#remote-debugging` and toggle the switch
+- **macOS**: Enabled by default when Chrome is launched via terminal
 
 ## Video Format
 
