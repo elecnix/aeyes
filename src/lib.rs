@@ -858,23 +858,18 @@ async fn daemon_responding(addr: SocketAddr) -> bool {
 }
 
 /// Handle the chrome command - capture screenshot from Chrome via CDP
-fn chrome_cmd(
-    quality: u32,
-    output: &Path,
-    list_tabs: bool,
-) -> Result<()> {
+fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> {
     if list_tabs {
         println!("Chrome debug targets:");
         println!();
-        let targets = chrome_capture::list_targets()
-            .context("failed to list Chrome targets")?;
-        
+        let targets = chrome_capture::list_targets().context("failed to list Chrome targets")?;
+
         if targets.is_empty() {
             println!("  No targets found.");
             println!();
             println!("Make sure Chrome is running with remote debugging enabled.");
         } else {
-            for (i, target) in targets.iter().enumerate() {
+            for target in targets.iter() {
                 let short_id = &target.target_id[..8.min(target.target_id.len())];
                 println!("  {} {}", short_id, target.title);
                 println!("      {}", target.url);
@@ -885,14 +880,18 @@ fn chrome_cmd(
     }
 
     println!("Capturing screenshot from Chrome...");
-    
+
     let jpeg = chrome_capture::capture_screenshot(quality)
         .context("failed to capture Chrome screenshot")?;
-    
+
     std::fs::write(output, &jpeg)
         .with_context(|| format!("failed to write screenshot to {}", output.display()))?;
-    
-    println!("Screenshot saved to {} ({} bytes)", output.display(), jpeg.len());
+
+    println!(
+        "Screenshot saved to {} ({} bytes)",
+        output.display(),
+        jpeg.len()
+    );
     Ok(())
 }
 
@@ -2808,13 +2807,17 @@ mod tests {
 
     #[test]
     fn test_parse_bind_address_invalid() {
-        let err = parse_bind_address("not-an-address").unwrap_err().to_string();
+        let err = parse_bind_address("not-an-address")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid bind address"));
     }
 
     #[test]
     fn test_parse_bind_address_invalid_port() {
-        let err = parse_bind_address("127.0.0.1:99999").unwrap_err().to_string();
+        let err = parse_bind_address("127.0.0.1:99999")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid bind address"));
     }
 
