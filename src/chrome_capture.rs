@@ -74,7 +74,11 @@ pub fn get_browser_ws_url() -> Result<String> {
         } else {
             "~/.config/google-chrome/DevToolsActivePort"
         },
-        COMMON_PORTS.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+        COMMON_PORTS
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 }
 

@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail, Context, Result};
-use base64::Engine as _;
 use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
@@ -8,6 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand};
 use image::{load_from_memory, RgbImage};
 #[cfg(not(target_os = "linux"))]
@@ -247,7 +247,7 @@ pub struct AppState {
 }
 
 /// Persistent Chrome CDP session with a background WebSocket handler.
-/// The WebSocket stays connected in a background thread so Chrome's 
+/// The WebSocket stays connected in a background thread so Chrome's
 /// "Allow debugging" permission persists across requests.
 #[derive(Clone)]
 pub struct OptionChromeSession(Arc<Mutex<Option<ChromeSession>>>);
@@ -273,32 +273,36 @@ struct CdpCommand {
 /// Spawn a persistent CDP connection - ONE connection for everything.
 fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
     use tungstenite::{connect, Message};
-    
+
     // Connect to Chrome ONCE
-    let (mut ws, _) = connect(&ws_url)
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    
+    let (mut ws, _) = connect(&ws_url).map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
     // Get targets using the SAME connection
     let targets_msg = json!({"id": 1, "method": "Target.getTargets", "params": {}});
     ws.send(Message::Text(targets_msg.to_string().into()))
         .map_err(|e| anyhow::anyhow!("send: {e}"))?;
-    
+
     let target_id = loop {
         let msg = ws.read().map_err(|e| anyhow::anyhow!("read: {e}"))?;
         if let Ok(text) = msg.to_text() {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
                 if value.get("id") == Some(&json!(1)) {
-                    let targets = value["result"]["targetInfos"].as_array()
+                    let targets = value["result"]["targetInfos"]
+                        .as_array()
                         .context("no targets")?;
-                    let page = targets.iter()
+                    let page = targets
+                        .iter()
                         .find(|t| t["type"] == "page")
                         .context("no Chrome page found")?;
-                    break page["targetId"].as_str().context("no targetId")?.to_string();
+                    break page["targetId"]
+                        .as_str()
+                        .context("no targetId")?
+                        .to_string();
                 }
             }
         }
     };
-    
+
     // Attach using the SAME connection
     let attach_msg = json!({
         "id": 2,
@@ -307,7 +311,7 @@ fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
     });
     ws.send(Message::Text(attach_msg.to_string().into()))
         .map_err(|e| anyhow::anyhow!("attach: {e}"))?;
-    
+
     let session_id = loop {
         let msg = ws.read().map_err(|e| anyhow::anyhow!("read: {e}"))?;
         if let Ok(text) = msg.to_text() {
@@ -316,21 +320,24 @@ fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
                     if let Some(err) = value.get("error") {
                         anyhow::bail!("attach: {err}");
                     }
-                    break value["result"]["sessionId"].as_str().context("no sessionId")?.to_string();
+                    break value["result"]["sessionId"]
+                        .as_str()
+                        .context("no sessionId")?
+                        .to_string();
                 }
             }
         }
     };
-    
+
     info!("Chrome: ONE connection for targets+attach+commands, session {session_id}");
-    
+
     // Channel for commands
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CdpCommand>();
-    
+
     // Spawn background thread that owns this ONE connection
     std::thread::spawn(move || {
         let mut next_id: u64 = 3;
-        
+
         while let Ok(cmd) = cmd_rx.recv() {
             let cmd_id = next_id;
             next_id += 1;
@@ -340,12 +347,12 @@ fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
                 "method": cmd.method,
                 "params": cmd.params
             });
-            
+
             if let Err(e) = ws.send(Message::Text(cmd_msg.to_string().into())) {
                 let _ = cmd.respond_to.send(Err(anyhow::anyhow!("send: {e}")));
                 break;
             }
-            
+
             // Read until we get our response (skip events)
             let result = loop {
                 match ws.read() {
@@ -365,30 +372,39 @@ fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
                     Err(e) => break Err(anyhow::anyhow!("read: {e}")),
                 }
             };
-            
+
             let _ = cmd.respond_to.send(result);
         }
-        
+
         info!("Chrome: persistent CDP session ended");
     });
-    
+
     Ok(ChromeSession { cmd_tx })
 }
 
 impl ChromeSession {
     /// Execute a CDP command through the persistent background connection.
-    pub async fn execute(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    pub async fn execute(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
-        
-        self.cmd_tx.send(CdpCommand {
-            method: method.to_string(),
-            params,
-            respond_to,
-        }).map_err(|_| anyhow::anyhow!("chrome session thread not running"))?;
-        
+
+        self.cmd_tx
+            .send(CdpCommand {
+                method: method.to_string(),
+                params,
+                respond_to,
+            })
+            .map_err(|_| anyhow::anyhow!("chrome session thread not running"))?;
+
         tokio::task::spawn_blocking(move || {
-            response_rx.recv().map_err(|_| anyhow::anyhow!("chrome session thread dropped"))?
-        }).await?
+            response_rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("chrome session thread dropped"))?
+        })
+        .await?
     }
 }
 
@@ -1051,13 +1067,13 @@ async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> 
         println!("Chrome debug targets:");
         println!();
 
-        let resp = client.get(format!("http://{addr}/chrome/tabs"))
+        let resp = client
+            .get(format!("http://{addr}/chrome/tabs"))
             .send()
             .await
             .context("failed to query daemon")?;
 
-        let json: serde_json::Value = resp.json().await
-            .context("failed to parse response")?;
+        let json: serde_json::Value = resp.json().await.context("failed to parse response")?;
 
         if let Some(tabs) = json["tabs"].as_array() {
             for target in tabs {
@@ -1077,7 +1093,8 @@ async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> 
 
     // Use daemon's persistent session (Chrome permission stays active)
     println!("Capturing screenshot via daemon (persistent session)...");
-    let resp = client.get(format!("http://{addr}/chrome/screenshot?quality={quality}"))
+    let resp = client
+        .get(format!("http://{addr}/chrome/screenshot?quality={quality}"))
         .send()
         .await
         .context("failed to capture via daemon")?;
@@ -1086,10 +1103,17 @@ async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> 
         let jpeg = resp.bytes().await?.to_vec();
         std::fs::write(output, &jpeg)
             .with_context(|| format!("failed to write screenshot to {}", output.display()))?;
-        println!("Screenshot saved to {} ({} bytes)", output.display(), jpeg.len());
+        println!(
+            "Screenshot saved to {} ({} bytes)",
+            output.display(),
+            jpeg.len()
+        );
     } else {
         let err: serde_json::Value = resp.json().await?;
-        anyhow::bail!("daemon error: {}", err["error"].as_str().unwrap_or("unknown"));
+        anyhow::bail!(
+            "daemon error: {}",
+            err["error"].as_str().unwrap_or("unknown")
+        );
     }
 
     Ok(())
@@ -1779,9 +1803,7 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
 // ============================================================================
 
 /// Get or create a Chrome CDP session - connects ONCE.
-async fn get_or_create_chrome_session(
-    state: &AppState,
-) -> Result<ChromeSession> {
+async fn get_or_create_chrome_session(state: &AppState) -> Result<ChromeSession> {
     // Check if we have a valid cached session
     {
         let session_guard = state.chrome_session.0.lock().await;
@@ -1794,7 +1816,7 @@ async fn get_or_create_chrome_session(
     // Create new session - single connection for everything
     info!("Chrome: creating new persistent CDP session");
     let ws_url = chrome_capture::get_browser_ws_url()?;
-    
+
     // spawn_persistent_chrome_session connects ONCE, gets targets, attaches, keeps connection
     let session = spawn_persistent_chrome_session(ws_url)?;
 
@@ -1805,20 +1827,22 @@ async fn get_or_create_chrome_session(
 }
 
 /// GET /chrome/tabs - List Chrome tabs
-async fn chrome_tabs_handler(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn chrome_tabs_handler(State(state): State<AppState>) -> impl IntoResponse {
     *state.last_activity.write().await = Instant::now();
 
     match chrome_capture::list_targets() {
         Ok(targets) => {
-            let tabs: Vec<_> = targets.into_iter().filter(|t| t.target_type == "page").collect();
+            let tabs: Vec<_> = targets
+                .into_iter()
+                .filter(|t| t.target_type == "page")
+                .collect();
             Json(serde_json::json!({ "tabs": tabs })).into_response()
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": e.to_string() })),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -1829,32 +1853,37 @@ async fn chrome_screenshot_handler(
 ) -> impl IntoResponse {
     *state.last_activity.write().await = Instant::now();
 
-    let quality = params.get("quality")
+    let quality = params
+        .get("quality")
         .and_then(|q| q.parse::<u32>().ok())
         .unwrap_or(85);
 
     match get_or_create_chrome_session(&state).await {
         Ok(session) => {
             // Use the persistent session to capture
-            let result = session.execute("Page.captureScreenshot", json!({
-                "format": "jpeg",
-                "quality": quality,
-                "fromSurface": true
-            })).await;
+            let result = session
+                .execute(
+                    "Page.captureScreenshot",
+                    json!({
+                        "format": "jpeg",
+                        "quality": quality,
+                        "fromSurface": true
+                    }),
+                )
+                .await;
 
             match result {
                 Ok(data) => {
                     let img_data = data["data"].as_str().unwrap_or("");
                     match base64::engine::general_purpose::STANDARD.decode(img_data) {
-                        Ok(jpeg) => (
-                            StatusCode::OK,
-                            [("Content-Type", "image/jpeg")],
-                            jpeg,
-                        ).into_response(),
+                        Ok(jpeg) => {
+                            (StatusCode::OK, [("Content-Type", "image/jpeg")], jpeg).into_response()
+                        }
                         Err(e) => (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({ "error": format!("decode: {e}") })),
-                        ).into_response(),
+                        )
+                            .into_response(),
                     }
                 }
                 Err(e) => {
@@ -1863,14 +1892,16 @@ async fn chrome_screenshot_handler(
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(serde_json::json!({ "error": e.to_string() })),
-                    ).into_response()
+                    )
+                        .into_response()
                 }
             }
         }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": e.to_string() })),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -2397,7 +2428,7 @@ mod tests {
             streams: Arc::new(streams),
             cameras: Arc::new(fake_cameras()),
             last_activity: Arc::new(RwLock::new(Instant::now())),
-        chrome_session: OptionChromeSession::default(),
+            chrome_session: OptionChromeSession::default(),
         }
     }
 
@@ -2662,7 +2693,7 @@ mod tests {
                 backend: "test".to_string(),
             }]),
             last_activity: Arc::new(RwLock::new(Instant::now())),
-        chrome_session: OptionChromeSession::default(),
+            chrome_session: OptionChromeSession::default(),
         };
         let Json(response) = list_cams_http(State(state)).await;
         assert_eq!(response.selected_camera, "cam-a");
@@ -2687,7 +2718,7 @@ mod tests {
             streams: Arc::new(streams),
             cameras: Arc::new(vec![]),
             last_activity: Arc::new(RwLock::new(Instant::now())),
-        chrome_session: OptionChromeSession::default(),
+            chrome_session: OptionChromeSession::default(),
         };
         let resp = frame_http(AxumPath("default".to_string()), State(state)).await;
         assert_eq!(resp.status(), StatusCode::OK);
