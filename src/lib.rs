@@ -878,16 +878,45 @@ async fn daemon_responding(addr: SocketAddr) -> bool {
     TcpStream::connect(addr).await.is_ok()
 }
 
-/// Handle the chrome command - uses daemon's persistent CDP session
-async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> {
-    let addr = daemon_addr()
-        .await
-        .context("daemon not running. Start with: aeyes start")?;
-
-    if !daemon_responding(addr).await {
-        anyhow::bail!("daemon not responding at {addr}. Start with: aeyes start");
+/// Ensure daemon is running, auto-starting if needed. Returns daemon address.
+/// If camera is specified, uses it when starting the daemon.
+async fn ensure_daemon_running(camera: Option<&str>) -> Result<SocketAddr> {
+    if let Ok(addr) = daemon_addr().await {
+        if daemon_responding(addr).await {
+            return Ok(addr);
+        }
     }
 
+    // Auto-start daemon with specified or first available camera
+    let backend = NativeBackend;
+    let cams = backend.list_cameras().context("no cameras found")?;
+    let chosen = if let Some(cam_id) = camera {
+        choose_camera(&cams, Some(cam_id))?
+    } else {
+        choose_camera(&cams, None)
+            .or_else(|_| cams.first().cloned().context("no cameras available"))?
+    };
+    let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    start_daemon(Some(chosen.id.clone()), bind_str)
+        .await
+        .context("failed to auto-start daemon")?;
+
+    // Wait for daemon to be ready
+    for _ in 0..100 {
+        if let Ok(addr) = daemon_addr().await {
+            if daemon_responding(addr).await {
+                return Ok(addr);
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("daemon failed to become ready")
+}
+
+/// Handle the chrome command - uses daemon's persistent CDP session
+/// Auto-starts daemon if not running.
+async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> {
+    let addr = ensure_daemon_running(None).await?;
     let client = reqwest::Client::new();
 
     if list_tabs {
@@ -939,35 +968,7 @@ async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> 
 }
 
 pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
-    let addr = match daemon_addr().await {
-        Ok(addr) if daemon_responding(addr).await => addr,
-        _ => {
-            let backend = NativeBackend;
-            let cams = backend.list_cameras().context("no cameras found")?;
-            let chosen = choose_camera(&cams, camera.as_deref()).context(
-                "could not auto-select camera (specify --camera <id-or-name> if multiple)",
-            )?;
-            let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-            start_daemon(Some(chosen.id.clone()), bind_str)
-                .await
-                .context("failed to auto-start daemon")?;
-            let mut retries = 100;
-            let mut ready_addr = None;
-            while retries > 0 {
-                match daemon_addr().await {
-                    Ok(addr) if daemon_responding(addr).await => {
-                        ready_addr = Some(addr);
-                        break;
-                    }
-                    _ => {
-                        sleep(Duration::from_millis(100)).await;
-                        retries -= 1;
-                    }
-                }
-            }
-            ready_addr.context("daemon failed to become ready")?
-        }
-    };
+    let addr = ensure_daemon_running(camera.as_deref()).await?;
     let path = if let Some(cam) = &camera {
         format!("/cams/{}/frame", cam)
     } else {
@@ -988,35 +989,7 @@ pub async fn video_cmd(
     max_length: f64,
     fps: u32,
 ) -> Result<()> {
-    let addr = match daemon_addr().await {
-        Ok(addr) if daemon_responding(addr).await => addr,
-        _ => {
-            let backend = NativeBackend;
-            let cams = backend.list_cameras().context("no cameras found")?;
-            let chosen = choose_camera(&cams, camera.as_deref()).context(
-                "could not auto-select camera (specify --camera <id-or-name> if multiple)",
-            )?;
-            let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-            start_daemon(Some(chosen.id.clone()), bind_str)
-                .await
-                .context("failed to auto-start daemon")?;
-            let mut retries = 100;
-            let mut ready_addr = None;
-            while retries > 0 {
-                match daemon_addr().await {
-                    Ok(addr) if daemon_responding(addr).await => {
-                        ready_addr = Some(addr);
-                        break;
-                    }
-                    _ => {
-                        sleep(Duration::from_millis(100)).await;
-                        retries -= 1;
-                    }
-                }
-            }
-            ready_addr.context("daemon failed to become ready")?
-        }
-    };
+    let addr = ensure_daemon_running(camera.as_deref()).await?;
     let path = if let Some(cam) = &camera {
         format!("/cams/{}/video?max_length={}&fps={}", cam, max_length, fps)
     } else {
