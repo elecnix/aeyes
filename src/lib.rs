@@ -274,9 +274,6 @@ struct CdpCommand {
 fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
     use tungstenite::{connect, Message};
     
-    // Channel for sending commands - using unbounded so senders don't block
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CdpCommand>();
-    
     // Connect to Chrome ONCE
     let (mut ws, _) = connect(&ws_url)
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
@@ -325,7 +322,7 @@ fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
         }
     };
     
-    eprintln!("Chrome: ONE connection for targets+attach+commands, session {session_id}");
+    info!("Chrome: ONE connection for targets+attach+commands, session {session_id}");
     
     // Channel for commands
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CdpCommand>();
@@ -372,7 +369,7 @@ fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
             let _ = cmd.respond_to.send(result);
         }
         
-        eprintln!("Chrome daemon: connection closed");
+        info!("Chrome: persistent CDP session ended");
     });
     
     Ok(ChromeSession { cmd_tx })
@@ -1789,13 +1786,13 @@ async fn get_or_create_chrome_session(
     {
         let session_guard = state.chrome_session.0.lock().await;
         if let Some(ref session) = *session_guard {
-            eprintln!("Chrome: reusing existing session");
+            info!("Chrome: reusing cached CDP session");
             return Ok(session.clone());
         }
     }
 
     // Create new session - single connection for everything
-    eprintln!("Chrome: creating NEW session (one connection only)");
+    info!("Chrome: creating new persistent CDP session");
     let ws_url = chrome_capture::get_browser_ws_url()?;
     
     // spawn_persistent_chrome_session connects ONCE, gets targets, attaches, keeps connection
