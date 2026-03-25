@@ -94,6 +94,7 @@ impl SobelEdgeDetector {
 
     /// Compute horizontal gradient (Sobel Gx)
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn sobel_gx(
         _topleft: u8,
         _top: u8,
@@ -111,6 +112,7 @@ impl SobelEdgeDetector {
 
     /// Compute vertical gradient (Sobel Gy)
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn sobel_gy(
         topleft: u8,
         top: u8,
@@ -194,6 +196,7 @@ impl LocalBinaryPattern {
 
     /// Compute LBP for single pixel (8-bit pattern)
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn compute_lbp(
         center: u8,
         tl: u8,
@@ -292,8 +295,8 @@ impl AdaptiveThreshold {
         decay_rate: f32,
         min_sensitivity: f32,
     ) -> Self {
-        let regions_x = (width + region_size - 1) / region_size;
-        let regions_y = (height + region_size - 1) / region_size;
+        let regions_x = width.div_ceil(region_size);
+        let regions_y = height.div_ceil(region_size);
 
         Self {
             width,
@@ -309,7 +312,7 @@ impl AdaptiveThreshold {
         let region_x = x / self.region_size;
         let region_y = y / self.region_size;
 
-        let regions_x = (self.width + self.region_size - 1) / self.region_size;
+        let regions_x = self.width.div_ceil(self.region_size);
         let idx = region_y * regions_x + region_x;
 
         let sensitivity = self.sensitivities.get(idx).copied().unwrap_or(1.0);
@@ -322,7 +325,7 @@ impl AdaptiveThreshold {
         let region_x = x / self.region_size;
         let region_y = y / self.region_size;
 
-        let regions_x = (self.width + self.region_size - 1) / self.region_size;
+        let regions_x = self.width.div_ceil(self.region_size);
         let idx = region_y * regions_x + region_x;
 
         if let Some(threshold) = self.sensitivities.get_mut(idx) {
@@ -393,6 +396,7 @@ impl LightingInvariantDetector {
     }
 
     /// Detect motion in RGB frame
+    #[allow(clippy::cast_possible_truncation)]
     pub fn detect(&mut self, frame_rgb: &[u8]) -> Vec<(usize, usize)> {
         if frame_rgb.len() != self.width * self.height * 3 {
             return Vec::new();
@@ -432,7 +436,7 @@ impl LightingInvariantDetector {
                 if self.config.use_temporal_edges {
                     let curr_edge = edges[idx];
                     let prev_edge = self.sobel.prev_edges()[idx];
-                    let edge_delta = (curr_edge as i16 - prev_edge as i16).abs() as u8;
+                    let edge_delta = (curr_edge as i16 - prev_edge as i16).unsigned_abs() as u8;
 
                     if edge_delta > self.config.min_edge_movement
                         && curr_edge > self.config.edge_threshold

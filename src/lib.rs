@@ -1184,7 +1184,7 @@ pub async fn motion_cmd(
 
     // Default resolution if we can't determine
     let (width, height) = if let Some(arr) = cams_json["cameras"].as_array() {
-        if arr.first().is_some() {
+        if !arr.is_empty() {
             // We'll assume 640x480 as default; in a real implementation we'd query camera capabilities
             (640, 480)
         } else {
