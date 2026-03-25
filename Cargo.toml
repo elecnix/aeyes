@@ -37,3 +37,4 @@ rscam = "0.5.5"
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
+rand = "0.9"

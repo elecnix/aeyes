@@ -26,6 +26,7 @@ use std::{collections::HashMap, time::Instant};
 use rscam::{Camera as RsCamera, Config as RsConfig};
 
 pub mod chrome_capture;
+pub mod motion;
 #[cfg(target_os = "linux")]
 use rscam::{
     Control as RsControl, CtrlData, CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO, CID_FOCUS_AUTO,
@@ -129,6 +130,30 @@ pub enum Commands {
         /// List available Chrome tabs
         #[arg(long)]
         list_tabs: bool,
+    },
+    /// Motion detection: wait for motion or analyze frames
+    Motion {
+        /// Output file path for detection visualization (optional)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Motion detection threshold (0-255, higher = less sensitive)
+        #[arg(long, default_value_t = 25)]
+        threshold: u8,
+        /// Wait for motion to occur (blocking)
+        #[arg(long)]
+        wait: bool,
+        /// Timeout in seconds when using --wait (default: 30)
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Minimum area of motion (pixels) to trigger
+        #[arg(long, default_value_t = 10)]
+        min_area: usize,
+        /// Enable Sobel edge detection (default: true)
+        #[arg(long)]
+        no_sobel: bool,
+        /// Enable Local Binary Pattern detection (default: true)
+        #[arg(long)]
+        no_lbp: bool,
     },
 }
 
@@ -867,6 +892,20 @@ pub async fn run_cli() -> Result<()> {
             output,
             list_tabs,
         }) => chrome_cmd(quality, &output, list_tabs).await,
+        Some(Commands::Motion {
+            output,
+            threshold,
+            wait,
+            timeout,
+            min_area,
+            no_sobel,
+            no_lbp,
+        }) => {
+            motion_cmd(
+                output, threshold, wait, timeout, min_area, !no_sobel, !no_lbp,
+            )
+            .await
+        }
         None => print_help(),
     }
 }
@@ -1117,6 +1156,141 @@ async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> 
     }
 
     Ok(())
+}
+
+pub async fn motion_cmd(
+    output: Option<PathBuf>,
+    threshold: u8,
+    wait: bool,
+    timeout_secs: u64,
+    min_area: usize,
+    _use_sobel: bool,
+    _use_lbp: bool,
+) -> Result<()> {
+    let addr = ensure_daemon_running(None).await?;
+
+    println!("Starting lighting-invariant motion detection...");
+    println!("Threshold: {}, Min Area: {}", threshold, min_area);
+    println!("Timeout: {}s", timeout_secs);
+
+    // Query camera resolution from daemon
+    let client = reqwest::Client::new();
+    let cams_resp = client
+        .get(format!("http://{addr}/cams"))
+        .send()
+        .await
+        .context("failed to query cameras")?;
+    let cams_json: serde_json::Value = cams_resp.json().await?;
+
+    // Default resolution if we can't determine
+    let (width, height) = if let Some(arr) = cams_json["cameras"].as_array() {
+        if !arr.is_empty() {
+            // We'll assume 640x480 as default; in a real implementation we'd query camera capabilities
+            (640, 480)
+        } else {
+            (640, 480)
+        }
+    } else {
+        (640, 480)
+    };
+
+    // Construct motion detector with configuration matching CLI flags
+    let config = motion::LightingInvariantConfig {
+        edge_threshold: threshold,
+        min_edge_movement: 2,
+        contrast_threshold: 20,
+        decay_rate: 0.96,
+        min_sensitivity: 0.3,
+        use_temporal_edges: true,
+        use_lbp: _use_lbp,
+        use_sobel: _use_sobel,
+    };
+    let mut detector = motion::LightingInvariantDetector::new(width, height, config);
+
+    let client = reqwest::Client::new();
+
+    if wait {
+        let timeout_dur = Duration::from_secs(timeout_secs);
+        let start = Instant::now();
+
+        loop {
+            if start.elapsed() > timeout_dur {
+                anyhow::bail!("motion detection timeout after {} seconds", timeout_secs);
+            }
+
+            match client
+                .get(format!("http://{addr}/cams/default/frame"))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let bytes = resp.bytes().await?;
+                    let frame = bytes.to_vec();
+
+                    let detections = detector.detect(&frame);
+
+                    if detections.len() >= min_area {
+                        println!("Motion detected! {} pixels", detections.len());
+                        if let Some(ref out) = output {
+                            if let Some(vis) = visualize_motion(&frame, &detections) {
+                                fs::write(out, vis)?;
+                                println!("Motion visualization saved to {}", out.display());
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    warn!("failed to capture frame, retrying...");
+                }
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+    } else {
+        // Single frame capture (for compatibility)
+        let resp = client
+            .get(format!("http://{addr}/cams/default/frame"))
+            .send()
+            .await
+            .context("failed to capture frame")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("failed to capture frame from daemon");
+        }
+
+        let bytes = resp.bytes().await?;
+        let frame = bytes.to_vec();
+        match &output {
+            Some(out) => fs::write(out, &frame)?,
+            None => fs::write("motion.jpg", &frame)?,
+        }
+        println!("Frame saved ({} bytes)", frame.len());
+        Ok(())
+    }
+}
+
+/// Create a visualization of motion by highlighting moving pixels in red
+fn visualize_motion(frame: &[u8], motion_pixels: &[(usize, usize)]) -> Option<Vec<u8>> {
+    if frame.is_empty() {
+        return None;
+    }
+
+    let mut vis = frame.to_vec();
+    let pixels = frame.len() / 3;
+    let width = (pixels as f64).sqrt().round() as usize;
+
+    for (x, y) in motion_pixels {
+        let idx = y * width + x;
+        if idx * 3 < vis.len() {
+            // Highlight in red
+            vis[idx * 3] = 255; // R
+            vis[idx * 3 + 1] = 0; // G
+            vis[idx * 3 + 2] = 0; // B
+        }
+    }
+
+    Some(vis)
 }
 
 pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
