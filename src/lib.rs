@@ -900,7 +900,12 @@ pub async fn run_cli() -> Result<()> {
             min_area,
             no_sobel,
             no_lbp,
-        }) => motion_cmd(output, threshold, wait, timeout, min_area, !no_sobel, !no_lbp).await,
+        }) => {
+            motion_cmd(
+                output, threshold, wait, timeout, min_area, !no_sobel, !no_lbp,
+            )
+            .await
+        }
         None => print_help(),
     }
 }
@@ -1176,7 +1181,7 @@ pub async fn motion_cmd(
         .await
         .context("failed to query cameras")?;
     let cams_json: serde_json::Value = cams_resp.json().await?;
-    
+
     // Default resolution if we can't determine
     let (width, height) = if let Some(arr) = cams_json["cameras"].as_array() {
         if arr.first().is_some() {
@@ -1223,7 +1228,7 @@ pub async fn motion_cmd(
                     let frame = bytes.to_vec();
 
                     let detections = detector.detect(&frame);
-                    
+
                     if detections.len() >= min_area {
                         println!("Motion detected! {} pixels", detections.len());
                         if let Some(ref out) = output {
@@ -1279,9 +1284,9 @@ fn visualize_motion(frame: &[u8], motion_pixels: &[(usize, usize)]) -> Option<Ve
         let idx = y * width + x;
         if idx * 3 < vis.len() {
             // Highlight in red
-            vis[idx * 3] = 255;     // R
-            vis[idx * 3 + 1] = 0;   // G
-            vis[idx * 3 + 2] = 0;   // B
+            vis[idx * 3] = 255; // R
+            vis[idx * 3 + 1] = 0; // G
+            vis[idx * 3 + 2] = 0; // B
         }
     }
 

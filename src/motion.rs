@@ -12,12 +12,11 @@
 /// - Local shadows (clouds, objects passing)
 /// - Camera exposure changes
 /// - Flickering lights
-/// 
+///
 /// Still detects:
 /// - Objects entering/leaving scene
 /// - People/animals moving
 /// - Screen changes (pixel-level motion)
-
 use std::cmp;
 
 #[derive(Clone, Debug)]
@@ -25,27 +24,27 @@ pub struct LightingInvariantConfig {
     /// Edge detection threshold (0-255)
     /// Higher = only strong edges trigger motion
     pub edge_threshold: u8,
-    
+
     /// Minimum edge movement distance (pixels)
     /// Prevents noise from triggering detections
     pub min_edge_movement: u8,
-    
+
     /// Local contrast threshold (0-255)
     /// Changes in local pattern indicate motion
     pub contrast_threshold: u8,
-    
+
     /// Decay rate for edge maps (same as luminance)
     pub decay_rate: f32,
-    
+
     /// Sensitivity floor
     pub min_sensitivity: f32,
-    
+
     /// Enable temporal edge tracking
     pub use_temporal_edges: bool,
-    
+
     /// Enable local binary patterns (more robust but slower)
     pub use_lbp: bool,
-    
+
     /// Enable gradient magnitude (Sobel edges)
     pub use_sobel: bool,
 }
@@ -95,21 +94,37 @@ impl SobelEdgeDetector {
 
     /// Compute horizontal gradient (Sobel Gx)
     #[inline]
-    fn sobel_gx(_topleft: u8, _top: u8, topright: u8,
-                left: u8, right: u8,
-                botleft: u8, _bot: u8, botright: u8) -> i16 {
-        -(_topleft as i16) + topright as i16
-        - 2 * (left as i16) + 2 * (right as i16)
-        - (botleft as i16) + botright as i16
+    fn sobel_gx(
+        _topleft: u8,
+        _top: u8,
+        topright: u8,
+        left: u8,
+        right: u8,
+        botleft: u8,
+        _bot: u8,
+        botright: u8,
+    ) -> i16 {
+        -(_topleft as i16) + topright as i16 - 2 * (left as i16) + 2 * (right as i16)
+            - (botleft as i16)
+            + botright as i16
     }
 
     /// Compute vertical gradient (Sobel Gy)
     #[inline]
-    fn sobel_gy(topleft: u8, top: u8, topright: u8,
-                _left: u8, _right: u8,
-                botleft: u8, bot: u8, botright: u8) -> i16 {
+    fn sobel_gy(
+        topleft: u8,
+        top: u8,
+        topright: u8,
+        _left: u8,
+        _right: u8,
+        botleft: u8,
+        bot: u8,
+        botright: u8,
+    ) -> i16 {
         topleft as i16 + 2 * top as i16 + topright as i16
-        - botleft as i16 - 2 * bot as i16 - botright as i16
+            - botleft as i16
+            - 2 * bot as i16
+            - botright as i16
     }
 
     /// Detect edges in luminance frame
@@ -179,10 +194,17 @@ impl LocalBinaryPattern {
 
     /// Compute LBP for single pixel (8-bit pattern)
     #[inline]
-    fn compute_lbp(center: u8,
-                    tl: u8, tm: u8, tr: u8,
-                    ml: u8, mr: u8,
-                    bl: u8, bm: u8, br: u8) -> u8 {
+    fn compute_lbp(
+        center: u8,
+        tl: u8,
+        tm: u8,
+        tr: u8,
+        ml: u8,
+        mr: u8,
+        bl: u8,
+        bm: u8,
+        br: u8,
+    ) -> u8 {
         let mut pattern = 0u8;
         pattern |= if tl > center { 1 << 0 } else { 0 };
         pattern |= if tm > center { 1 << 1 } else { 0 };
@@ -263,11 +285,16 @@ pub struct AdaptiveThreshold {
 }
 
 impl AdaptiveThreshold {
-    pub fn new(width: usize, height: usize, region_size: usize, 
-               decay_rate: f32, min_sensitivity: f32) -> Self {
+    pub fn new(
+        width: usize,
+        height: usize,
+        region_size: usize,
+        decay_rate: f32,
+        min_sensitivity: f32,
+    ) -> Self {
         let regions_x = (width + region_size - 1) / region_size;
         let regions_y = (height + region_size - 1) / region_size;
-        
+
         Self {
             width,
             region_size,
@@ -281,10 +308,10 @@ impl AdaptiveThreshold {
     pub fn threshold_at(&self, x: usize, y: usize, base_threshold: u8) -> u8 {
         let region_x = x / self.region_size;
         let region_y = y / self.region_size;
-        
+
         let regions_x = (self.width + self.region_size - 1) / self.region_size;
         let idx = region_y * regions_x + region_x;
-        
+
         let sensitivity = self.sensitivities.get(idx).copied().unwrap_or(1.0);
         let adjusted = (base_threshold as f32 * sensitivity) as u8;
         adjusted.max((base_threshold as f32 * self.min_sensitivity) as u8)
@@ -294,10 +321,10 @@ impl AdaptiveThreshold {
     pub fn register_detection(&mut self, x: usize, y: usize) {
         let region_x = x / self.region_size;
         let region_y = y / self.region_size;
-        
+
         let regions_x = (self.width + self.region_size - 1) / self.region_size;
         let idx = region_y * regions_x + region_x;
-        
+
         if let Some(threshold) = self.sensitivities.get_mut(idx) {
             *threshold *= 0.85; // Damping
             *threshold = threshold.max(self.min_sensitivity);
@@ -318,20 +345,20 @@ pub struct LightingInvariantDetector {
     width: usize,
     height: usize,
     config: LightingInvariantConfig,
-    
+
     // Image processing
     lum_frame: Vec<u8>,
     prev_lum_frame: Vec<u8>,
-    
+
     // Edge detection
     sobel: SobelEdgeDetector,
-    
+
     // Texture analysis
     lbp: LocalBinaryPattern,
-    
+
     // Adaptive thresholding
     adaptive_threshold: AdaptiveThreshold,
-    
+
     // Metrics
     frame_count: u64,
     detection_count: u64,
@@ -398,7 +425,7 @@ impl LightingInvariantDetector {
         for y in 1..(self.height - 1) {
             for x in 1..(self.width - 1) {
                 let idx = y * self.width + x;
-                
+
                 let mut is_motion = false;
 
                 // METHOD 1: Temporal edge movement
@@ -406,8 +433,10 @@ impl LightingInvariantDetector {
                     let curr_edge = edges[idx];
                     let prev_edge = self.sobel.prev_edges()[idx];
                     let edge_delta = (curr_edge as i16 - prev_edge as i16).abs() as u8;
-                    
-                    if edge_delta > self.config.min_edge_movement && curr_edge > self.config.edge_threshold {
+
+                    if edge_delta > self.config.min_edge_movement
+                        && curr_edge > self.config.edge_threshold
+                    {
                         is_motion = true;
                     }
                 }
@@ -416,16 +445,19 @@ impl LightingInvariantDetector {
                 if self.config.use_lbp && !is_motion {
                     let curr_pattern = self.lbp.pattern(x, y);
                     let prev_pattern = self.lbp.prev_pattern(x, y);
-                    let pattern_distance = LocalBinaryPattern::hamming_distance(curr_pattern, prev_pattern);
-                    
+                    let pattern_distance =
+                        LocalBinaryPattern::hamming_distance(curr_pattern, prev_pattern);
+
                     if pattern_distance > self.config.contrast_threshold {
                         is_motion = true;
                     }
                 }
 
                 if is_motion {
-                    let threshold = self.adaptive_threshold.threshold_at(x, y, self.config.edge_threshold);
-                    
+                    let threshold =
+                        self.adaptive_threshold
+                            .threshold_at(x, y, self.config.edge_threshold);
+
                     // Double-check with edge magnitude
                     if edges[idx] > threshold {
                         detections.push((x, y));
@@ -463,7 +495,7 @@ mod tests {
     #[test]
     fn test_sobel_edge_detection() {
         let mut detector = SobelEdgeDetector::new(10, 10);
-        
+
         // Create frame with vertical edge
         let mut frame = vec![100u8; 10 * 10];
         for y in 0..10 {
@@ -473,7 +505,7 @@ mod tests {
         }
 
         let edges = detector.detect(&frame);
-        
+
         // Check that edges are detected around x=4-5
         let mut edge_found = false;
         for y in 1..9 {
@@ -483,24 +515,24 @@ mod tests {
                 break;
             }
         }
-        
+
         assert!(edge_found, "Should detect vertical edge");
     }
 
     #[test]
     fn test_lbp_texture() {
         let mut lbp = LocalBinaryPattern::new(10, 10);
-        
+
         let frame1 = vec![100u8; 10 * 10];
         lbp.compute(&frame1);
         let pattern1 = lbp.pattern(5, 5);
-        
+
         // Create slightly different frame (some pixels brighter)
         let mut frame2 = vec![100u8; 10 * 10];
         frame2[4 * 10 + 4] = 120; // Top-left neighbor
         lbp.compute(&frame2);
         let pattern2 = lbp.pattern(5, 5);
-        
+
         let distance = LocalBinaryPattern::hamming_distance(pattern1, pattern2);
         assert!(distance > 0, "Should detect pattern change");
     }
@@ -509,24 +541,31 @@ mod tests {
     fn test_global_lighting_change() {
         let config = LightingInvariantConfig::default();
         let mut detector = LightingInvariantDetector::new(100, 100, config);
-        
+
         // Create frame with uniform brightness
         let frame1 = vec![128u8; 100 * 100 * 3];
         let _detections1 = detector.detect(&frame1);
-        
+
         // Create frame with same content but 50% brighter
-        let frame2: Vec<u8> = frame1.iter().map(|&p| (p as f32 * 1.5).min(255.0) as u8).collect();
+        let frame2: Vec<u8> = frame1
+            .iter()
+            .map(|&p| (p as f32 * 1.5).min(255.0) as u8)
+            .collect();
         let detections2 = detector.detect(&frame2);
-        
+
         // Global lighting change should produce minimal detections
-        assert!(detections2.len() < 100, "Global lighting change should not produce many detections, got {}", detections2.len());
+        assert!(
+            detections2.len() < 100,
+            "Global lighting change should not produce many detections, got {}",
+            detections2.len()
+        );
     }
 
     #[test]
     fn test_local_shadow() {
         let config = LightingInvariantConfig::default();
         let mut detector = LightingInvariantDetector::new(100, 100, config);
-        
+
         // Create initial frame with pattern
         let mut frame1 = vec![150u8; 100 * 100 * 3];
         for i in 0..(100 * 100) {
@@ -534,9 +573,9 @@ mod tests {
                 frame1[i * 3] = 100;
             }
         }
-        
+
         detector.detect(&frame1);
-        
+
         // Add shadow (local darkening)
         let mut frame2 = frame1.clone();
         for y in 25..75 {
@@ -547,9 +586,9 @@ mod tests {
                 frame2[idx + 2] = (frame2[idx + 2] as f32 * 0.7) as u8;
             }
         }
-        
+
         let detections = detector.detect(&frame2);
-        
+
         // Should detect shadow boundary as motion (edges move)
         assert!(!detections.is_empty(), "Should detect shadow edges");
     }
@@ -558,7 +597,7 @@ mod tests {
     fn test_object_motion() {
         let config = LightingInvariantConfig::default();
         let mut detector = LightingInvariantDetector::new(100, 100, config);
-        
+
         // Create frame with object
         let mut frame1 = vec![150u8; 100 * 100 * 3];
         for y in 40..60 {
@@ -569,9 +608,9 @@ mod tests {
                 frame1[idx + 2] = 50;
             }
         }
-        
+
         detector.detect(&frame1);
-        
+
         // Move object
         let mut frame2 = vec![150u8; 100 * 100 * 3];
         for y in 45..65 {
@@ -582,9 +621,9 @@ mod tests {
                 frame2[idx + 2] = 50;
             }
         }
-        
+
         let detections = detector.detect(&frame2);
-        
+
         // Should detect object movement
         assert!(!detections.is_empty(), "Should detect object motion");
     }
@@ -593,34 +632,37 @@ mod tests {
     fn test_static_scene_no_detections_after_warmup() {
         let config = LightingInvariantConfig::default();
         let mut detector = LightingInvariantDetector::new(64, 64, config);
-        
+
         let frame = vec![128u8; 64 * 64 * 3];
-        
+
         // First detection warms up prev_lum
         detector.detect(&frame);
-        
+
         // Second detection on same frame should have no motion
         let detections = detector.detect(&frame);
-        assert!(detections.is_empty(), "Static scene should have no detections after warmup");
+        assert!(
+            detections.is_empty(),
+            "Static scene should have no detections after warmup"
+        );
     }
 
     #[test]
     fn test_detector_reset() {
         let config = LightingInvariantConfig::default();
         let mut detector = LightingInvariantDetector::new(64, 64, config);
-        
+
         let frame1 = vec![100u8; 64 * 64 * 3];
         let mut frame2 = vec![100u8; 64 * 64 * 3];
         frame2[0] = 200; // small change
-        
+
         detector.detect(&frame1);
         detector.detect(&frame2);
-        
+
         // Reset
         detector.prev_lum_frame.fill(0);
         detector.frame_count = 0;
         detector.detection_count = 0;
-        
+
         let metrics = detector.metrics();
         // DecayMetrics uses edge_count to store frame_count
         assert_eq!(metrics.edge_count, 0);
