@@ -1204,6 +1204,7 @@ pub async fn motion_cmd(
         use_temporal_edges: true,
         use_lbp: _use_lbp,
         use_sobel: _use_sobel,
+        dilate: false,
     };
     let mut detector = motion::LightingInvariantDetector::new(width, height, config);
 

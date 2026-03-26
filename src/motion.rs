@@ -18,6 +18,7 @@
 /// - People/animals moving
 /// - Screen changes (pixel-level motion)
 use std::cmp;
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub struct LightingInvariantConfig {
@@ -47,19 +48,23 @@ pub struct LightingInvariantConfig {
 
     /// Enable gradient magnitude (Sobel edges)
     pub use_sobel: bool,
+
+    /// Dilate detections by 1 pixel (4-neighborhood) to fill gaps
+    pub dilate: bool,
 }
 
 impl Default for LightingInvariantConfig {
     fn default() -> Self {
         Self {
-            edge_threshold: 2,
-            min_edge_movement: 1,
+            edge_threshold: 1,
+            min_edge_movement: 0,
             contrast_threshold: 1,
             decay_rate: 0.96,
             min_sensitivity: 0.3,
             use_temporal_edges: true,
             use_lbp: true,
             use_sobel: true,
+            dilate: true,  // experimental: dilation post-processing
         }
     }
 }
@@ -477,6 +482,25 @@ impl LightingInvariantDetector {
 
         // Update previous frame
         self.prev_lum_frame.copy_from_slice(&self.lum_frame);
+
+        // Optional dilation: expand detections by 1 pixel (8-neighborhood)
+        if self.config.dilate {
+            let mut dilated_set: HashSet<(usize, usize)> = detections.iter().cloned().collect();
+            for &(x, y) in &detections {
+                // 4-connected
+                if x > 0 { dilated_set.insert((x - 1, y)); }
+                if x + 1 < self.width { dilated_set.insert((x + 1, y)); }
+                if y > 0 { dilated_set.insert((x, y - 1)); }
+                if y + 1 < self.height { dilated_set.insert((x, y + 1)); }
+                // diagonals
+                if x > 0 && y > 0 { dilated_set.insert((x - 1, y - 1)); }
+                if x + 1 < self.width && y > 0 { dilated_set.insert((x + 1, y - 1)); }
+                if x > 0 && y + 1 < self.height { dilated_set.insert((x - 1, y + 1)); }
+                if x + 1 < self.width && y + 1 < self.height { dilated_set.insert((x + 1, y + 1)); }
+            }
+            detections = dilated_set.into_iter().collect();
+        }
+
         self.frame_count += 1;
 
         detections
