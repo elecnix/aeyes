@@ -52,9 +52,9 @@ pub struct LightingInvariantConfig {
 impl Default for LightingInvariantConfig {
     fn default() -> Self {
         Self {
-            edge_threshold: 25,
-            min_edge_movement: 2,
-            contrast_threshold: 20,
+            edge_threshold: 2,
+            min_edge_movement: 1,
+            contrast_threshold: 1,
             decay_rate: 0.96,
             min_sensitivity: 0.3,
             use_temporal_edges: true,

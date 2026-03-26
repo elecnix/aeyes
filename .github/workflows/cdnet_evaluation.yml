@@ -1,0 +1,39 @@
+name: CDnet Evaluation
+
+on:
+  workflow_dispatch: {}  # manual triggering only
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tests/cdnet_evaluation
+      - name: Cache CDnet dataset
+        uses: actions/cache@v4
+        with:
+          path: tests/cdnet_evaluation/data
+          key: cdnet-dataset-v1
+          restore-keys: |
+            cdnet-dataset-
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+      - name: Run CDnet evaluation
+        env:
+          CDNET_DOWNLOAD: 1
+          CDNET_MAX_FRAMES: 0
+        run: |
+          cargo run --release --bin cdnet-evaluation
+        timeout-minutes: 180
+      - name: Upload evaluation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdnet-report-${{ github.run_number }}
+          path: |
+            tests/cdnet_evaluation/results/cdnet_report.json
+            tests/cdnet_evaluation/results/*.log
