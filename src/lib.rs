@@ -137,7 +137,7 @@ pub enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Motion detection threshold (0-255, higher = less sensitive)
-        #[arg(long, default_value_t = 25)]
+        #[arg(long, default_value_t = 1)]
         threshold: u8,
         /// Wait for motion to occur (blocking)
         #[arg(long)]
@@ -1197,14 +1197,14 @@ pub async fn motion_cmd(
     // Construct motion detector with configuration matching CLI flags
     let config = motion::LightingInvariantConfig {
         edge_threshold: threshold,
-        min_edge_movement: 2,
-        contrast_threshold: 20,
+        min_edge_movement: 0,
+        contrast_threshold: 1,
         decay_rate: 0.96,
         min_sensitivity: 0.3,
         use_temporal_edges: true,
         use_lbp: _use_lbp,
         use_sobel: _use_sobel,
-        dilate: false,
+        dilate: true,
     };
     let mut detector = motion::LightingInvariantDetector::new(width, height, config);
 
