@@ -8,6 +8,7 @@ use std::fs;
 use std::io::Write;
 
 use aeyes::motion::{LightingInvariantDetector, LightingInvariantConfig};
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Metrics {
@@ -274,21 +275,22 @@ fn evaluate_category(category_name: &str, dataset_root: &PathBuf, config: &Confi
         return Err(anyhow!("no sequences found in category: {}", category_name));
     }
     println!("  Found {} sequences", sequence_dirs.len());
+    let results: Vec<Result<SequenceResult>> = sequence_dirs.par_iter().map(|seq_dir| evaluate_sequence(seq_dir, config)).collect();
     let mut sequence_results = Vec::new();
     let mut agg_tp = 0u64;
     let mut agg_fp = 0u64;
     let mut agg_fn = 0u64;
     let mut total_frames = 0u64;
     let mut total_time = 0.0;
-    for seq_dir in &sequence_dirs {
-        match evaluate_sequence(seq_dir, config) {
-            Ok(result) => {
-                sequence_results.push(result.clone());
-                agg_tp += result.metrics.true_positives;
-                agg_fp += result.metrics.false_positives;
-                agg_fn += result.metrics.false_negatives;
-                total_frames += result.frames;
-                total_time += result.metrics.total_time_secs;
+    for result in results {
+        match result {
+            Ok(res) => {
+                sequence_results.push(res.clone());
+                agg_tp += res.metrics.true_positives;
+                agg_fp += res.metrics.false_positives;
+                agg_fn += res.metrics.false_negatives;
+                total_frames += res.frames;
+                total_time += res.metrics.total_time_secs;
             }
             Err(e) => {
                 eprintln!("    ✗ Error: {}", e);
@@ -327,11 +329,14 @@ fn print_summary(report: &Report) {
     println!("{}", "═".repeat(60));
     println!("Frames: {}", report.overall.frames_processed);
     println!("Time: {:.2} seconds", report.overall.total_time_secs);
+    let fps = report.overall.frames_processed as f64 / report.overall.total_time_secs;
+    println!("Throughput: {:.2} FPS", fps);
     println!("Config: max_frames_per_sequence={}", report.config.max_frames_per_sequence);
     println!();
     println!("METRIC overall_f1={:.6}", report.overall.f1_score);
     println!("METRIC overall_precision={:.6}", report.overall.precision);
     println!("METRIC overall_recall={:.6}", report.overall.recall);
+    println!("METRIC overall_fps={:.6}", fps);
 }
 
 fn main() -> Result<()> {
