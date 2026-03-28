@@ -390,10 +390,11 @@ impl LightingInvariantDetector {
         }
     }
 
-    /// Convert RGB to luminance
+    /// Convert RGB to luminance using fixed-point approximation
     #[inline]
     fn rgb_to_lum(r: u8, g: u8, b: u8) -> u8 {
-        (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8
+        // (306*r + 601*g + 117*b) >> 10 ≈ 0.299*r + 0.587*g + 0.114*b
+        (((306 * r as u16) + (601 * g as u16) + (117 * b as u16)) >> 10) as u8
     }
 
     /// Detect motion in RGB frame
