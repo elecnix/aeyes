@@ -62,9 +62,9 @@ impl Default for LightingInvariantConfig {
             decay_rate: 0.96,
             min_sensitivity: 0.3,
             use_temporal_edges: true,
-            use_lbp: true,
+            use_lbp: true,   // keep LBP for accuracy
             use_sobel: true,
-            dilate: true,  // experimental: dilation post-processing
+            dilate: false,   // dilation off for speed
         }
     }
 }
