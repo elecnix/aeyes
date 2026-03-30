@@ -421,7 +421,8 @@ impl LightingInvariantDetector {
             vec![0; self.width * self.height]
         };
 
-        if self.config.use_lbp {
+        // Compute LBP every other frame to save CPU (temporal edges carry most motion info)
+        if self.config.use_lbp && (self.frame_count & 1) == 0 {
             self.lbp.compute(&self.lum_frame);
         }
 
