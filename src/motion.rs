@@ -84,7 +84,7 @@ pub struct SobelEdgeDetector {
     width: usize,
     height: usize,
     edges: Vec<u8>,
-    prev_edges: Vec<u8>,
+    pub prev_edges: Vec<u8>,
 }
 
 impl SobelEdgeDetector {
@@ -162,7 +162,8 @@ impl SobelEdgeDetector {
                 let gx = Self::sobel_gx(tl, tm, tr, ml, mr, bl, bm, br);
                 let gy = Self::sobel_gy(tl, tm, tr, ml, mr, bl, bm, br);
                 // Magnitude: sqrt(gx² + gy²) ≈ |gx| + |gy| (faster)
-                let magnitude = (gx.abs() + gy.abs()) / 2;
+                // Clamp to u8 range
+                let magnitude = cmp::min(255, (gx.abs() + gy.abs()) as u16) as u8;
                 *edge = cmp::min(255, magnitude as u8);
             }
             // Borders remain unchanged (from previous frame)
@@ -170,12 +171,9 @@ impl SobelEdgeDetector {
 
         &self.edges
     }
-
-    /// Get previous edge map for temporal comparison
-    pub fn prev_edges(&self) -> &[u8] {
-        &self.prev_edges
-    }
 }
+
+/// Local Binary Pattern
 
 /// Local Binary Pattern - texture descriptor invariant to monotonic lighting
 /// Compares each pixel to neighbors: bright neighbor = 1 bit
@@ -436,7 +434,7 @@ impl LightingInvariantDetector {
                 // METHOD 1: Temporal edge movement
                 if self.config.use_temporal_edges {
                     let curr_edge = edges[idx];
-                    let prev_edge = self.sobel.prev_edges()[idx];
+                    let prev_edge = self.sobel.prev_edges[idx];
                     let edge_delta = (curr_edge as i16 - prev_edge as i16).unsigned_abs() as u8;
                     if edge_delta > self.config.min_edge_movement && curr_edge > self.config.edge_threshold {
                         is_motion = true;
