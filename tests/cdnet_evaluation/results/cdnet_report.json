@@ -1,6 +1,6 @@
 {
   "dataset": "CDnet 2014",
-  "timestamp": "2026-03-30T15:32:07.917809388+00:00",
+  "timestamp": "2026-03-30T17:28:44.351311236+00:00",
   "categories": [
     {
       "name": "baseline",
@@ -15,7 +15,7 @@
             "false_positives": 0,
             "false_negatives": 23523,
             "frames_processed": 2,
-            "total_time_secs": 3.567607146
+            "total_time_secs": 5.435890242
           },
           "frames": 2
         },
@@ -29,7 +29,7 @@
             "false_positives": 0,
             "false_negatives": 14858,
             "frames_processed": 2,
-            "total_time_secs": 93.16476554
+            "total_time_secs": 131.012747054
           },
           "frames": 2
         },
@@ -43,7 +43,7 @@
             "false_positives": 0,
             "false_negatives": 15319,
             "frames_processed": 2,
-            "total_time_secs": 3.7467573659999998
+            "total_time_secs": 5.30591388
           },
           "frames": 2
         },
@@ -57,7 +57,7 @@
             "false_positives": 0,
             "false_negatives": 4997,
             "frames_processed": 2,
-            "total_time_secs": 2.977222119
+            "total_time_secs": 4.263120616
           },
           "frames": 2
         }
@@ -70,472 +70,19 @@
         "false_positives": 0,
         "false_negatives": 58697,
         "frames_processed": 8,
-        "total_time_secs": 103.456352171
-      }
-    },
-    {
-      "name": "cameraJitter",
-      "sequences": [
-        {
-          "name": "boulevard",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9289358428030303,
-            "f1_score": 0.9631588798237567,
-            "true_positives": 156953,
-            "false_positives": 0,
-            "false_negatives": 12007,
-            "frames_processed": 2,
-            "total_time_secs": 3.486345532
-          },
-          "frames": 2
-        },
-        {
-          "name": "badminton",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9302662037037037,
-            "f1_score": 0.9638734822365462,
-            "true_positives": 643000,
-            "false_positives": 0,
-            "false_negatives": 48200,
-            "frames_processed": 2,
-            "total_time_secs": 59.749791201
-          },
-          "frames": 2
-        },
-        {
-          "name": "sidewalk",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9688742897727273,
-            "f1_score": 0.984191113475881,
-            "true_positives": 163701,
-            "false_positives": 0,
-            "false_negatives": 5259,
-            "frames_processed": 2,
-            "total_time_secs": 3.492185634
-          },
-          "frames": 2
-        },
-        {
-          "name": "traffic",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9775065104166667,
-            "f1_score": 0.9886253271658793,
-            "true_positives": 150145,
-            "false_positives": 0,
-            "false_negatives": 3455,
-            "frames_processed": 2,
-            "total_time_secs": 2.874135166
-          },
-          "frames": 2
-        }
-      ],
-      "aggregate": {
-        "precision": 1.0,
-        "recall": 0.9417266977813853,
-        "f1_score": 0.969988926719091,
-        "true_positives": 1113799,
-        "false_positives": 0,
-        "false_negatives": 68921,
-        "frames_processed": 8,
-        "total_time_secs": 69.602457533
-      }
-    },
-    {
-      "name": "dynamicBackground",
-      "sequences": [
-        {
-          "name": "fountain01",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.8744293338477366,
-            "f1_score": 0.9330085888623508,
-            "true_positives": 217586,
-            "false_positives": 0,
-            "false_negatives": 31246,
-            "frames_processed": 2,
-            "total_time_secs": 7.6071307820000005
-          },
-          "frames": 2
-        },
-        {
-          "name": "overpass",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.87193359375,
-            "f1_score": 0.9315860313220579,
-            "true_positives": 133929,
-            "false_positives": 0,
-            "false_negatives": 19671,
-            "frames_processed": 2,
-            "total_time_secs": 3.336396541
-          },
-          "frames": 2
-        },
-        {
-          "name": "fountain02",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9832859117798354,
-            "f1_score": 0.9915725271273848,
-            "true_positives": 244673,
-            "false_positives": 0,
-            "false_negatives": 4159,
-            "frames_processed": 2,
-            "total_time_secs": 7.775416248
-          },
-          "frames": 2
-        },
-        {
-          "name": "canoe",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.8854557291666667,
-            "f1_score": 0.9392484962328129,
-            "true_positives": 136006,
-            "false_positives": 0,
-            "false_negatives": 17594,
-            "frames_processed": 2,
-            "total_time_secs": 3.340684765
-          },
-          "frames": 2
-        },
-        {
-          "name": "fall",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9820659722222222,
-            "f1_score": 0.9909518512354708,
-            "true_positives": 678804,
-            "false_positives": 0,
-            "false_negatives": 12396,
-            "frames_processed": 2,
-            "total_time_secs": 59.774184394
-          },
-          "frames": 2
-        },
-        {
-          "name": "boats",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.8796484375,
-            "f1_score": 0.9359712379725265,
-            "true_positives": 135114,
-            "false_positives": 0,
-            "false_negatives": 18486,
-            "frames_processed": 2,
-            "total_time_secs": 3.183750294
-          },
-          "frames": 2
-        }
-      ],
-      "aggregate": {
-        "precision": 1.0,
-        "recall": 0.9372284295468652,
-        "f1_score": 0.9675972283414106,
-        "true_positives": 1546112,
-        "false_positives": 0,
-        "false_negatives": 103552,
-        "frames_processed": 12,
-        "total_time_secs": 85.01756302400001
-      }
-    },
-    {
-      "name": "intermittentObjectMotion",
-      "sequences": [
-        {
-          "name": "tramstop",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9714988425925926,
-            "f1_score": 0.9855434064724444,
-            "true_positives": 241740,
-            "false_positives": 0,
-            "false_negatives": 7092,
-            "frames_processed": 2,
-            "total_time_secs": 7.769220327
-          },
-          "frames": 2
-        },
-        {
-          "name": "winterDriveway",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9196484375,
-            "f1_score": 0.9581425635390595,
-            "true_positives": 141258,
-            "false_positives": 0,
-            "false_negatives": 12342,
-            "frames_processed": 2,
-            "total_time_secs": 3.365837655
-          },
-          "frames": 2
-        },
-        {
-          "name": "abandonedBox",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9795605066872428,
-            "f1_score": 0.9896747317176163,
-            "true_positives": 243746,
-            "false_positives": 0,
-            "false_negatives": 5086,
-            "frames_processed": 2,
-            "total_time_secs": 7.969343628
-          },
-          "frames": 2
-        },
-        {
-          "name": "sofa",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9279036458333333,
-            "f1_score": 0.9626037565090536,
-            "true_positives": 142526,
-            "false_positives": 0,
-            "false_negatives": 11074,
-            "frames_processed": 2,
-            "total_time_secs": 3.304741353
-          },
-          "frames": 2
-        },
-        {
-          "name": "parking",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9184765625,
-            "f1_score": 0.9575061592653676,
-            "true_positives": 141078,
-            "false_positives": 0,
-            "false_negatives": 12522,
-            "frames_processed": 2,
-            "total_time_secs": 3.299748861
-          },
-          "frames": 2
-        },
-        {
-          "name": "streetLight",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.93677734375,
-            "f1_score": 0.9673567762169357,
-            "true_positives": 143889,
-            "false_positives": 0,
-            "false_negatives": 9711,
-            "frames_processed": 2,
-            "total_time_secs": 3.462199026
-          },
-          "frames": 2
-        }
-      ],
-      "aggregate": {
-        "precision": 1.0,
-        "recall": 0.9480002949470534,
-        "f1_score": 0.9733061102773807,
-        "true_positives": 1054237,
-        "false_positives": 0,
-        "false_negatives": 57827,
-        "frames_processed": 12,
-        "total_time_secs": 29.171090850000002
-      }
-    },
-    {
-      "name": "shadow",
-      "sequences": [
-        {
-          "name": "peopleInShade",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.8864754098360655,
-            "f1_score": 0.9398218553117532,
-            "true_positives": 164388,
-            "false_positives": 0,
-            "false_negatives": 21052,
-            "frames_processed": 2,
-            "total_time_secs": 4.574833595
-          },
-          "frames": 2
-        },
-        {
-          "name": "busStation",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9682465277777778,
-            "f1_score": 0.9838671265138351,
-            "true_positives": 167313,
-            "false_positives": 0,
-            "false_negatives": 5487,
-            "frames_processed": 2,
-            "total_time_secs": 4.188916304
-          },
-          "frames": 2
-        },
-        {
-          "name": "bungalows",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9733854166666667,
-            "f1_score": 0.9865132360315659,
-            "true_positives": 168201,
-            "false_positives": 0,
-            "false_negatives": 4599,
-            "frames_processed": 2,
-            "total_time_secs": 4.11259187
-          },
-          "frames": 2
-        },
-        {
-          "name": "backdoor",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9621809895833333,
-            "f1_score": 0.9807260336240963,
-            "true_positives": 147791,
-            "false_positives": 0,
-            "false_negatives": 5809,
-            "frames_processed": 2,
-            "total_time_secs": 3.484905547
-          },
-          "frames": 2
-        },
-        {
-          "name": "cubicle",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.8123757102272727,
-            "f1_score": 0.8964760514533715,
-            "true_positives": 137259,
-            "false_positives": 0,
-            "false_negatives": 31701,
-            "frames_processed": 2,
-            "total_time_secs": 3.886812538
-          },
-          "frames": 2
-        },
-        {
-          "name": "copyMachine",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.8669068287037037,
-            "f1_score": 0.9287092589464092,
-            "true_positives": 599206,
-            "false_positives": 0,
-            "false_negatives": 91994,
-            "frames_processed": 2,
-            "total_time_secs": 57.84683006
-          },
-          "frames": 2
-        }
-      ],
-      "aggregate": {
-        "precision": 1.0,
-        "recall": 0.8960111341273951,
-        "f1_score": 0.9451538738349952,
-        "true_positives": 1384158,
-        "false_positives": 0,
-        "false_negatives": 160642,
-        "frames_processed": 12,
-        "total_time_secs": 78.094889914
-      }
-    },
-    {
-      "name": "thermal",
-      "sequences": [
-        {
-          "name": "library",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.901171875,
-            "f1_score": 0.948017259091843,
-            "true_positives": 138420,
-            "false_positives": 0,
-            "false_negatives": 15180,
-            "frames_processed": 2,
-            "total_time_secs": 3.042083854
-          },
-          "frames": 2
-        },
-        {
-          "name": "park",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9824317392676768,
-            "f1_score": 0.991138024889163,
-            "true_positives": 199190,
-            "false_positives": 0,
-            "false_negatives": 3562,
-            "frames_processed": 2,
-            "total_time_secs": 5.280804738
-          },
-          "frames": 2
-        },
-        {
-          "name": "diningRoom",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.9465559895833333,
-            "f1_score": 0.9725443240766445,
-            "true_positives": 145391,
-            "false_positives": 0,
-            "false_negatives": 8209,
-            "frames_processed": 2,
-            "total_time_secs": 2.989142808
-          },
-          "frames": 2
-        },
-        {
-          "name": "lakeSide",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.8861197916666667,
-            "f1_score": 0.9396219641846272,
-            "true_positives": 136108,
-            "false_positives": 0,
-            "false_negatives": 17492,
-            "frames_processed": 2,
-            "total_time_secs": 2.971246714
-          },
-          "frames": 2
-        },
-        {
-          "name": "corridor",
-          "metrics": {
-            "precision": 1.0,
-            "recall": 0.94484375,
-            "f1_score": 0.9716397525508155,
-            "true_positives": 145128,
-            "false_positives": 0,
-            "false_negatives": 8472,
-            "frames_processed": 2,
-            "total_time_secs": 3.000126345
-          },
-          "frames": 2
-        }
-      ],
-      "aggregate": {
-        "precision": 1.0,
-        "recall": 0.9352446056547619,
-        "f1_score": 0.9665389097812113,
-        "true_positives": 764237,
-        "false_positives": 0,
-        "false_negatives": 52915,
-        "frames_processed": 10,
-        "total_time_secs": 17.283404459
+        "total_time_secs": 146.017671792
       }
     }
   ],
   "overall": {
     "precision": 1.0,
-    "recall": 0.9341779479871749,
-    "f1_score": 0.9659689781484048,
-    "true_positives": 7132486,
+    "recall": 0.9558217425337187,
+    "f1_score": 0.9774119202657755,
+    "true_positives": 1269943,
     "false_positives": 0,
-    "false_negatives": 502554,
-    "frames_processed": 62,
-    "total_time_secs": 382.625757951
+    "false_negatives": 58697,
+    "frames_processed": 8,
+    "total_time_secs": 146.017671792
   },
   "config": {
     "max_frames_per_sequence": 2

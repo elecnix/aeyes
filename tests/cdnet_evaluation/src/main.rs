@@ -68,18 +68,23 @@ impl Default for Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("tests/cdnet_evaluation/results"));
 
-        Self {
-            cache_dir,
-            download: env::var("CDNET_DOWNLOAD").map(|v| v == "1").unwrap_or(true),
-            output_dir,
-            categories: vec![
+        // Support limiting categories via CDNET_CATEGORIES env var (comma-separated)
+        let categories = env::var("CDNET_CATEGORIES")
+            .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_else(|_| vec![
                 "baseline".to_string(),
                 "cameraJitter".to_string(),
                 "dynamicBackground".to_string(),
                 "intermittentObjectMotion".to_string(),
                 "shadow".to_string(),
                 "thermal".to_string(),
-            ],
+            ]);
+
+        Self {
+            cache_dir,
+            download: env::var("CDNET_DOWNLOAD").map(|v| v == "1").unwrap_or(true),
+            output_dir,
+            categories,
             max_frames_per_sequence: env::var("CDNET_MAX_FRAMES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -170,9 +175,93 @@ fn load_ground_truth(gt_dir: &PathBuf, frame_idx: usize) -> Result<Option<Vec<u8
     Ok(None)
 }
 
+/// Pre-convert dataset to raw RGB binary format for faster I/O.
+/// Raw files store pixel data without any header or compression.
+/// Also writes a .dims file with "WIDTHxHEIGHT\n" for loader.
+fn pre_convert_to_raw(dataset_root: &PathBuf) -> Result<usize> {
+    let mut count = 0;
+    println!("\n🔄 Pre-converting JPEG to raw RGB (this takes ~1 min)...");
+    
+    for category in ["baseline", "cameraJitter", "dynamicBackground", "intermittentObjectMotion", "shadow", "thermal"] {
+        let cat_dir = dataset_root.join(category);
+        if !cat_dir.exists() { continue; }
+        
+        for entry in fs::read_dir(&cat_dir)? {
+            let seq_dir = entry?.path();
+            if !seq_dir.is_dir() { continue; }
+            
+            let input_dir = seq_dir.join("input");
+            let raw_dir = seq_dir.join("raw");
+            
+            if input_dir.exists() && !raw_dir.exists() {
+                fs::create_dir_all(&raw_dir)?;
+                
+                // Find first image to get dimensions
+                let first_file = fs::read_dir(&input_dir)?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path().extension()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("png"))
+                            .unwrap_or(false)
+                    })
+                    .next();
+                
+                let (width, height) = if let Some(first) = first_file {
+                    let img = image::open(first.path())?;
+                    (img.width(), img.height())
+                } else {
+                    continue;
+                };
+                
+                // Write dimensions file
+                fs::write(raw_dir.join(".dims"), format!("{}x{}\n", width, height))?;
+                
+                // Convert all images
+                for entry in fs::read_dir(&input_dir)? {
+                    let file = entry?;
+                    let path = file.path();
+                    let ext = path.extension().and_then(|s| s.to_str());
+                    if !ext.map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("png")).unwrap_or(false) {
+                        continue;
+                    }
+                    
+                    let img = image::open(&path)?;
+                    let rgb = img.to_rgb8();
+                    let raw_name = path.file_stem().unwrap().to_string_lossy().into_owned() + ".raw";
+                    fs::write(raw_dir.join(raw_name), rgb.as_raw())?;
+                    count += 1;
+                }
+                
+                println!("  ✓ {}: {} frames", seq_dir.file_name().unwrap().to_string_lossy(), count);
+            }
+        }
+    }
+    
+    println!("✓ Pre-conversion complete: {} frames", count);
+    Ok(count)
+}
+
+/// Load image from JPEG or pre-converted raw RGB format.
+fn load_frame(path: &PathBuf, dims: Option<(u32, u32)>) -> Option<image::RgbImage> {
+    if path.extension().map(|e| e == "raw").unwrap_or(false) {
+        // Raw format: binary RGB with known dimensions
+        if let Some((w, h)) = dims {
+            fs::read(path).ok().and_then(|data| image::RgbImage::from_raw(w, h, data))
+        } else { None }
+    } else {
+        // JPEG/PNG format
+        image::open(path).ok().map(|img| img.to_rgb8())
+    }
+}
+
 fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<SequenceResult> {
     let seq_name = sequence_dir.file_name().unwrap().to_string_lossy().into_owned();
-    let input_dir = if sequence_dir.join("input").exists() {
+    // Prefer raw/ directory if available (pre-converted from JPEG)
+    let use_raw = sequence_dir.join("raw").exists();
+    let input_dir = if use_raw {
+        sequence_dir.join("raw")
+    } else if sequence_dir.join("input").exists() {
         sequence_dir.join("input")
     } else {
         sequence_dir.clone()
@@ -182,12 +271,15 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
     } else {
         sequence_dir.clone()
     };
+    
+    // Filter for supported formats
     let input_files: Vec<PathBuf> = fs::read_dir(&input_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
             let p = e.path();
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("bmp")
+                ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("png") || 
+                ext.eq_ignore_ascii_case("bmp") || ext.eq_ignore_ascii_case("raw")
             } else { false }
         })
         .map(|e| e.path())
@@ -203,12 +295,22 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
         println!("  ⚠ No groundtruth found in {}, skipping metrics", seq_name);
         return Ok(SequenceResult { name: seq_name, metrics: Metrics { precision: 0.0, recall: 0.0, f1_score: 0.0, true_positives: 0, false_positives: 0, false_negatives: 0, frames_processed: 0, total_time_secs: 0.0 }, frames: input_files.len() as u64 });
     }
-    let first_img = image::open(&input_files[0])?;
-    let (width, height) = first_img.dimensions();
-    let width = width as usize;
-    let height = height as usize;
+    // Load dimensions for raw format
+    let raw_dims = if use_raw {
+        fs::read_to_string(sequence_dir.join("raw/.dims")).ok().and_then(|dims| {
+            let parts: Vec<&str> = dims.trim().split('x').collect();
+            if parts.len() == 2 {
+                Some((parts[0].parse().unwrap_or(1), parts[1].parse().unwrap_or(1)))
+            } else { None }
+        })
+    } else { None };
+    
+    // Load first image to get dimensions (use load_frame helper)
+    let first_img = load_frame(&input_files[0], raw_dims)
+        .ok_or_else(|| anyhow!("failed to load first frame"))?;
+    let (width, height) = (first_img.width() as usize, first_img.height() as usize);
     let mut detector = LightingInvariantDetector::new(width, height, LightingInvariantConfig::default());
-    println!("  ▶ {}: {} frames, {}×{}", seq_name, input_files.len(), width, height);
+    println!("  ▶ {}: {} frames, {}×{} [{}]", seq_name, input_files.len(), width, height, if use_raw { "raw" } else { "jpeg" });
     let mut total_tp = 0u64;
     let mut total_fp = 0u64;
     let mut total_fn = 0u64;
@@ -220,9 +322,13 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
         input_files.len()
     };
     for (i, input_path) in input_files.iter().take(max_frames).enumerate() {
-        let input_img = image::open(input_path)
-            .with_context(|| format!("failed to open input frame: {:?}", input_path))?;
-        let rgb = input_img.to_rgb8();
+        let rgb = match load_frame(input_path, raw_dims) {
+            Some(r) => r,
+            None => {
+                eprintln!("  ✗ {}: failed to decode frame {}", seq_name, i);
+                continue;
+            }
+        };
         let gt_binary = load_ground_truth(&gt_dir, i)?
             .ok_or_else(|| anyhow!("missing ground truth for frame {}", i+1))?;
         let detections = detector.detect(rgb.as_raw());
@@ -353,6 +459,18 @@ fn main() -> Result<()> {
     println!();
     let zip_path = ensure_dataset(&config)?;
     let dataset_root = extract_dataset(&zip_path, &config)?;
+    
+    // Auto-convert to raw if not done yet (skip on subsequent runs)
+    let raw_sequences = dataset_root.join("baseline/highway/raw").exists();
+    if !raw_sequences && env::var("CDNET_PRECONVERT").map(|v| v == "1").unwrap_or(false) {
+        match pre_convert_to_raw(&dataset_root) {
+            Ok(count) => println!("  Pre-converted {} frames to raw format", count),
+            Err(e) => eprintln!("  ⚠ Pre-conversion failed: {}, continuing with JPEG", e),
+        }
+    } else if raw_sequences {
+        println!("  Using pre-converted raw frames (set CDNET_PRECONVERT=0 to re-convert)");
+    }
+    
     let mut category_results = Vec::new();
     let mut overall_tp = 0u64;
     let mut overall_fp = 0u64;
