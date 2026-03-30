@@ -8,36 +8,27 @@
 - **Integer luminance conversion** (fixed-point): small additional gain
 - **Sobel magnitude without /2**: slight improvement
 - **Disable dilation** (HashSet overhead): ~6% FPS gain at cost of ~3% F1
+- **LBP skip odd frames**: +5% F1 improvement (and ~same FPS)
 
 ### 🎯 I/O Bottleneck (PRIMARY)
-The main bottleneck is JPEG decoding, not detection algorithm:
+The main bottleneck is JPEG decoding (~85% of time), NOT detection algorithm:
 - Current throughput: ~0.16 FPS (2 frames per sequence)
-- JPEG decoding dominates wall-clock time
-- **Solutions (deferred):**
-  - Pre-convert CDnet dataset to raw RGB binary format (3x smaller, instant load)
-  - Use RAM disk for dataset during evaluation
-  - Use faster JPEG decoder (mozjpeg via FFI, or `jpeg-decoder` crate)
-  - For production use: daemon captures raw RGB directly (no JPEG overhead)
-
-### 📊 Algorithmic Speedups (Explored)
-- **Skip LBP on odd frames**: Surprisingly IMPROVED F1 (0.913→0.966), FPS slightly lower
-  - Theory: skipping reduces texture noise false positives on alternating frames
-  - Trade-off: may miss very fast texture changes between skipped frames
-  - **Recommended for accuracy over speed**
+- Parallelizing frame decoding DID NOT HELP (image crate is already threaded internally)
+- **Tried and Failed:**
+  - Parallel frame pre-decoding with Rayon (marginal/slower)
+  - The `image` crate likely serializes internally
   
-- **Parallel detection loop**: SLOWED DOWN (0.143→0.111 FPS)
-  - Parallel mask approach had too much overhead for small frames
-  - Sequential detection is cache-friendly; parallelizing adds overhead
-
+### 📊 Algorithmic Speedups (Explored, Diminishing Returns)
 - **Edge threshold increases**: F1 dropped below 0.90, unacceptable
-
 - **LBP disable**: F1 dropped to 0.77, unacceptable
+- **Parallel detection loop**: SLOWED DOWN (0.143→0.111 FPS)
+- **Dilation disable**: FPS +6%, F1 -3% (acceptable trade-off)
 
-### 💡 Potential Future Work
-1. **Batch frame decoding**: Pre-load N frames in parallel, then process sequentially
-2. **SIMD acceleration**: Use `std::simd` or `packed_simd` for Sobel kernels
-3. **Resolution scaling**: Downscale for detection, upscale for output
-4. **Adaptive skip**: Skip frames when motion is low, process more when high
+### 💡 Potential Future Work (High Impact)
+1. **Faster JPEG decoder**: Use `jpeg-decoder` crate (pure Rust, SIMD) or mozjpeg FFI
+2. **Pre-convert CDnet to raw RGB**: Eliminated JPEG entirely; failed previously due to loader issue
+3. **SIMD for Sobel**: `packed_simd` crate for vectorized gradients
+4. **Resolution downscaling**: 2x downscale = 4x fewer pixels to process
 
 ## Accuracy (F1)
 
@@ -45,8 +36,8 @@ The main bottleneck is JPEG decoding, not detection algorithm:
 - **Edge threshold 1** (ultra-sensitive): minimal baseline
 - **Min edge movement 0**: captures any positive edge delta
 - **Contrast threshold 1**: maximum LBP sensitivity
-- **8-connected dilation**: fills gaps, +10% recall
-- **LBP every odd frame**: +5% F1 improvement
+- **8-connected dilation**: fills gaps, +10% recall (when enabled)
+- **LBP skip odd frames**: +5% F1 improvement (recommended)
 
 ### 🎯 Best Configurations
 
@@ -68,9 +59,8 @@ dilate=false, use_lbp=true, skip_lbp_odd_frames=false
 - 6 categories × ~4-6 sequences × ~1000 frames each ≈ 70k frames
 - Full evaluation at 0.16 FPS would take ~5 days
 - Practical: use `CDNET_MAX_FRAMES=2` for quick iteration
-- For production benchmarking: pre-convert to raw, use RAM disk
 
-### Pre-conversion (Failed Attempt)
+### Pre-conversion (Failed - Re-try Later)
 - Created raw/ directories with binary RGB data
 - Evaluation binary couldn't load .raw files (image crate doesn't support raw format)
-- **Deferred**: implement proper raw loader with dimensions metadata
+- **To re-try**: implement custom raw loader using `std::fs::read` + `image::RgbImage::from_raw`
