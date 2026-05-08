@@ -844,7 +844,11 @@ fn device_supports_video_capture(path: &str) -> bool {
         return false;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.contains("Video Capture")
+    stdout
+        .lines()
+        .skip_while(|l| !l.contains("Device Caps"))
+        .take(10)
+        .any(|l| l.contains("Video Capture"))
 }
 
 pub fn print_help() -> Result<()> {
