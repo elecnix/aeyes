@@ -602,6 +602,12 @@ impl V4l2OpenCamera {
                 width: 640,
                 height: 480,
                 fps: 30,
+                format: *b"YUYV",
+            },
+            CapturePreset {
+                width: 640,
+                height: 480,
+                fps: 30,
                 format: *b"MJPG",
             },
         ];
