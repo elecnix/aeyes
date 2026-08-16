@@ -89,7 +89,7 @@ pub enum Commands {
         /// Force capture resolution (e.g. "320x320") instead of the device native/default mode
         #[arg(long)]
         resolution: Option<String>,
-        /// Force capture format (MJPG or YUYV) instead of the device native/default mode
+        /// Force capture format (MJPG/YUYV/YU12/YV12/NV12/RGB3/BGR3) instead of the device native/default mode
         #[arg(long)]
         format: Option<String>,
     },
@@ -106,7 +106,7 @@ pub enum Commands {
         /// Force capture resolution (e.g. "320x320"); applied when the daemon is started/auto-started
         #[arg(long)]
         resolution: Option<String>,
-        /// Force capture format (MJPG or YUYV); applied when the daemon is started/auto-started
+        /// Force capture format (MJPG/YUYV/YU12/YV12/NV12/RGB3/BGR3); applied when the daemon is started/auto-started
         #[arg(long)]
         format: Option<String>,
     },
@@ -127,7 +127,7 @@ pub enum Commands {
         /// Force capture resolution (e.g. "320x320"); applied when the daemon is started/auto-started
         #[arg(long)]
         resolution: Option<String>,
-        /// Force capture format (MJPG or YUYV); applied when the daemon is started/auto-started
+        /// Force capture format (MJPG/YUYV/YU12/YV12/NV12/RGB3/BGR3); applied when the daemon is started/auto-started
         #[arg(long)]
         format: Option<String>,
     },
@@ -166,8 +166,8 @@ pub trait CameraBackend: Send + Sync {
 ///
 /// Both fields are optional; when unset the backend picks the device's
 /// native/current mode and falls back to its preset list (see
-/// `plan_capture_presets`). Only formats aeyes can encode (MJPG / YUYV) are
-/// accepted.
+/// `plan_capture_presets`). Only formats aeyes can encode (MJPG, YUYV,
+/// YU12, YV12, NV12, RGB3, BGR3) are accepted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CameraOpenOptions {
     /// Explicit resolution override as (width, height), e.g. `Some((320, 320))`.
@@ -197,13 +197,16 @@ pub fn parse_resolution(input: &str) -> Result<(u32, u32)> {
 
 /// Parse a fourcc format string, restricted to the formats aeyes can encode.
 pub fn parse_fourcc(input: &str) -> Result<[u8; 4]> {
-    match input.trim().to_ascii_uppercase().as_str() {
-        "MJPG" | "YUYV" => {
+    let upper = input.trim().to_ascii_uppercase();
+    match upper.as_str() {
+        "MJPG" | "YUYV" | "YU12" | "YV12" | "NV12" | "RGB3" | "BGR3" => {
             let mut fourcc = [0u8; 4];
-            fourcc.copy_from_slice(input.trim().to_ascii_uppercase().as_bytes());
+            fourcc.copy_from_slice(upper.as_bytes());
             Ok(fourcc)
         }
-        _ => bail!("unsupported format '{input}'; aeyes can only encode MJPG or YUYV"),
+        _ => bail!(
+            "unsupported format '{input}'; aeyes can only encode MJPG, YUYV, YU12, YV12, NV12, RGB3, or BGR3"
+        ),
     }
 }
 
@@ -784,19 +787,26 @@ impl OpenCamera for V4l2OpenCamera {
             warn!(?err, device = %self.device_path, "failed to adapt exposure from captured frame");
         }
 
-        if self.format == *b"MJPG" {
-            return Ok(frame.to_vec());
+        match &self.format {
+            b"MJPG" => Ok(frame.to_vec()),
+            b"YUYV" => yuyv_to_jpeg(self.width, self.height, &frame)
+                .with_context(|| format!("failed to encode YUYV frame from {}", self.device_path)),
+            b"YU12" => yuv420_to_jpeg(self.width, self.height, &frame, false)
+                .with_context(|| format!("failed to encode YU12 frame from {}", self.device_path)),
+            b"YV12" => yuv420_to_jpeg(self.width, self.height, &frame, true)
+                .with_context(|| format!("failed to encode YV12 frame from {}", self.device_path)),
+            b"NV12" => nv12_to_jpeg(self.width, self.height, &frame)
+                .with_context(|| format!("failed to encode NV12 frame from {}", self.device_path)),
+            b"RGB3" => rgb24_to_jpeg(self.width, self.height, &frame)
+                .with_context(|| format!("failed to encode RGB3 frame from {}", self.device_path)),
+            b"BGR3" => bgr24_to_jpeg(self.width, self.height, &frame)
+                .with_context(|| format!("failed to encode BGR3 frame from {}", self.device_path)),
+            other => bail!(
+                "unsupported frame format '{}' from {}",
+                String::from_utf8_lossy(other),
+                self.device_path
+            ),
         }
-        if self.format == *b"YUYV" {
-            return yuyv_to_jpeg(self.width, self.height, &frame)
-                .with_context(|| format!("failed to encode YUYV frame from {}", self.device_path));
-        }
-
-        bail!(
-            "unsupported frame format '{}' from {}",
-            String::from_utf8_lossy(&self.format),
-            self.device_path
-        )
     }
 }
 
@@ -826,10 +836,19 @@ struct NativeFormat {
     format: [u8; 4],
 }
 
-/// Formats aeyes can hand back as JPEG (MJPEG passthrough, YUYV conversion).
+/// Formats aeyes can hand back as JPEG, in preference order: MJPG is passed
+/// through untouched, YUYV / YU12 / YV12 / NV12 / RGB3 / BGR3 are converted.
+#[cfg(target_os = "linux")]
+fn encodable_formats() -> [[u8; 4]; 7] {
+    [
+        *b"MJPG", *b"YUYV", *b"RGB3", *b"BGR3", *b"YU12", *b"YV12", *b"NV12",
+    ]
+}
+
+/// Formats aeyes can hand back as JPEG (MJPEG passthrough, the rest converted).
 #[cfg(target_os = "linux")]
 fn is_encodable_format(format: &[u8; 4]) -> bool {
-    format == b"MJPG" || format == b"YUYV"
+    encodable_formats().contains(format)
 }
 
 /// Common sizes used as fallbacks when a device advertises a stepwise frame
@@ -1013,7 +1032,8 @@ fn candidate_intervals(preferred_fps: u32) -> Vec<(u32, u32)> {
 /// Order of preference:
 /// 1. explicit `--resolution`/`--format` overrides (exactly what was asked);
 /// 2. the device's native/current mode (if aeyes can encode it);
-/// 3. enumerated encodable modes (MJPG before YUYV, larger first);
+/// 3. enumerated encodable modes (MJPG → YUYV → RGB3 → BGR3 → YU12 → YV12 → NV12,
+///    larger first);
 /// 4. the historical fixed preset list, deduplicated against the above.
 #[cfg(target_os = "linux")]
 fn plan_capture_presets(
@@ -1040,7 +1060,7 @@ fn plan_capture_presets(
             return presets;
         }
         (Some((width, height)), None) => {
-            for format in [*b"MJPG", *b"YUYV"] {
+            for format in encodable_formats() {
                 push(CapturePreset {
                     width,
                     height,
@@ -1092,32 +1112,22 @@ fn plan_capture_presets(
                     });
                 }
             }
-            let mut mjpg: Vec<(u32, u32)> = Vec::new();
-            let mut yuyv: Vec<(u32, u32)> = Vec::new();
-            for sf in supported {
-                if sf.format == *b"MJPG" {
-                    mjpg.extend(sf.resolutions.iter().copied());
-                } else if sf.format == *b"YUYV" {
-                    yuyv.extend(sf.resolutions.iter().copied());
+            for format in encodable_formats() {
+                let mut resolutions: Vec<(u32, u32)> = Vec::new();
+                for sf in supported {
+                    if sf.format == format {
+                        resolutions.extend(sf.resolutions.iter().copied());
+                    }
                 }
-            }
-            mjpg.sort_by_key(|(w, h)| std::cmp::Reverse(w * h));
-            yuyv.sort_by_key(|(w, h)| std::cmp::Reverse(w * h));
-            for (width, height) in mjpg {
-                push(CapturePreset {
-                    width,
-                    height,
-                    fps: 30,
-                    format: *b"MJPG",
-                });
-            }
-            for (width, height) in yuyv {
-                push(CapturePreset {
-                    width,
-                    height,
-                    fps: 30,
-                    format: *b"YUYV",
-                });
+                resolutions.sort_by_key(|(w, h)| std::cmp::Reverse(w * h));
+                for (width, height) in resolutions {
+                    push(CapturePreset {
+                        width,
+                        height,
+                        fps: 30,
+                        format,
+                    });
+                }
             }
             for preset in FIXED_CAPTURE_PRESETS {
                 push(preset);
@@ -2765,6 +2775,104 @@ fn push_yuv_pixel(rgb: &mut Vec<u8>, y: f32, u: f32, v: f32) {
     rgb.extend_from_slice(&[r, g, b]);
 }
 
+/// Convert a planar YUV 4:2:0 frame to JPEG.
+///
+/// Covers YU12 (I420: Y plane, then U, then V) and YV12 (Y plane, then V,
+/// then U) via the `uv_swapped` plane-order flag. Odd sizes round the chroma
+/// planes up (`div_ceil`), matching V4L2's behavior.
+pub fn yuv420_to_jpeg(width: u32, height: u32, bytes: &[u8], uv_swapped: bool) -> Result<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let y_len = w * h;
+    let uv_len = cw * ch;
+    let expected = y_len + 2 * uv_len;
+    if bytes.len() != expected {
+        bail!(
+            "invalid YUV420 buffer length: expected {expected} bytes for {width}x{height}, got {}",
+            bytes.len()
+        );
+    }
+    let y_plane = &bytes[..y_len];
+    let (u_plane, v_plane) = if uv_swapped {
+        (&bytes[y_len + uv_len..], &bytes[y_len..y_len + uv_len])
+    } else {
+        (&bytes[y_len..y_len + uv_len], &bytes[y_len + uv_len..])
+    };
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for row in 0..h {
+        for col in 0..w {
+            let y = y_plane[row * w + col] as f32;
+            let chroma = (row / 2) * cw + col / 2;
+            push_yuv_pixel(
+                &mut rgb,
+                y,
+                u_plane[chroma] as f32 - 128.0,
+                v_plane[chroma] as f32 - 128.0,
+            );
+        }
+    }
+    encode_rgb_to_jpeg(width, height, rgb)
+}
+
+/// Convert a bi-planar NV12 frame (full-resolution Y plane followed by an
+/// interleaved U/V plane at half resolution) to JPEG.
+pub fn nv12_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let y_len = w * h;
+    let expected = y_len + cw * ch * 2;
+    if bytes.len() != expected {
+        bail!(
+            "invalid NV12 buffer length: expected {expected} bytes for {width}x{height}, got {}",
+            bytes.len()
+        );
+    }
+    let y_plane = &bytes[..y_len];
+    let uv_plane = &bytes[y_len..];
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for row in 0..h {
+        for col in 0..w {
+            let y = y_plane[row * w + col] as f32;
+            let uv_off = (row / 2) * (cw * 2) + (col / 2) * 2;
+            push_yuv_pixel(
+                &mut rgb,
+                y,
+                uv_plane[uv_off] as f32 - 128.0,
+                uv_plane[uv_off + 1] as f32 - 128.0,
+            );
+        }
+    }
+    encode_rgb_to_jpeg(width, height, rgb)
+}
+
+/// Convert a tightly-packed 24-bit RGB (RGB3) frame to JPEG.
+pub fn rgb24_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+    let expected = (width as usize) * (height as usize) * 3;
+    if bytes.len() != expected {
+        bail!(
+            "invalid RGB buffer length: expected {expected} bytes for {width}x{height}, got {}",
+            bytes.len()
+        );
+    }
+    encode_rgb_to_jpeg(width, height, bytes.to_vec())
+}
+
+/// Convert a tightly-packed 24-bit BGR (BGR3) frame to JPEG.
+pub fn bgr24_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+    let expected = (width as usize) * (height as usize) * 3;
+    if bytes.len() != expected {
+        bail!(
+            "invalid BGR buffer length: expected {expected} bytes for {width}x{height}, got {}",
+            bytes.len()
+        );
+    }
+    let mut rgb = Vec::with_capacity(expected);
+    for chunk in bytes.chunks_exact(3) {
+        rgb.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
+    }
+    encode_rgb_to_jpeg(width, height, rgb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3058,6 +3166,138 @@ mod tests {
     fn test_yuyv_to_jpeg_encodes() {
         let jpeg = yuyv_to_jpeg(2, 1, &[80, 90, 81, 240]).unwrap();
         assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+
+    #[test]
+    fn test_yuv420_to_jpeg_encodes() {
+        // 4x4 frame: solid Y=80, U=90, V=240 planes (both plane orders).
+        let mut bytes = vec![80u8; 16];
+        bytes.extend([90u8; 4]);
+        bytes.extend([240u8; 4]);
+        assert_eq!(bytes.len(), 24);
+        for uv_swapped in [false, true] {
+            let jpeg = yuv420_to_jpeg(4, 4, &bytes, uv_swapped).unwrap();
+            assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+        }
+    }
+
+    #[test]
+    fn test_yuv420_to_jpeg_invalid_length() {
+        let err = yuv420_to_jpeg(4, 4, &[0u8; 20], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid YUV420 buffer length"));
+    }
+
+    #[test]
+    fn test_yuv420_to_jpeg_colorspace_sanity() {
+        // Solid 2x2 YU12 frame encoding a blue-ish pixel (Y=82, U=240, V=90).
+        let mut bytes = vec![82u8; 4];
+        bytes.push(240); // U plane (1x1 chroma)
+        bytes.push(90); // V plane
+        let jpeg = yuv420_to_jpeg(2, 2, &bytes, false).unwrap();
+        let img = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (2, 2));
+        let px = img.get_pixel(0, 0).0;
+        assert!(px[2] > 180 && px[0] < 80, "expected blue-ish, got {px:?}");
+    }
+
+    #[test]
+    fn test_nv12_to_jpeg_encodes() {
+        let mut bytes = vec![80u8; 16]; // Y plane 4x4
+        bytes.extend([90u8; 8]); // interleaved U/V 2x2
+        let jpeg = nv12_to_jpeg(4, 4, &bytes).unwrap();
+        assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+
+    #[test]
+    fn test_nv12_to_jpeg_invalid_length() {
+        let err = nv12_to_jpeg(4, 4, &[0u8; 23]).unwrap_err().to_string();
+        assert!(err.contains("invalid NV12 buffer length"));
+    }
+
+    #[test]
+    fn test_nv12_to_jpeg_colorspace_sanity() {
+        let mut bytes = vec![82u8; 4]; // Y plane 2x2
+        bytes.extend_from_slice(&[240, 90]); // U, V
+        let jpeg = nv12_to_jpeg(2, 2, &bytes).unwrap();
+        let img = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (2, 2));
+        let px = img.get_pixel(0, 0).0;
+        assert!(px[2] > 180 && px[0] < 80, "expected blue-ish, got {px:?}");
+    }
+
+    #[test]
+    fn test_rgb24_to_jpeg_encodes() {
+        let jpeg = rgb24_to_jpeg(2, 2, &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]).unwrap();
+        assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+
+    #[test]
+    fn test_rgb24_to_jpeg_invalid_length() {
+        let err = rgb24_to_jpeg(2, 2, &[0u8; 11]).unwrap_err().to_string();
+        assert!(err.contains("invalid RGB buffer length"));
+    }
+
+    #[test]
+    fn test_rgb24_to_jpeg_roundtrip_colors() {
+        // 1x3 frame: red, green, blue.
+        let jpeg = rgb24_to_jpeg(1, 3, &[255, 0, 0, 0, 255, 0, 0, 0, 255]).unwrap();
+        let img = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (1, 3));
+        let px = |x: u32, y: u32| img.get_pixel(x, y).0;
+        assert!(
+            px(0, 0)[0] > 200 && px(0, 0)[1] < 60 && px(0, 0)[2] < 60,
+            "red: {:?}",
+            px(0, 0)
+        );
+        assert!(
+            px(0, 1)[1] > 200 && px(0, 1)[0] < 60 && px(0, 1)[2] < 60,
+            "green: {:?}",
+            px(0, 1)
+        );
+        assert!(
+            px(0, 2)[2] > 200 && px(0, 2)[0] < 60 && px(0, 2)[1] < 60,
+            "blue: {:?}",
+            px(0, 2)
+        );
+    }
+
+    #[test]
+    fn test_bgr24_to_jpeg_encodes() {
+        // BGR bytes for red, green, blue, white.
+        let jpeg = bgr24_to_jpeg(2, 2, &[0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255]).unwrap();
+        assert!(jpeg.starts_with(&[0xFF, 0xD8, 0xFF]));
+    }
+
+    #[test]
+    fn test_bgr24_to_jpeg_invalid_length() {
+        let err = bgr24_to_jpeg(2, 2, &[0u8; 10]).unwrap_err().to_string();
+        assert!(err.contains("invalid BGR buffer length"));
+    }
+
+    #[test]
+    fn test_bgr24_to_jpeg_roundtrip_colors() {
+        // BGR bytes for red, green, blue.
+        let jpeg = bgr24_to_jpeg(1, 3, &[0, 0, 255, 0, 255, 0, 255, 0, 0]).unwrap();
+        let img = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (1, 3));
+        let px = |x: u32, y: u32| img.get_pixel(x, y).0;
+        assert!(
+            px(0, 0)[0] > 200 && px(0, 0)[1] < 60 && px(0, 0)[2] < 60,
+            "red: {:?}",
+            px(0, 0)
+        );
+        assert!(
+            px(0, 1)[1] > 200 && px(0, 1)[0] < 60 && px(0, 1)[2] < 60,
+            "green: {:?}",
+            px(0, 1)
+        );
+        assert!(
+            px(0, 2)[2] > 200 && px(0, 2)[0] < 60 && px(0, 2)[1] < 60,
+            "blue: {:?}",
+            px(0, 2)
+        );
     }
 
     #[test]
@@ -3680,9 +3920,11 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn plan_skips_unencodable_native() {
-        // Producer writes NV12: not encodable, so it must be skipped and the
-        // fixed MJPG/YUYV fallback list used instead.
+    fn plan_uses_nv12_native_first() {
+        // Producer writes NV12 (v4l2loopback converts it to YU12/YV12/RGB3/BGR3,
+        // but a real device may advertise NV12 natively): now encodable, so the
+        // native mode is tried first and the fixed MJPG/YUYV list is only a
+        // later fallback.
         let supported = supported_formats(&[(*b"NV12", &[(320, 320)])]);
         let native = Some(NativeFormat {
             width: 320,
@@ -3690,11 +3932,9 @@ mod tests {
             format: *b"NV12",
         });
         let presets = plan_capture_presets(&supported, native, &CameraOpenOptions::default());
-        assert!(!presets.is_empty());
-        assert!(presets
-            .iter()
-            .all(|p| p.format == *b"MJPG" || p.format == *b"YUYV"));
-        assert_ne!(presets[0].format, *b"NV12");
+        assert_eq!(presets[0].format, *b"NV12");
+        assert_eq!((presets[0].width, presets[0].height), (320, 320));
+        assert!(presets.iter().any(|p| p.format == *b"MJPG"));
     }
 
     #[test]
@@ -3719,9 +3959,14 @@ mod tests {
             format: None,
         };
         let presets = plan_capture_presets(&[], None, &options);
-        assert_eq!(presets.len(), 2);
+        assert_eq!(presets.len(), 7);
         assert_eq!(presets[0].format, *b"MJPG");
         assert_eq!(presets[1].format, *b"YUYV");
+        assert_eq!(presets[2].format, *b"RGB3");
+        assert_eq!(presets[3].format, *b"BGR3");
+        assert_eq!(presets[4].format, *b"YU12");
+        assert_eq!(presets[5].format, *b"YV12");
+        assert_eq!(presets[6].format, *b"NV12");
         for p in &presets {
             assert_eq!((p.width, p.height), (320, 320));
         }
@@ -3787,8 +4032,49 @@ mod tests {
     fn parse_fourcc_restricts_to_encodable() {
         assert_eq!(parse_fourcc("MJPG").unwrap(), *b"MJPG");
         assert_eq!(parse_fourcc("yuyv").unwrap(), *b"YUYV");
-        assert!(parse_fourcc("NV12").is_err());
+        assert_eq!(parse_fourcc("YU12").unwrap(), *b"YU12");
+        assert_eq!(parse_fourcc("yv12").unwrap(), *b"YV12");
+        assert_eq!(parse_fourcc("NV12").unwrap(), *b"NV12");
+        assert_eq!(parse_fourcc("RGB3").unwrap(), *b"RGB3");
+        assert_eq!(parse_fourcc("bgr3").unwrap(), *b"BGR3");
         assert!(parse_fourcc("H264").is_err());
+        assert!(parse_fourcc("XVID").is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn encodable_formats_covers_new_fourccs() {
+        for format in [
+            *b"MJPG", *b"YUYV", *b"YU12", *b"YV12", *b"NV12", *b"RGB3", *b"BGR3",
+        ] {
+            assert!(
+                is_encodable_format(&format),
+                "{format:?} should be encodable"
+            );
+        }
+        for format in [*b"H264", *b"MP4V", *b"XVID"] {
+            assert!(
+                !is_encodable_format(&format),
+                "{format:?} should not be encodable"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_enumerates_all_encodable_formats_in_preference_order() {
+        // A device advertising several formats: MJPG first, then YUYV, then
+        // the new converted formats, each largest-first.
+        let supported = supported_formats(&[
+            (*b"NV12", &[(320, 320)]),
+            (*b"YU12", &[(320, 320)]),
+            (*b"MJPG", &[(1920, 1080)]),
+            (*b"RGB3", &[(640, 480)]),
+        ]);
+        let presets = plan_capture_presets(&supported, None, &CameraOpenOptions::default());
+        let formats: Vec<[u8; 4]> = presets.iter().map(|p| p.format).collect();
+        let first_four = &formats[..4];
+        assert_eq!(first_four, &[*b"MJPG", *b"RGB3", *b"YU12", *b"NV12"]);
     }
 
     #[test]
