@@ -23,13 +23,12 @@ use nokhwa::{
 use std::{collections::HashMap, time::Instant};
 
 #[cfg(target_os = "linux")]
-use rscam::{Camera as RsCamera, Config as RsConfig};
+use rscam::{
+    Camera as RsCamera, Config as RsConfig, Control as RsControl, CtrlData, ResolutionInfo,
+    CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO, CID_FOCUS_AUTO,
+};
 
 pub mod chrome_capture;
-#[cfg(target_os = "linux")]
-use rscam::{
-    Control as RsControl, CtrlData, CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO, CID_FOCUS_AUTO,
-};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -87,6 +86,12 @@ pub enum Commands {
         /// Bind address or IP for the daemon HTTP API (e.g. "0.0.0.0", "0.0.0.0:43210")
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: String,
+        /// Force capture resolution (e.g. "320x320") instead of the device native/default mode
+        #[arg(long)]
+        resolution: Option<String>,
+        /// Force capture format (MJPG or YUYV) instead of the device native/default mode
+        #[arg(long)]
+        format: Option<String>,
     },
     /// List available cameras
     Cams,
@@ -98,6 +103,12 @@ pub enum Commands {
         /// Output file path
         #[arg(short, long, default_value = DEFAULT_OUTPUT)]
         output: PathBuf,
+        /// Force capture resolution (e.g. "320x320"); applied when the daemon is started/auto-started
+        #[arg(long)]
+        resolution: Option<String>,
+        /// Force capture format (MJPG or YUYV); applied when the daemon is started/auto-started
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Capture a video clip through the daemon HTTP API
     Video {
@@ -113,6 +124,12 @@ pub enum Commands {
         /// Frames per second
         #[arg(long, default_value_t = DEFAULT_VIDEO_FPS)]
         fps: u32,
+        /// Force capture resolution (e.g. "320x320"); applied when the daemon is started/auto-started
+        #[arg(long)]
+        resolution: Option<String>,
+        /// Force capture format (MJPG or YUYV); applied when the daemon is started/auto-started
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Stop the daemon
     Stop,
@@ -142,7 +159,52 @@ pub struct CameraDescriptor {
 pub trait CameraBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn list_cameras(&self) -> Result<Vec<CameraDescriptor>>;
-    fn open(&self, id: &str) -> Result<Box<dyn OpenCamera>>;
+    fn open(&self, id: &str, options: &CameraOpenOptions) -> Result<Box<dyn OpenCamera>>;
+}
+
+/// Explicit capture overrides applied when opening a camera.
+///
+/// Both fields are optional; when unset the backend picks the device's
+/// native/current mode and falls back to its preset list (see
+/// `plan_capture_presets`). Only formats aeyes can encode (MJPG / YUYV) are
+/// accepted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CameraOpenOptions {
+    /// Explicit resolution override as (width, height), e.g. `Some((320, 320))`.
+    pub resolution: Option<(u32, u32)>,
+    /// Explicit fourcc format override, e.g. `Some(*b"YUYV")`.
+    pub format: Option<[u8; 4]>,
+}
+
+/// Parse a `WxH` resolution string (e.g. `"320x320"` or `"1280X720"`).
+pub fn parse_resolution(input: &str) -> Result<(u32, u32)> {
+    let (width, height) = input
+        .split_once(['x', 'X'])
+        .with_context(|| format!("invalid resolution '{input}'; expected WxH like 320x320"))?;
+    let width: u32 = width
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid width in '{input}'; expected WxH like 320x320"))?;
+    let height: u32 = height
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid height in '{input}'; expected WxH like 320x320"))?;
+    if width == 0 || height == 0 {
+        bail!("invalid resolution '{input}'; width and height must be non-zero");
+    }
+    Ok((width, height))
+}
+
+/// Parse a fourcc format string, restricted to the formats aeyes can encode.
+pub fn parse_fourcc(input: &str) -> Result<[u8; 4]> {
+    match input.trim().to_ascii_uppercase().as_str() {
+        "MJPG" | "YUYV" => {
+            let mut fourcc = [0u8; 4];
+            fourcc.copy_from_slice(input.trim().to_ascii_uppercase().as_bytes());
+            Ok(fourcc)
+        }
+        _ => bail!("unsupported format '{input}'; aeyes can only encode MJPG or YUYV"),
+    }
 }
 
 pub trait OpenCamera: Send {
@@ -457,14 +519,14 @@ impl CameraBackend for NativeBackend {
         }
     }
 
-    fn open(&self, id: &str) -> Result<Box<dyn OpenCamera>> {
+    fn open(&self, id: &str, options: &CameraOpenOptions) -> Result<Box<dyn OpenCamera>> {
         #[cfg(target_os = "linux")]
         {
-            Ok(Box::new(V4l2OpenCamera::open(id)?))
+            Ok(Box::new(V4l2OpenCamera::open(id, options)?))
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Ok(Box::new(NokhwaOpenCamera::open(id)?))
+            Ok(Box::new(NokhwaOpenCamera::open(id, options)?))
         }
     }
 }
@@ -482,14 +544,18 @@ struct NokhwaOpenCamera {
 
 #[cfg(not(target_os = "linux"))]
 impl NokhwaOpenCamera {
-    fn open(id: &str) -> Result<Self> {
+    fn open(id: &str, options: &CameraOpenOptions) -> Result<Self> {
         let camera_index = if let Ok(index) = id.parse::<u32>() {
             CameraIndex::Index(index)
         } else {
             CameraIndex::String(id.to_string())
         };
+        // Non-Linux backend keeps MJPEG encoding; only the resolution override
+        // is honored (the format override maps to FrameFormat on other backends
+        // and is intentionally ignored here to keep the fallback deterministic).
+        let (width, height) = options.resolution.unwrap_or((1920, 1080));
         let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
-            CameraFormat::new(Resolution::new(1920, 1080), FrameFormat::MJPEG, 30),
+            CameraFormat::new(Resolution::new(width, height), FrameFormat::MJPEG, 30),
         ));
         let mut camera = Camera::new(camera_index, requested).context("failed to create camera")?;
         camera
@@ -541,7 +607,7 @@ struct V4l2OpenCamera {
 
 #[cfg(target_os = "linux")]
 impl V4l2OpenCamera {
-    fn open(id: &str) -> Result<Self> {
+    fn open(id: &str, options: &CameraOpenOptions) -> Result<Self> {
         let index: u32 = id
             .parse()
             .with_context(|| format!("camera ID '{id}' must be numeric like '0'"))?;
@@ -549,106 +615,66 @@ impl V4l2OpenCamera {
         let mut camera = RsCamera::new(&device_path)
             .with_context(|| format!("failed to open V4L2 device {device_path}"))?;
 
-        let candidates = [
-            CapturePreset {
-                width: 3840,
-                height: 2160,
-                fps: 30,
-                format: *b"MJPG",
-            },
-            CapturePreset {
-                width: 2560,
-                height: 1440,
-                fps: 30,
-                format: *b"MJPG",
-            },
-            CapturePreset {
-                width: 1920,
-                height: 1080,
-                fps: 60,
-                format: *b"MJPG",
-            },
-            CapturePreset {
-                width: 1920,
-                height: 1080,
-                fps: 30,
-                format: *b"MJPG",
-            },
-            CapturePreset {
-                width: 1280,
-                height: 720,
-                fps: 60,
-                format: *b"MJPG",
-            },
-            CapturePreset {
-                width: 1280,
-                height: 720,
-                fps: 30,
-                format: *b"MJPG",
-            },
-            CapturePreset {
-                width: 1920,
-                height: 1080,
-                fps: 30,
-                format: *b"YUYV",
-            },
-            CapturePreset {
-                width: 1280,
-                height: 720,
-                fps: 30,
-                format: *b"YUYV",
-            },
-            CapturePreset {
-                width: 640,
-                height: 480,
-                fps: 30,
-                format: *b"YUYV",
-            },
-            CapturePreset {
-                width: 640,
-                height: 480,
-                fps: 30,
-                format: *b"MJPG",
-            },
-        ];
+        // Ask the device what it actually supports instead of assuming the
+        // fixed preset list. With v4l2loopback (exclusive_caps=1) the device
+        // only advertises the producer's native mode, so the old 640x480-only
+        // attempt could never succeed (elecnix/aeyes#26).
+        let supported = enumerate_supported_formats(&camera);
+        let native = query_native_format(&device_path);
+        let candidates = plan_capture_presets(&supported, native, options);
 
-        let mut last_error = None;
+        let mut attempted: Vec<String> = Vec::new();
         for preset in candidates {
-            let config = RsConfig {
-                interval: (1, preset.fps),
-                resolution: (preset.width, preset.height),
-                format: &preset.format,
-                ..Default::default()
-            };
-            match camera.start(&config) {
-                Ok(()) => {
-                    return Ok(Self {
-                        camera,
-                        device_path,
-                        width: preset.width,
-                        height: preset.height,
-                        format: preset.format,
-                        exposure_controller: None,
-                    });
-                }
-                Err(err) => {
-                    last_error = Some(format!(
-                        "{}x{}@{} {} rejected by {}: {}",
-                        preset.width,
-                        preset.height,
-                        preset.fps,
-                        String::from_utf8_lossy(&preset.format),
-                        device_path,
-                        err
-                    ));
+            for (num, den) in candidate_intervals(preset.fps) {
+                let config = RsConfig {
+                    interval: (num, den),
+                    resolution: (preset.width, preset.height),
+                    format: &preset.format,
+                    ..Default::default()
+                };
+                match camera.start(&config) {
+                    Ok(()) => {
+                        return Ok(Self {
+                            camera,
+                            device_path,
+                            width: preset.width,
+                            height: preset.height,
+                            format: preset.format,
+                            exposure_controller: None,
+                        });
+                    }
+                    Err(err) => {
+                        let attempt = format!(
+                            "{}x{}@{}fps {} rejected by {}: {}",
+                            preset.width,
+                            preset.height,
+                            den,
+                            String::from_utf8_lossy(&preset.format),
+                            device_path,
+                            err
+                        );
+                        if !attempted.contains(&attempt) {
+                            attempted.push(attempt);
+                        }
+                    }
                 }
             }
         }
 
+        let last = attempted
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "no capture modes attempted".to_string());
         bail!(
-            "failed to start V4L2 stream on {}. Last attempted mode: {}",
+            "failed to start V4L2 stream on {}\nattempted modes: {}\nlast attempted mode: {}\ndevice supports: {}",
             device_path,
-            last_error.unwrap_or_else(|| "no capture modes attempted".to_string())
+            if attempted.is_empty() {
+                "(none)".to_string()
+            } else {
+                attempted.join("; ")
+            },
+            last,
+            summarize_supported(&supported)
         )
     }
 
@@ -775,12 +801,356 @@ impl OpenCamera for V4l2OpenCamera {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct CapturePreset {
     width: u32,
     height: u32,
     fps: u32,
     format: [u8; 4],
+}
+
+/// A format advertised by the device (VIDIOC_ENUM_FMT + VIDIOC_ENUM_FRAMESIZES).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct SupportedFormat {
+    format: [u8; 4],
+    resolutions: Vec<(u32, u32)>,
+}
+
+/// The device's current/active mode as reported by `v4l2-ctl --get-fmt-video`.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug)]
+struct NativeFormat {
+    width: u32,
+    height: u32,
+    format: [u8; 4],
+}
+
+/// Formats aeyes can hand back as JPEG (MJPEG passthrough, YUYV conversion).
+#[cfg(target_os = "linux")]
+fn is_encodable_format(format: &[u8; 4]) -> bool {
+    format == b"MJPG" || format == b"YUYV"
+}
+
+/// Common sizes used as fallbacks when a device advertises a stepwise frame
+/// size range or an explicit --format without a matching enumerated entry.
+#[cfg(target_os = "linux")]
+fn common_resolutions() -> [(u32, u32); 7] {
+    [
+        (3840, 2160),
+        (2560, 1440),
+        (1920, 1080),
+        (1280, 720),
+        (640, 480),
+        (320, 320),
+        (320, 240),
+    ]
+}
+
+/// The historical quality-first candidate list, kept as a last-resort fallback
+/// for devices whose enumeration returns nothing useful.
+#[cfg(target_os = "linux")]
+const FIXED_CAPTURE_PRESETS: [CapturePreset; 10] = [
+    CapturePreset {
+        width: 3840,
+        height: 2160,
+        fps: 30,
+        format: *b"MJPG",
+    },
+    CapturePreset {
+        width: 2560,
+        height: 1440,
+        fps: 30,
+        format: *b"MJPG",
+    },
+    CapturePreset {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        format: *b"MJPG",
+    },
+    CapturePreset {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        format: *b"MJPG",
+    },
+    CapturePreset {
+        width: 1280,
+        height: 720,
+        fps: 60,
+        format: *b"MJPG",
+    },
+    CapturePreset {
+        width: 1280,
+        height: 720,
+        fps: 30,
+        format: *b"MJPG",
+    },
+    CapturePreset {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        format: *b"YUYV",
+    },
+    CapturePreset {
+        width: 1280,
+        height: 720,
+        fps: 30,
+        format: *b"YUYV",
+    },
+    CapturePreset {
+        width: 640,
+        height: 480,
+        fps: 30,
+        format: *b"YUYV",
+    },
+    CapturePreset {
+        width: 640,
+        height: 480,
+        fps: 30,
+        format: *b"MJPG",
+    },
+];
+
+/// Enumerate the formats and discrete frame sizes a device advertises via
+/// VIDIOC_ENUM_FMT / VIDIOC_ENUM_FRAMESIZES.
+#[cfg(target_os = "linux")]
+fn enumerate_supported_formats(camera: &RsCamera) -> Vec<SupportedFormat> {
+    let mut out = Vec::new();
+    for fmt in camera.formats() {
+        let Ok(fmt) = fmt else { continue };
+        let resolutions = match camera.resolutions(&fmt.format) {
+            Ok(ResolutionInfo::Discretes(list)) => list,
+            Ok(ResolutionInfo::Stepwise { min, max, .. }) => {
+                // Stepwise range: expose the bounds plus common sizes inside it.
+                let mut list = vec![min, max];
+                for (width, height) in common_resolutions() {
+                    if width >= min.0 && width <= max.0 && height >= min.1 && height <= max.1 {
+                        list.push((width, height));
+                    }
+                }
+                list.sort_unstable();
+                list.dedup();
+                list
+            }
+            Err(_) => Vec::new(),
+        };
+        out.push(SupportedFormat {
+            format: fmt.format,
+            resolutions,
+        });
+    }
+    out
+}
+
+/// Query the device's current/active mode via `v4l2-ctl --get-fmt-video`.
+#[cfg(target_os = "linux")]
+fn query_native_format(device_path: &str) -> Option<NativeFormat> {
+    let output = std::process::Command::new("v4l2-ctl")
+        .arg("--device")
+        .arg(device_path)
+        .arg("--get-fmt-video")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut format: Option<[u8; 4]> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Width/Height") {
+            if let Some(value) = rest.split(':').nth(1) {
+                let mut it = value.trim().split('/');
+                if let (Some(w), Some(h)) = (it.next(), it.next()) {
+                    width = w.trim().parse().ok()?;
+                    height = h.trim().parse().ok()?;
+                }
+            }
+        }
+        if let Some(rest) = line.strip_prefix("Pixel Format") {
+            // e.g. "Pixel Format      : 'YUYV'" (optionally followed by a
+            // human-readable description, e.g. "'MJPG' (Motion-JPEG)").
+            if let Some(quote) = rest.find('\'') {
+                let bytes: Vec<u8> = rest[quote + 1..].chars().take(4).map(|c| c as u8).collect();
+                if bytes.len() == 4 {
+                    format = Some([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                }
+            }
+        }
+    }
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(NativeFormat {
+        width,
+        height,
+        format: format?,
+    })
+}
+
+/// Interval candidates tried for each preset, in preference order. Some devices
+/// (and v4l2loopback producers) only accept a specific frame rate, so a single
+/// 30fps attempt is not always enough.
+#[cfg(target_os = "linux")]
+fn candidate_intervals(preferred_fps: u32) -> Vec<(u32, u32)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for fps in [preferred_fps, 15, 10, 5] {
+        if fps == 0 || !seen.insert(fps) {
+            continue;
+        }
+        out.push((1, fps));
+    }
+    out
+}
+
+/// Decide which capture modes to attempt, in order. Pure and unit-tested.
+///
+/// Order of preference:
+/// 1. explicit `--resolution`/`--format` overrides (exactly what was asked);
+/// 2. the device's native/current mode (if aeyes can encode it);
+/// 3. enumerated encodable modes (MJPG before YUYV, larger first);
+/// 4. the historical fixed preset list, deduplicated against the above.
+#[cfg(target_os = "linux")]
+fn plan_capture_presets(
+    supported: &[SupportedFormat],
+    native: Option<NativeFormat>,
+    options: &CameraOpenOptions,
+) -> Vec<CapturePreset> {
+    let mut presets: Vec<CapturePreset> = Vec::new();
+    let mut seen: std::collections::HashSet<([u8; 4], u32, u32)> = std::collections::HashSet::new();
+    let mut push = |preset: CapturePreset| {
+        if seen.insert((preset.format, preset.width, preset.height)) {
+            presets.push(preset);
+        }
+    };
+
+    match (options.resolution, options.format) {
+        (Some((width, height)), Some(format)) => {
+            push(CapturePreset {
+                width,
+                height,
+                fps: 30,
+                format,
+            });
+            return presets;
+        }
+        (Some((width, height)), None) => {
+            for format in [*b"MJPG", *b"YUYV"] {
+                push(CapturePreset {
+                    width,
+                    height,
+                    fps: 30,
+                    format,
+                });
+            }
+            return presets;
+        }
+        (None, Some(format)) => {
+            if let Some(native) = native.filter(|native| native.format == format) {
+                push(CapturePreset {
+                    width: native.width,
+                    height: native.height,
+                    fps: 30,
+                    format,
+                });
+            }
+            if let Some(supported) = supported.iter().find(|sf| sf.format == format) {
+                let mut resolutions = supported.resolutions.clone();
+                resolutions.sort_by_key(|(w, h)| std::cmp::Reverse(w * h));
+                for (width, height) in resolutions {
+                    push(CapturePreset {
+                        width,
+                        height,
+                        fps: 30,
+                        format,
+                    });
+                }
+            }
+            for (width, height) in common_resolutions() {
+                push(CapturePreset {
+                    width,
+                    height,
+                    fps: 30,
+                    format,
+                });
+            }
+            return presets;
+        }
+        (None, None) => {
+            if let Some(native) = native {
+                if is_encodable_format(&native.format) {
+                    push(CapturePreset {
+                        width: native.width,
+                        height: native.height,
+                        fps: 30,
+                        format: native.format,
+                    });
+                }
+            }
+            let mut mjpg: Vec<(u32, u32)> = Vec::new();
+            let mut yuyv: Vec<(u32, u32)> = Vec::new();
+            for sf in supported {
+                if sf.format == *b"MJPG" {
+                    mjpg.extend(sf.resolutions.iter().copied());
+                } else if sf.format == *b"YUYV" {
+                    yuyv.extend(sf.resolutions.iter().copied());
+                }
+            }
+            mjpg.sort_by_key(|(w, h)| std::cmp::Reverse(w * h));
+            yuyv.sort_by_key(|(w, h)| std::cmp::Reverse(w * h));
+            for (width, height) in mjpg {
+                push(CapturePreset {
+                    width,
+                    height,
+                    fps: 30,
+                    format: *b"MJPG",
+                });
+            }
+            for (width, height) in yuyv {
+                push(CapturePreset {
+                    width,
+                    height,
+                    fps: 30,
+                    format: *b"YUYV",
+                });
+            }
+            for preset in FIXED_CAPTURE_PRESETS {
+                push(preset);
+            }
+        }
+    }
+
+    presets
+}
+
+/// Human-readable summary of what the device advertises, for error reporting.
+#[cfg(target_os = "linux")]
+fn summarize_supported(supported: &[SupportedFormat]) -> String {
+    if supported.is_empty() {
+        return "(no formats enumerated)".to_string();
+    }
+    supported
+        .iter()
+        .map(|sf| {
+            let res = sf
+                .resolutions
+                .iter()
+                .map(|(w, h)| format!("{w}x{h}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if sf.resolutions.is_empty() {
+                String::from_utf8_lossy(&sf.format).to_string()
+            } else {
+                format!("{} ({})", String::from_utf8_lossy(&sf.format), res)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(target_os = "linux")]
@@ -861,15 +1231,36 @@ pub async fn run_cli() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     let cli = Cli::parse();
     match cli.command {
-        Some(Commands::Start { camera, bind }) => start_daemon(camera, bind).await,
+        Some(Commands::Start {
+            camera,
+            bind,
+            resolution,
+            format,
+        }) => start_daemon(camera, bind, cli_open_options(resolution, format)?).await,
         Some(Commands::Cams) => list_cameras_cmd(),
-        Some(Commands::Frame { camera, output }) => frame_cmd(camera, &output).await,
+        Some(Commands::Frame {
+            camera,
+            output,
+            resolution,
+            format,
+        }) => frame_cmd(camera, &output, cli_open_options(resolution, format)?).await,
         Some(Commands::Video {
             camera,
             output,
             max_length,
             fps,
-        }) => video_cmd(camera, &output, max_length, fps).await,
+            resolution,
+            format,
+        }) => {
+            video_cmd(
+                camera,
+                &output,
+                max_length,
+                fps,
+                cli_open_options(resolution, format)?,
+            )
+            .await
+        }
         Some(Commands::Stop) => stop_daemon().await,
         Some(Commands::Status) => status_cmd().await,
         Some(Commands::Chrome {
@@ -879,6 +1270,17 @@ pub async fn run_cli() -> Result<()> {
         }) => chrome_cmd(quality, &output, list_tabs).await,
         None => print_help(),
     }
+}
+
+/// Build `CameraOpenOptions` from the CLI `--resolution`/`--format` flags.
+fn cli_open_options(
+    resolution: Option<String>,
+    format: Option<String>,
+) -> Result<CameraOpenOptions> {
+    Ok(CameraOpenOptions {
+        resolution: resolution.as_deref().map(parse_resolution).transpose()?,
+        format: format.as_deref().map(parse_fourcc).transpose()?,
+    })
 }
 
 pub fn runtime_dir() -> PathBuf {
@@ -952,7 +1354,11 @@ fn parse_bind_address(input: &str) -> Result<SocketAddr> {
     bail!("invalid bind address '{input}'; expected an IP like \"0.0.0.0\" or a full address like \"0.0.0.0:43210\"");
 }
 
-pub async fn start_daemon(requested_camera: Option<String>, bind: String) -> Result<()> {
+pub async fn start_daemon(
+    requested_camera: Option<String>,
+    bind: String,
+    options: CameraOpenOptions,
+) -> Result<()> {
     let bind = parse_bind_address(&bind)?;
     fs::create_dir_all(runtime_dir())?;
     if let Ok(addr) = daemon_addr().await {
@@ -974,6 +1380,12 @@ pub async fn start_daemon(requested_camera: Option<String>, bind: String) -> Res
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if let Some((width, height)) = options.resolution {
+        cmd.env("AEYES_RESOLUTION", format!("{width}x{height}"));
+    }
+    if let Some(format) = options.format {
+        cmd.env("AEYES_FORMAT", String::from_utf8_lossy(&format).to_string());
+    }
     let child = cmd.spawn().context("failed to spawn daemon")?;
     let pid = child.id().context("missing daemon pid")?;
     fs::write(pid_path(), pid.to_string())?;
@@ -1034,7 +1446,10 @@ async fn daemon_responding(addr: SocketAddr) -> bool {
 
 /// Ensure daemon is running, auto-starting if needed. Returns daemon address.
 /// If camera is specified, uses it when starting the daemon.
-async fn ensure_daemon_running(camera: Option<&str>) -> Result<SocketAddr> {
+async fn ensure_daemon_running(
+    camera: Option<&str>,
+    options: &CameraOpenOptions,
+) -> Result<SocketAddr> {
     if let Ok(addr) = daemon_addr().await {
         if daemon_responding(addr).await {
             return Ok(addr);
@@ -1051,7 +1466,7 @@ async fn ensure_daemon_running(camera: Option<&str>) -> Result<SocketAddr> {
             .or_else(|_| cams.first().cloned().context("no cameras available"))?
     };
     let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    start_daemon(Some(chosen.id.clone()), bind_str)
+    start_daemon(Some(chosen.id.clone()), bind_str, options.clone())
         .await
         .context("failed to auto-start daemon")?;
 
@@ -1070,7 +1485,8 @@ async fn ensure_daemon_running(camera: Option<&str>) -> Result<SocketAddr> {
 /// Handle the chrome command - uses daemon's persistent CDP session
 /// Auto-starts daemon if not running.
 async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> {
-    let addr = ensure_daemon_running(None).await?;
+    let options = CameraOpenOptions::default();
+    let addr = ensure_daemon_running(None, &options).await?;
     let client = reqwest::Client::new();
 
     if list_tabs {
@@ -1129,8 +1545,12 @@ async fn chrome_cmd(quality: u32, output: &Path, list_tabs: bool) -> Result<()> 
     Ok(())
 }
 
-pub async fn frame_cmd(camera: Option<String>, output: &Path) -> Result<()> {
-    let addr = ensure_daemon_running(camera.as_deref()).await?;
+pub async fn frame_cmd(
+    camera: Option<String>,
+    output: &Path,
+    options: CameraOpenOptions,
+) -> Result<()> {
+    let addr = ensure_daemon_running(camera.as_deref(), &options).await?;
     let path = if let Some(cam) = &camera {
         format!("/cams/{}/frame", cam)
     } else {
@@ -1150,8 +1570,9 @@ pub async fn video_cmd(
     output: &Path,
     max_length: f64,
     fps: u32,
+    options: CameraOpenOptions,
 ) -> Result<()> {
-    let addr = ensure_daemon_running(camera.as_deref()).await?;
+    let addr = ensure_daemon_running(camera.as_deref(), &options).await?;
     let path = if let Some(cam) = &camera {
         format!("/cams/{}/video?max_length={}&fps={}", cam, max_length, fps)
     } else {
@@ -1221,12 +1642,21 @@ pub async fn run_daemon_from_env() -> Result<()> {
         .parse()
         .context("invalid AEYES_BIND")?;
     let selected_camera = env::var("AEYES_CAMERA").context("AEYES_CAMERA missing")?;
-    run_daemon(bind, selected_camera, Box::new(NativeBackend)).await
+    let options = CameraOpenOptions {
+        resolution: env::var("AEYES_RESOLUTION")
+            .ok()
+            .and_then(|v| parse_resolution(&v).ok()),
+        format: env::var("AEYES_FORMAT")
+            .ok()
+            .and_then(|v| parse_fourcc(&v).ok()),
+    };
+    run_daemon(bind, selected_camera, options, Box::new(NativeBackend)).await
 }
 
 pub async fn run_daemon(
     bind: SocketAddr,
     selected_camera: String,
+    options: CameraOpenOptions,
     backend: Box<dyn CameraBackend>,
 ) -> Result<()> {
     fs::create_dir_all(runtime_dir())?;
@@ -1249,10 +1679,12 @@ pub async fn run_daemon(
 
         let backend = backend.clone();
         let camera_id = camera.id.clone();
+        let options = options.clone();
         tokio::spawn(async move {
             if let Err(err) = camera_loop(
                 backend,
                 camera_id.clone(),
+                options,
                 latest_jpeg,
                 last_error,
                 frame_tx,
@@ -1313,11 +1745,12 @@ pub async fn run_daemon(
 async fn camera_loop(
     backend: Arc<dyn CameraBackend>,
     selected_camera: String,
+    options: CameraOpenOptions,
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
     last_error: Arc<RwLock<Option<DaemonErrorState>>>,
     frame_tx: broadcast::Sender<Vec<u8>>,
 ) -> Result<()> {
-    let mut camera = match backend.open(&selected_camera) {
+    let mut camera = match backend.open(&selected_camera, &options) {
         Ok(camera) => camera,
         Err(err) => {
             let state = DaemonErrorState::new("failed to open selected camera")
@@ -2371,7 +2804,7 @@ mod tests {
         fn list_cameras(&self) -> Result<Vec<CameraDescriptor>> {
             Ok(self.cameras.clone())
         }
-        fn open(&self, id: &str) -> Result<Box<dyn OpenCamera>> {
+        fn open(&self, id: &str, _options: &CameraOpenOptions) -> Result<Box<dyn OpenCamera>> {
             if let Some(message) = &self.fail_open {
                 bail!(message.clone());
             }
@@ -2771,7 +3204,12 @@ mod tests {
             fail_capture: None,
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            Box::new(backend),
+        ));
 
         let client = reqwest::Client::new();
         let mut ready = false;
@@ -2819,7 +3257,12 @@ mod tests {
             fail_open: Some("simulated open failure".into()),
             fail_capture: None,
         };
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            Box::new(backend),
+        ));
         tokio::time::sleep(Duration::from_millis(500)).await;
         let client = reqwest::Client::new();
         let resp = client
@@ -2846,7 +3289,12 @@ mod tests {
             fail_capture: Some("simulated capture failure".into()),
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            Box::new(backend),
+        ));
         sleep(Duration::from_millis(400)).await;
 
         let client = reqwest::Client::new();
@@ -2876,7 +3324,12 @@ mod tests {
             fail_capture: None,
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            Box::new(backend),
+        ));
         let client = reqwest::Client::new();
         for _ in 0..20 {
             if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
@@ -2951,7 +3404,12 @@ mod tests {
             fail_capture: None,
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            Box::new(backend),
+        ));
 
         let client = reqwest::Client::new();
         let mut ready = false;
@@ -2998,7 +3456,12 @@ mod tests {
             fail_capture: None,
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            Box::new(backend),
+        ));
 
         let client = reqwest::Client::new();
         let mut ready = false;
@@ -3044,7 +3507,12 @@ mod tests {
             fail_capture: None,
         };
 
-        let handle = tokio::spawn(run_daemon(bind, "cam-a".into(), Box::new(backend)));
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            Box::new(backend),
+        ));
 
         let client = reqwest::Client::new();
         let mut ready = false;
@@ -3159,5 +3627,176 @@ mod tests {
     fn test_pid_path_not_empty() {
         let path = pid_path();
         assert!(path.ends_with("daemon.pid"));
+    }
+
+    // ---------------------------------------------------------------------
+    // V4L2 capture-mode planning (issue #26: native-format fallback)
+    // ---------------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::type_complexity)]
+    fn supported_formats(entries: &[([u8; 4], &[(u32, u32)])]) -> Vec<SupportedFormat> {
+        entries
+            .iter()
+            .map(|(format, resolutions)| SupportedFormat {
+                format: *format,
+                resolutions: resolutions.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_prefers_native_mode_first() {
+        // v4l2loopback exclusive_caps=1: only the producer's mode is advertised.
+        let supported = supported_formats(&[(*b"YUYV", &[(320, 320)])]);
+        let native = Some(NativeFormat {
+            width: 320,
+            height: 320,
+            format: *b"YUYV",
+        });
+        let presets = plan_capture_presets(&supported, native, &CameraOpenOptions::default());
+        assert_eq!(presets[0].format, *b"YUYV");
+        assert_eq!((presets[0].width, presets[0].height), (320, 320));
+        // Native + enumerated are the same mode, so it appears exactly once.
+        assert_eq!(
+            presets
+                .iter()
+                .filter(|p| p.format == *b"YUYV" && (p.width, p.height) == (320, 320))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_uses_enumerated_resolutions_desc() {
+        let supported = supported_formats(&[(*b"MJPG", &[(640, 480), (1920, 1080), (1280, 720)])]);
+        let presets = plan_capture_presets(&supported, None, &CameraOpenOptions::default());
+        // Enumerated sizes come first, largest first.
+        let sizes: Vec<(u32, u32)> = presets.iter().map(|p| (p.width, p.height)).collect();
+        assert_eq!(&sizes[..3], &[(1920, 1080), (1280, 720), (640, 480)]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_skips_unencodable_native() {
+        // Producer writes NV12: not encodable, so it must be skipped and the
+        // fixed MJPG/YUYV fallback list used instead.
+        let supported = supported_formats(&[(*b"NV12", &[(320, 320)])]);
+        let native = Some(NativeFormat {
+            width: 320,
+            height: 320,
+            format: *b"NV12",
+        });
+        let presets = plan_capture_presets(&supported, native, &CameraOpenOptions::default());
+        assert!(!presets.is_empty());
+        assert!(presets
+            .iter()
+            .all(|p| p.format == *b"MJPG" || p.format == *b"YUYV"));
+        assert_ne!(presets[0].format, *b"NV12");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_explicit_resolution_and_format() {
+        let supported = supported_formats(&[(*b"YUYV", &[(320, 320)])]);
+        let options = CameraOpenOptions {
+            resolution: Some((320, 320)),
+            format: Some(*b"YUYV"),
+        };
+        let presets = plan_capture_presets(&supported, None, &options);
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].format, *b"YUYV");
+        assert_eq!((presets[0].width, presets[0].height), (320, 320));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_explicit_resolution_tries_encodable_formats() {
+        let options = CameraOpenOptions {
+            resolution: Some((320, 320)),
+            format: None,
+        };
+        let presets = plan_capture_presets(&[], None, &options);
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].format, *b"MJPG");
+        assert_eq!(presets[1].format, *b"YUYV");
+        for p in &presets {
+            assert_eq!((p.width, p.height), (320, 320));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_explicit_format_uses_native_res_first() {
+        let supported = supported_formats(&[(*b"YUYV", &[(640, 480), (320, 320)])]);
+        let native = Some(NativeFormat {
+            width: 320,
+            height: 320,
+            format: *b"YUYV",
+        });
+        let options = CameraOpenOptions {
+            resolution: None,
+            format: Some(*b"YUYV"),
+        };
+        let presets = plan_capture_presets(&supported, native, &options);
+        assert_eq!((presets[0].width, presets[0].height), (320, 320));
+        assert_eq!(presets[1].width * presets[1].height, 640 * 480);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn plan_deduplicates_against_fixed_list() {
+        let supported = supported_formats(&[(*b"MJPG", &[(1920, 1080)])]);
+        let presets = plan_capture_presets(&supported, None, &CameraOpenOptions::default());
+        let mut seen = std::collections::HashSet::new();
+        for p in &presets {
+            assert!(
+                seen.insert((p.format, p.width, p.height)),
+                "duplicate preset {}x{} {:?}",
+                p.width,
+                p.height,
+                p.format
+            );
+        }
+        assert_eq!(presets.len(), 8); // 1 enumerated + 7 unique fixed (3 dupes removed)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn candidate_intervals_fall_back_ladder() {
+        let intervals = candidate_intervals(30);
+        assert_eq!(intervals, vec![(1, 30), (1, 15), (1, 10), (1, 5)]);
+        // Preferred fps is tried first and not duplicated.
+        let intervals = candidate_intervals(15);
+        assert_eq!(intervals, vec![(1, 15), (1, 10), (1, 5)]);
+    }
+
+    #[test]
+    fn parse_resolution_accepts_common_formats() {
+        assert_eq!(parse_resolution("320x320").unwrap(), (320, 320));
+        assert_eq!(parse_resolution("1280X720").unwrap(), (1280, 720));
+        assert_eq!(parse_resolution(" 640 x 480 ").unwrap(), (640, 480));
+        assert!(parse_resolution("abc").is_err());
+        assert!(parse_resolution("0x10").is_err());
+        assert!(parse_resolution("320x").is_err());
+    }
+
+    #[test]
+    fn parse_fourcc_restricts_to_encodable() {
+        assert_eq!(parse_fourcc("MJPG").unwrap(), *b"MJPG");
+        assert_eq!(parse_fourcc("yuyv").unwrap(), *b"YUYV");
+        assert!(parse_fourcc("NV12").is_err());
+        assert!(parse_fourcc("H264").is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn summarize_supported_reports_modes() {
+        let supported = supported_formats(&[(*b"YUYV", &[(320, 320)])]);
+        let summary = summarize_supported(&supported);
+        assert!(summary.contains("YUYV"));
+        assert!(summary.contains("320x320"));
     }
 }
