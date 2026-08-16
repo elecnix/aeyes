@@ -25,6 +25,11 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Coverage
         if: runner.os == 'Linux'
+        # Use cargo-llvm-cov instead of cargo-tarpaulin: tarpaulin injects
+        # --cfg=tarpaulin, which trips a const-eval bug in pulp 0.22.3
+        # (CheckSameSize::<i8, u16>) on recent rustc, failing the whole step.
+        # llvm-cov instruments via -C instrument-coverage and works on stable.
         run: |
-          cargo install cargo-tarpaulin
-          cargo tarpaulin --lib --ignore-tests --skip-clean --no-fail-fast --out xml
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov --lib --no-fail-fast --cobertura --output-path cobertura.xml
