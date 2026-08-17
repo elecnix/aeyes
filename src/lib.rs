@@ -2094,7 +2094,16 @@ async fn web_ui_handler(AxumPath(id): AxumPath<String>, State(state): State<AppS
         <span class="camera-info">{camera_name}</span>
     </header>
     <div class="stream-container">
-        <img src="/cams/{id}/stream" alt="Live stream from {camera_name}" onerror="setStatus('error', 'Stream error')" onload="setStatus('connected', 'Connected')">
+        <img src="/cams/{id}/stream" alt="Live stream from {camera_name}" onerror="reconnect()" onload="setStatus('connected', 'Connected')">
+        <script>
+            function reconnect() {{
+                setStatus('error', 'Reconnecting…');
+                setTimeout(() => {{
+                    const img = document.querySelector('img');
+                    if (img) img.src = '/cams/{id}/stream?t=' + Date.now();
+                }}, 2000);
+            }}
+        </script>
     </div>
     <div class="status" id="status">Connecting...</div>
     <script>
