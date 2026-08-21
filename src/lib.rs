@@ -2602,7 +2602,7 @@ fn analyze_rgb_frame(bytes: &[u8]) -> FrameLumaStats {
     let mut clipped = 0u64;
     let mut dark = 0u64;
 
-    for pixel in bytes.chunks_exact(3).step_by(4) {
+    for pixel in bytes.as_chunks::<3>().0.iter().step_by(4) {
         let r = pixel[0] as u64;
         let g = pixel[1] as u64;
         let b = pixel[2] as u64;
@@ -2661,7 +2661,7 @@ fn analyze_yuyv_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
     let mut clipped = 0u64;
     let mut dark = 0u64;
 
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         for y in [chunk[0], chunk[2]] {
             histogram[y as usize] += 1;
             samples += 1;
@@ -2764,7 +2764,7 @@ pub fn yuyv_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
     }
 
     let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let y0 = chunk[0] as f32;
         let u = chunk[1] as f32 - 128.0;
         let y1 = chunk[2] as f32;
@@ -2876,7 +2876,7 @@ pub fn bgr24_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
         );
     }
     let mut rgb = Vec::with_capacity(expected);
-    for chunk in bytes.chunks_exact(3) {
+    for chunk in bytes.as_chunks::<3>().0 {
         rgb.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
     }
     encode_rgb_to_jpeg(width, height, rgb)
