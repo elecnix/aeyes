@@ -1,0 +1,17 @@
+name: pr-body-format
+
+on:
+  pull_request:
+    # `edited` re-runs the check once the author fixes the body — without it
+    # the original red result stands.
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-body-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: elecnix/gh-pr-body-action@v1
