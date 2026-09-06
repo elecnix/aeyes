@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Review this pull request with Cite
-        uses: elecnix/cite@v0.4.0
+        uses: elecnix/cite@v0.5.0
         with:
           model_id: deepseek/deepseek-v4-flash-0731
           model_base_url: https://openrouter.ai/api/v1
