@@ -1,0 +1,7 @@
+# Identical in every repository that uses Cite.
+#
+# Cite's defaults cover everything else. require_parameters keeps an
+# OpenRouter-style router from choosing an endpoint that drops
+# response_format when CITE_PROVIDER selects the OpenRouter leg; Ollama
+# ignores the field.
+require_parameters: true
