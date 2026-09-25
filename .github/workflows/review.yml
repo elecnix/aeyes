@@ -13,12 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Review this pull request with Cite
-        uses: elecnix/cite@9c2964b0298b7ae110a2d4111fd84d7aa5b5b739  # v0.11.1
+        uses: elecnix/cite@1c0537ba7f8df4dc5db0651f609f6b8834167150  # v0.11.2
         with:
           # Ollama Cloud is the default provider. Set the CITE_PROVIDER
           # repository variable to "openrouter" to switch this repository
           # back; both keys exist in every repository.
           structured_output: ${{ vars.CITE_PROVIDER == 'openrouter' && 'response_format' || 'tools' }}
+          require_parameters: ${{ vars.CITE_PROVIDER == 'openrouter' }}
           model_api_key: ${{ vars.CITE_PROVIDER == 'openrouter' && secrets.MODEL_API_KEY || secrets.OLLAMA_API_KEY }}
           model_base_url: ${{ vars.CITE_PROVIDER == 'openrouter' && 'https://openrouter.ai/api/v1' || 'https://ollama.com/v1' }}
           model_id: ${{ vars.CITE_PROVIDER == 'openrouter' && 'deepseek/deepseek-v4-flash-0731' || 'deepseek-v4.1-flash' }}
