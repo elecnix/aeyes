@@ -196,18 +196,11 @@ pub fn parse_resolution(input: &str) -> Result<(u32, u32)> {
 }
 
 /// Parse a fourcc format string, restricted to the formats aeyes can encode.
+///
+/// Adapter over [`pixel_format::PixelFormat::parse`]: the accepted set and the
+/// message naming it now come from the single format table.
 pub fn parse_fourcc(input: &str) -> Result<[u8; 4]> {
-    let upper = input.trim().to_ascii_uppercase();
-    match upper.as_str() {
-        "MJPG" | "YUYV" | "YU12" | "YV12" | "NV12" | "RGB3" | "BGR3" => {
-            let mut fourcc = [0u8; 4];
-            fourcc.copy_from_slice(upper.as_bytes());
-            Ok(fourcc)
-        }
-        _ => bail!(
-            "unsupported format '{input}'; aeyes can only encode MJPG, YUYV, YU12, YV12, NV12, RGB3, or BGR3"
-        ),
-    }
+    pixel_format::PixelFormat::parse(input)
 }
 
 pub trait OpenCamera: Send {
@@ -787,26 +780,10 @@ impl OpenCamera for V4l2OpenCamera {
             warn!(?err, device = %self.device_path, "failed to adapt exposure from captured frame");
         }
 
-        match &self.format {
-            b"MJPG" => Ok(frame.to_vec()),
-            b"YUYV" => yuyv_to_jpeg(self.width, self.height, &frame)
-                .with_context(|| format!("failed to encode YUYV frame from {}", self.device_path)),
-            b"YU12" => yuv420_to_jpeg(self.width, self.height, &frame, false)
-                .with_context(|| format!("failed to encode YU12 frame from {}", self.device_path)),
-            b"YV12" => yuv420_to_jpeg(self.width, self.height, &frame, true)
-                .with_context(|| format!("failed to encode YV12 frame from {}", self.device_path)),
-            b"NV12" => nv12_to_jpeg(self.width, self.height, &frame)
-                .with_context(|| format!("failed to encode NV12 frame from {}", self.device_path)),
-            b"RGB3" => rgb24_to_jpeg(self.width, self.height, &frame)
-                .with_context(|| format!("failed to encode RGB3 frame from {}", self.device_path)),
-            b"BGR3" => bgr24_to_jpeg(self.width, self.height, &frame)
-                .with_context(|| format!("failed to encode BGR3 frame from {}", self.device_path)),
-            other => bail!(
-                "unsupported frame format '{}' from {}",
-                String::from_utf8_lossy(other),
-                self.device_path
-            ),
-        }
+        // One call, no fourcc named here: the format table decides how the frame
+        // becomes JPEG. See `pixel_format::PixelFormat::encode`.
+        pixel_format::PixelFormat::encode(self.width, self.height, &self.format, &frame)
+            .with_context(|| format!("failed to encode frame from {}", self.device_path))
     }
 }
 
@@ -837,18 +814,25 @@ struct NativeFormat {
 }
 
 /// Formats aeyes can hand back as JPEG, in preference order: MJPG is passed
-/// through untouched, YUYV / YU12 / YV12 / NV12 / RGB3 / BGR3 are converted.
+/// through untouched, the rest are converted.
+///
+/// Adapter over [`pixel_format::PixelFormat::ALL`], whose order *is* the
+/// preference order — there is no second list to keep in step with this one.
+/// The array length is read from the table so adding a format cannot silently
+/// desynchronise it.
 #[cfg(target_os = "linux")]
-fn encodable_formats() -> [[u8; 4]; 7] {
-    [
-        *b"MJPG", *b"YUYV", *b"RGB3", *b"BGR3", *b"YU12", *b"YV12", *b"NV12",
-    ]
+fn encodable_formats() -> [[u8; 4]; pixel_format::PixelFormat::COUNT] {
+    let mut formats = [[0u8; 4]; pixel_format::PixelFormat::COUNT];
+    for (slot, spec) in formats.iter_mut().zip(&pixel_format::PixelFormat::ALL) {
+        *slot = spec.fourcc();
+    }
+    formats
 }
 
 /// Formats aeyes can hand back as JPEG (MJPEG passthrough, the rest converted).
 #[cfg(target_os = "linux")]
 fn is_encodable_format(format: &[u8; 4]) -> bool {
-    encodable_formats().contains(format)
+    pixel_format::PixelFormat::get(format).is_some()
 }
 
 /// Common sizes used as fallbacks when a device advertises a stepwise frame
@@ -866,6 +850,14 @@ fn common_resolutions() -> [(u32, u32); 7] {
     ]
 }
 
+/// The two formats the historical fallback presets below name. Taken from the
+/// single format table so a fourcc is never spelled out twice.
+#[cfg(target_os = "linux")]
+const PRESET_MJPEG: [u8; 4] = pixel_format::PixelFormat::of(*b"MJPG").fourcc();
+
+#[cfg(target_os = "linux")]
+const PRESET_YUYV: [u8; 4] = pixel_format::PixelFormat::of(*b"YUYV").fourcc();
+
 /// The historical quality-first candidate list, kept as a last-resort fallback
 /// for devices whose enumeration returns nothing useful.
 #[cfg(target_os = "linux")]
@@ -874,61 +866,61 @@ const FIXED_CAPTURE_PRESETS: [CapturePreset; 10] = [
         width: 3840,
         height: 2160,
         fps: 30,
-        format: *b"MJPG",
+        format: PRESET_MJPEG,
     },
     CapturePreset {
         width: 2560,
         height: 1440,
         fps: 30,
-        format: *b"MJPG",
+        format: PRESET_MJPEG,
     },
     CapturePreset {
         width: 1920,
         height: 1080,
         fps: 60,
-        format: *b"MJPG",
+        format: PRESET_MJPEG,
     },
     CapturePreset {
         width: 1920,
         height: 1080,
         fps: 30,
-        format: *b"MJPG",
+        format: PRESET_MJPEG,
     },
     CapturePreset {
         width: 1280,
         height: 720,
         fps: 60,
-        format: *b"MJPG",
+        format: PRESET_MJPEG,
     },
     CapturePreset {
         width: 1280,
         height: 720,
         fps: 30,
-        format: *b"MJPG",
+        format: PRESET_MJPEG,
     },
     CapturePreset {
         width: 1920,
         height: 1080,
         fps: 30,
-        format: *b"YUYV",
+        format: PRESET_YUYV,
     },
     CapturePreset {
         width: 1280,
         height: 720,
         fps: 30,
-        format: *b"YUYV",
+        format: PRESET_YUYV,
     },
     CapturePreset {
         width: 640,
         height: 480,
         fps: 30,
-        format: *b"YUYV",
+        format: PRESET_YUYV,
     },
     CapturePreset {
         width: 640,
         height: 480,
         fps: 30,
-        format: *b"MJPG",
+        format: PRESET_MJPEG,
     },
 ];
 
@@ -2754,34 +2746,554 @@ fn quantize_exposure_value(minimum: i32, maximum: i32, step: i32, value: i32) ->
     minimum + ((offset + (step / 2)) / step) * step
 }
 
-pub fn yuyv_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-    let expected = (width as usize) * (height as usize) * 2;
-    if bytes.len() != expected {
-        bail!(
-            "invalid YUYV buffer length: expected {expected} bytes for {width}x{height}, got {}",
-            bytes.len()
-        );
+/// Pixel formats: the one place aeyes knows a fourcc.
+///
+/// Everything aeyes needs to know about a capture format — its fourcc, its
+/// human label, how long a `w x h` frame of it is, how it becomes JPEG, and
+/// whether its luma can be sampled for exposure stats — is a field on
+/// [`PixelFormat`] and lives in exactly one table,
+/// [`PixelFormat::ALL`]. There is one ordering of that table (it is the
+/// preference order) and one definition per format. Adding an eighth format is
+/// one row, not seven edits in seven places.
+///
+/// # Interface
+///
+/// Callers ask a question; they never name a fourcc:
+///
+/// - [`PixelFormat::parse`] — a user-supplied `--format` string to a fourcc.
+/// - [`PixelFormat::get`] — a device-reported fourcc to its spec, if encodable.
+/// - [`PixelFormat::encode`] — a raw frame in, JPEG out, for any encodable format.
+/// - [`PixelFormat::labels`] — the `MJPG/YUYV/...` list for `--help` and errors.
+/// - [`PixelFormat::ALL`] / [`PixelFormat::COUNT`] — the table and its length,
+///   already in preference order.
+///
+/// A caller that needs to know *about* a format asks
+/// [`PixelFormat::get`](PixelFormat::get) and reads
+/// [`label`](PixelFormat::label) or
+/// [`supports_exposure_sampling`](PixelFormat::supports_exposure_sampling)
+/// off the answer. Exposure adaptation, the camera seam and the CLI all hang
+/// off this seam and need no further change here.
+///
+/// The `yuyv_to_jpeg` / `yuv420_to_jpeg` / `nv12_to_jpeg` / `rgb24_to_jpeg` /
+/// `bgr24_to_jpeg` functions below this module are unchanged adapters: same
+/// signatures, same error strings, one-line delegations. They exist for callers
+/// that already hold a known format and for the `pub` surface; new code should
+/// call [`PixelFormat::encode`] instead.
+///
+/// # Why the module is inline
+///
+/// `src/lib.rs` is a single 4k-line file under concurrent edit. Adding
+/// `mod` declarations at the top of it would serialise every such change on one
+/// line, so the module keeps its diff local instead.
+pub mod pixel_format {
+    use crate::encode_rgb_to_jpeg;
+    use anyhow::{bail, Context, Result};
+
+    /// How a 4:2:0 YUV frame addresses its chroma samples.
+    ///
+    /// This is the *only* difference between YU12, YV12 and NV12: all three are
+    /// a full-resolution Y plane followed by half-resolution chroma, and they
+    /// share one loop that differs only in how it indexes that chroma.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum ChromaLayout {
+        /// Y plane, then a half-resolution *interleaved* U,V plane (NV12).
+        InterleavedUv,
+        /// Y plane, then half-resolution planes U then V (YU12 / I420).
+        PlanarUv,
+        /// Y plane, then half-resolution planes V then U (YV12).
+        PlanarVu,
     }
 
-    let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
-    for chunk in bytes.as_chunks::<4>().0 {
-        let y0 = chunk[0] as f32;
-        let u = chunk[1] as f32 - 128.0;
-        let y1 = chunk[2] as f32;
-        let v = chunk[3] as f32 - 128.0;
-        push_yuv_pixel(&mut rgb, y0, u, v);
-        push_yuv_pixel(&mut rgb, y1, u, v);
+    /// How a frame of a given format reaches a JPEG.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Encoding {
+        /// The device already hands us JPEG; pass it back untouched (MJPG).
+        Passthrough,
+        /// Packed 4:2:2 YUYV: two pixels per four bytes.
+        Packed422,
+        /// Subsampled 4:2:0 YUV in one of three chroma layouts.
+        Subsampled420(ChromaLayout),
+        /// Tightly-packed 24-bit RGB, or BGR when `bgr` is set.
+        Packed24 { bgr: bool },
     }
-    encode_rgb_to_jpeg(width, height, rgb)
+
+    /// Everything aeyes knows about one capture pixel format.
+    ///
+    /// Construct these with [`PixelFormat::get`] (or [`PixelFormat::parse`]
+    /// followed by `get`) rather than by hand, so there is exactly one value per
+    /// format. The table is [`PixelFormat::ALL`].
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct PixelFormat {
+        /// The fourcc a V4L2 device reports for this format.
+        fourcc: [u8; 4],
+        /// The fourcc as text, for `--help` and human-facing summaries.
+        label: &'static str,
+        /// Name used in `invalid <buffer name> buffer length` errors, which
+        /// groups the three 4:2:0 layouts under one "YUV420" name.
+        buffer_name: &'static str,
+        encoding: Encoding,
+        /// Whether a raw frame of this format can be sampled for luma stats.
+        /// YUYV is read straight off the frame; MJPG is sampled by decoding it.
+        /// The 4:2:0 and 24-bit layouts are not sampled at all yet.
+        exposure_sampleable: bool,
+    }
+
+    impl PixelFormat {
+        /// The canonical table of encodable formats, in preference order: the
+        /// first format a device advertises that appears here is the one aeyes
+        /// asks for. This is the *only* ordering of the encodable formats.
+        pub const ALL: [Self; 7] = [
+            Self {
+                fourcc: *b"MJPG",
+                label: "MJPG",
+                buffer_name: "MJPEG",
+                encoding: Encoding::Passthrough,
+                exposure_sampleable: true,
+            },
+            Self {
+                fourcc: *b"YUYV",
+                label: "YUYV",
+                buffer_name: "YUYV",
+                encoding: Encoding::Packed422,
+                exposure_sampleable: true,
+            },
+            Self {
+                fourcc: *b"RGB3",
+                label: "RGB3",
+                buffer_name: "RGB",
+                encoding: Encoding::Packed24 { bgr: false },
+                exposure_sampleable: false,
+            },
+            Self {
+                fourcc: *b"BGR3",
+                label: "BGR3",
+                buffer_name: "BGR",
+                encoding: Encoding::Packed24 { bgr: true },
+                exposure_sampleable: false,
+            },
+            Self {
+                fourcc: *b"YU12",
+                label: "YU12",
+                buffer_name: "YUV420",
+                encoding: Encoding::Subsampled420(ChromaLayout::PlanarUv),
+                exposure_sampleable: false,
+            },
+            Self {
+                fourcc: *b"YV12",
+                label: "YV12",
+                buffer_name: "YUV420",
+                encoding: Encoding::Subsampled420(ChromaLayout::PlanarVu),
+                exposure_sampleable: false,
+            },
+            Self {
+                fourcc: *b"NV12",
+                label: "NV12",
+                buffer_name: "NV12",
+                encoding: Encoding::Subsampled420(ChromaLayout::InterleavedUv),
+                exposure_sampleable: false,
+            },
+        ];
+
+        /// How many formats are encodable. Read this rather than repeating `7`,
+        /// so a new table row cannot silently desynchronise a fixed-size array
+        /// built by a caller.
+        pub const COUNT: usize = Self::ALL.len();
+
+        /// The fourcc a device reports for this format.
+        pub const fn fourcc(&self) -> [u8; 4] {
+            self.fourcc
+        }
+
+        /// The fourcc as text, e.g. `"NV12"`.
+        pub const fn label(&self) -> &'static str {
+            self.label
+        }
+
+        /// Whether a raw frame of this format can be sampled for luma stats
+        /// without a full per-pixel conversion.
+        ///
+        /// Callers that can already handle a sample still have to pick the right
+        /// analyser for the layout (MJPG decodes, YUYV reads the frame); this
+        /// only answers whether it is worth trying at all.
+        pub const fn supports_exposure_sampling(&self) -> bool {
+            self.exposure_sampleable
+        }
+
+        /// Look up a device-reported fourcc.
+        ///
+        /// `None` means aeyes cannot hand that format back as JPEG, which is
+        /// the single question every "can we use this mode?" site needs to ask.
+        pub fn get(fourcc: &[u8; 4]) -> Option<&'static Self> {
+            Self::ALL.iter().find(|spec| &spec.fourcc == fourcc)
+        }
+
+        /// Look a fourcc up in a `const` context, for tables that must be built
+        /// at compile time (the fallback capture presets).
+        ///
+        /// # Panics
+        ///
+        /// At compile time, if `fourcc` is not in [`Self::ALL`].
+        pub const fn of(fourcc: [u8; 4]) -> Self {
+            let mut i = 0;
+            while i < Self::COUNT {
+                let candidate = Self::ALL[i];
+                if candidate.fourcc[0] == fourcc[0]
+                    && candidate.fourcc[1] == fourcc[1]
+                    && candidate.fourcc[2] == fourcc[2]
+                    && candidate.fourcc[3] == fourcc[3]
+                {
+                    return candidate;
+                }
+                i += 1;
+            }
+            panic!("fourcc is not in PixelFormat::ALL");
+        }
+
+        /// Every encodable format as a slash-joined list, e.g.
+        /// `"MJPG/YUYV/RGB3/BGR3/YU12/YV12/NV12"`.
+        ///
+        /// The single source for `--help` text and for the "unsupported format"
+        /// error, so those can no longer fall out of step with the table.
+        pub fn labels() -> String {
+            Self::ALL
+                .iter()
+                .map(|spec| spec.label)
+                .collect::<Vec<_>>()
+                .join("/")
+        }
+
+        /// Parse a user-supplied format string (e.g. `yuyv`) to a fourcc.
+        ///
+        /// Case-insensitive and whitespace-tolerant; rejects anything aeyes
+        /// cannot encode, naming the accepted set from the table.
+        pub fn parse(input: &str) -> Result<[u8; 4]> {
+            let upper = input.trim().to_ascii_uppercase();
+            let bytes = upper.as_bytes();
+            if bytes.len() == 4 {
+                let fourcc = [bytes[0], bytes[1], bytes[2], bytes[3]];
+                if Self::get(&fourcc).is_some() {
+                    return Ok(fourcc);
+                }
+            }
+            bail!(
+                "unsupported format '{input}'; aeyes can only encode {}",
+                Self::labels()
+            )
+        }
+
+        /// Convert one captured frame into JPEG.
+        ///
+        /// This is the single entry point from capture: hand over the device's
+        /// fourcc and the raw frame, get JPEG back. The caller matches nothing.
+        pub fn encode(width: u32, height: u32, fourcc: &[u8; 4], frame: &[u8]) -> Result<Vec<u8>> {
+            let spec = Self::get(fourcc).with_context(|| {
+                format!(
+                    "unsupported frame format '{}'",
+                    String::from_utf8_lossy(fourcc)
+                )
+            })?;
+            if matches!(spec.encoding, Encoding::Passthrough) {
+                return Ok(frame.to_vec());
+            }
+            let rgb = spec.rgb_from_frame(width, height, frame)?;
+            encode_rgb_to_jpeg(width, height, rgb)
+        }
+
+        /// The one kernel every converter shares: BT.601 YUV -> RGB.
+        fn push_yuv_pixel(rgb: &mut Vec<u8>, y: f32, u: f32, v: f32) {
+            let r = (y + 1.402 * v).round().clamp(0.0, 255.0) as u8;
+            let g = (y - 0.344_136 * u - 0.714_136 * v)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let b = (y + 1.772 * u).round().clamp(0.0, 255.0) as u8;
+            rgb.extend_from_slice(&[r, g, b]);
+        }
+
+        /// Reject a frame whose length does not match this format's layout.
+        ///
+        /// Every encoder used to open with its own copy of this check; it is now
+        /// one function, driven by the table's `buffer_name`.
+        fn check_len(&self, frame: &[u8], expected: usize, width: u32, height: u32) -> Result<()> {
+            if frame.len() != expected {
+                bail!(
+                    "invalid {} buffer length: expected {expected} bytes for {width}x{height}, got {}",
+                    self.buffer_name,
+                    frame.len()
+                );
+            }
+            Ok(())
+        }
+
+        /// Expand a frame to packed RGB, rejecting it if its length is wrong.
+        fn rgb_from_frame(&self, width: u32, height: u32, frame: &[u8]) -> Result<Vec<u8>> {
+            let (w, h) = (width as usize, height as usize);
+            match self.encoding {
+                Encoding::Passthrough => unreachable!("MJPEG is passed through by encode"),
+                Encoding::Packed24 { bgr } => self.rgb_from_24bit(w, h, frame, bgr),
+                Encoding::Packed422 => self.rgb_from_yuyv(w, h, frame),
+                Encoding::Subsampled420(layout) => self.rgb_from_420(w, h, frame, layout),
+            }
+        }
+
+        /// Packed 4:2:2 YUYV: two pixels per four bytes, chroma shared.
+        fn rgb_from_yuyv(&self, w: usize, h: usize, frame: &[u8]) -> Result<Vec<u8>> {
+            self.check_len(frame, w * h * 2, w as u32, h as u32)?;
+            let mut rgb = Vec::with_capacity(w * h * 3);
+            for chunk in frame.as_chunks::<4>().0 {
+                let u = chunk[1] as f32 - 128.0;
+                let v = chunk[3] as f32 - 128.0;
+                Self::push_yuv_pixel(&mut rgb, chunk[0] as f32, u, v);
+                Self::push_yuv_pixel(&mut rgb, chunk[2] as f32, u, v);
+            }
+            Ok(rgb)
+        }
+
+        /// The one 4:2:0 loop. YU12, YV12 and NV12 share it and differ only in
+        /// how they address chroma. Odd sizes round the chroma planes up
+        /// (`div_ceil`), matching V4L2's behaviour.
+        fn rgb_from_420(
+            &self,
+            w: usize,
+            h: usize,
+            frame: &[u8],
+            layout: ChromaLayout,
+        ) -> Result<Vec<u8>> {
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let y_len = w * h;
+            let uv_len = cw * ch;
+            self.check_len(frame, y_len + 2 * uv_len, w as u32, h as u32)?;
+
+            let y_plane = &frame[..y_len];
+            let chroma = &frame[y_len..];
+            let chroma_at = |row: usize, col: usize| -> (f32, f32) {
+                match layout {
+                    ChromaLayout::InterleavedUv => {
+                        let offset = (row / 2) * (cw * 2) + (col / 2) * 2;
+                        (
+                            chroma[offset] as f32 - 128.0,
+                            chroma[offset + 1] as f32 - 128.0,
+                        )
+                    }
+                    ChromaLayout::PlanarUv => {
+                        let index = (row / 2) * cw + col / 2;
+                        (
+                            chroma[index] as f32 - 128.0,
+                            chroma[index + uv_len] as f32 - 128.0,
+                        )
+                    }
+                    ChromaLayout::PlanarVu => {
+                        let index = (row / 2) * cw + col / 2;
+                        (
+                            chroma[index + uv_len] as f32 - 128.0,
+                            chroma[index] as f32 - 128.0,
+                        )
+                    }
+                }
+            };
+
+            let mut rgb = Vec::with_capacity(w * h * 3);
+            for row in 0..h {
+                for col in 0..w {
+                    let (u, v) = chroma_at(row, col);
+                    Self::push_yuv_pixel(&mut rgb, y_plane[row * w + col] as f32, u, v);
+                }
+            }
+            Ok(rgb)
+        }
+
+        /// Tightly-packed 24-bit RGB, or BGR when `bgr` is set.
+        fn rgb_from_24bit(&self, w: usize, h: usize, frame: &[u8], bgr: bool) -> Result<Vec<u8>> {
+            let expected = w * h * 3;
+            self.check_len(frame, expected, w as u32, h as u32)?;
+            if !bgr {
+                return Ok(frame.to_vec());
+            }
+            let mut rgb = Vec::with_capacity(expected);
+            for chunk in frame.as_chunks::<3>().0 {
+                rgb.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
+            }
+            Ok(rgb)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{bgr24_to_jpeg, nv12_to_jpeg, rgb24_to_jpeg, yuv420_to_jpeg, yuyv_to_jpeg};
+
+        /// The named adapters must stay bit-identical to the table-driven path:
+        /// this is the guard that folding six converters into one dispatch did
+        /// not move a single pixel.
+        #[test]
+        fn encode_matches_the_named_adapters_byte_for_byte() {
+            let yuyv: Vec<u8> = (0..32).map(|i| (i as u8).wrapping_mul(7)).collect();
+            let yuv420 = {
+                let mut v = vec![80u8; 16];
+                v.extend((0..4).map(|i| 90 + i));
+                v.extend((0..4).map(|i| 240 - i));
+                v
+            };
+            let nv12 = {
+                let mut v = vec![82u8; 16];
+                v.extend((0..8).map(|i| 90 + i * 3));
+                v
+            };
+            let rgb24: Vec<u8> = (0..48).map(|i| (i as u8).wrapping_mul(5)).collect();
+
+            assert_eq!(
+                PixelFormat::encode(4, 4, b"YUYV", &yuyv).unwrap(),
+                yuyv_to_jpeg(4, 4, &yuyv).unwrap()
+            );
+            assert_eq!(
+                PixelFormat::encode(4, 4, b"YU12", &yuv420).unwrap(),
+                yuv420_to_jpeg(4, 4, &yuv420, false).unwrap()
+            );
+            assert_eq!(
+                PixelFormat::encode(4, 4, b"YV12", &yuv420).unwrap(),
+                yuv420_to_jpeg(4, 4, &yuv420, true).unwrap()
+            );
+            assert_eq!(
+                PixelFormat::encode(4, 4, b"NV12", &nv12).unwrap(),
+                nv12_to_jpeg(4, 4, &nv12).unwrap()
+            );
+            assert_eq!(
+                PixelFormat::encode(4, 4, b"RGB3", &rgb24).unwrap(),
+                rgb24_to_jpeg(4, 4, &rgb24).unwrap()
+            );
+            assert_eq!(
+                PixelFormat::encode(4, 4, b"BGR3", &rgb24).unwrap(),
+                bgr24_to_jpeg(4, 4, &rgb24).unwrap()
+            );
+        }
+
+        /// The three 4:2:0 layouts are the same loop: a YV12 buffer built by
+        /// swapping the planes of a YU12 one must decode to the same pixels.
+        #[test]
+        fn planar_uv_and_vu_are_mirror_images() {
+            let (y, u, v) = ([80u8; 4], [90u8; 1], [240u8; 1]);
+            let mut yv12 = y.to_vec();
+            yv12.extend_from_slice(&v);
+            yv12.extend_from_slice(&u);
+
+            let as_yu12 = PixelFormat::encode(2, 2, b"YU12", &yv12).unwrap();
+            let as_yv12 = PixelFormat::encode(2, 2, b"YV12", &yv12).unwrap();
+            assert!(
+                as_yu12 != as_yv12,
+                "a swapped buffer must not decode the same"
+            );
+
+            let mut yu12 = y.to_vec();
+            yu12.extend_from_slice(&u);
+            yu12.extend_from_slice(&v);
+            assert_eq!(
+                PixelFormat::encode(2, 2, b"YU12", &yu12).unwrap(),
+                PixelFormat::encode(2, 2, b"YV12", &yv12).unwrap()
+            );
+        }
+
+        /// NV12 is YU12 with its chroma planes interleaved; same pixels out.
+        #[test]
+        fn nv12_is_yu12_with_interleaved_chroma() {
+            let y = [80u8; 4];
+            let (u, v) = ([240u8; 1], [90u8; 1]);
+            let mut yv12 = y.to_vec();
+            yv12.extend_from_slice(&v);
+            yv12.extend_from_slice(&u);
+            let mut nv12 = y.to_vec();
+            nv12.extend_from_slice(&[u[0], v[0]]);
+
+            assert_eq!(
+                PixelFormat::encode(2, 2, b"YV12", &yv12).unwrap(),
+                PixelFormat::encode(2, 2, b"NV12", &nv12).unwrap()
+            );
+        }
+
+        /// MJPG is the device's JPEG already; aeyes must not touch a byte.
+        #[test]
+        fn mjpeg_is_passed_through_untouched() {
+            let jpeg = b"\xff\xd8\xff\xe0not-really-a-jpeg\xff\xd9".to_vec();
+            assert_eq!(PixelFormat::encode(2, 2, b"MJPG", &jpeg).unwrap(), jpeg);
+        }
+
+        #[test]
+        fn unsupported_fourcc_is_rejected_by_encode() {
+            let err = PixelFormat::encode(2, 2, b"H264", &[0u8; 16])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unsupported frame format"), "{err}");
+        }
+
+        #[test]
+        fn parse_agrees_with_the_table_in_both_directions() {
+            for spec in &PixelFormat::ALL {
+                assert_eq!(PixelFormat::parse(spec.label).unwrap(), spec.fourcc());
+                assert_eq!(
+                    PixelFormat::parse(&spec.label().to_lowercase()).unwrap(),
+                    spec.fourcc()
+                );
+                assert_eq!(PixelFormat::get(&spec.fourcc()), Some(spec));
+                assert_eq!(PixelFormat::of(spec.fourcc()), *spec);
+            }
+            assert!(PixelFormat::parse("H264").is_err());
+            assert!(PixelFormat::parse("YUY").is_err());
+            assert!(PixelFormat::get(b"H264").is_none());
+        }
+
+        /// `labels()` is what `--help` and the parse error print, so every
+        /// format in the table must appear exactly once.
+        #[test]
+        fn labels_lists_every_table_entry_exactly_once() {
+            let labels = PixelFormat::labels();
+            let listed: Vec<&str> = labels.split('/').collect();
+            let expected: Vec<&str> = PixelFormat::ALL.iter().map(|s| s.label()).collect();
+            assert_eq!(listed, expected);
+        }
+
+        #[test]
+        fn the_table_is_ordered_by_preference() {
+            assert_eq!(
+                PixelFormat::ALL.map(|s| s.fourcc()),
+                [*b"MJPG", *b"YUYV", *b"RGB3", *b"BGR3", *b"YU12", *b"YV12", *b"NV12"]
+            );
+            assert_eq!(PixelFormat::COUNT, PixelFormat::ALL.len());
+        }
+
+        /// Documents the predicate exposure adaptation reads: only MJPG (decode
+        /// to sample) and YUYV (sample straight off the frame) are sampleable.
+        #[test]
+        fn exposure_sampling_is_declared_per_format() {
+            for spec in &PixelFormat::ALL {
+                let expected = spec.fourcc() == *b"MJPG" || spec.fourcc() == *b"YUYV";
+                assert_eq!(spec.supports_exposure_sampling(), expected, "{spec:?}");
+            }
+        }
+
+        /// Buffer names are what the length errors print, and the 4:2:0 layouts
+        /// deliberately share one.
+        #[test]
+        fn length_errors_keep_their_format_names() {
+            let err = PixelFormat::encode(4, 4, b"YU12", &[0u8; 20])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid YUV420 buffer length"), "{err}");
+            let err = PixelFormat::encode(4, 4, b"YV12", &[0u8; 20])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid YUV420 buffer length"), "{err}");
+            let err = PixelFormat::encode(4, 4, b"NV12", &[0u8; 23])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid NV12 buffer length"), "{err}");
+        }
+    }
 }
 
-fn push_yuv_pixel(rgb: &mut Vec<u8>, y: f32, u: f32, v: f32) {
-    let r = (y + 1.402 * v).round().clamp(0.0, 255.0) as u8;
-    let g = (y - 0.344_136 * u - 0.714_136 * v)
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    let b = (y + 1.772 * u).round().clamp(0.0, 255.0) as u8;
-    rgb.extend_from_slice(&[r, g, b]);
+/// Convert a packed 4:2:2 YUYV frame to JPEG.
+///
+/// Adapter over [`pixel_format::PixelFormat::encode`]; callers that already know
+/// the format can keep using this. New code should call `encode` directly.
+pub fn yuyv_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
+    pixel_format::PixelFormat::encode(width, height, b"YUYV", bytes)
 }
 
 /// Convert a planar YUV 4:2:0 frame to JPEG.
@@ -2789,97 +3301,34 @@ fn push_yuv_pixel(rgb: &mut Vec<u8>, y: f32, u: f32, v: f32) {
 /// Covers YU12 (I420: Y plane, then U, then V) and YV12 (Y plane, then V,
 /// then U) via the `uv_swapped` plane-order flag. Odd sizes round the chroma
 /// planes up (`div_ceil`), matching V4L2's behavior.
+///
+/// Adapter over [`pixel_format::PixelFormat::encode`], which dispatches on the
+/// fourcc instead of taking a plane-order flag.
 pub fn yuv420_to_jpeg(width: u32, height: u32, bytes: &[u8], uv_swapped: bool) -> Result<Vec<u8>> {
-    let (w, h) = (width as usize, height as usize);
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let y_len = w * h;
-    let uv_len = cw * ch;
-    let expected = y_len + 2 * uv_len;
-    if bytes.len() != expected {
-        bail!(
-            "invalid YUV420 buffer length: expected {expected} bytes for {width}x{height}, got {}",
-            bytes.len()
-        );
-    }
-    let y_plane = &bytes[..y_len];
-    let (u_plane, v_plane) = if uv_swapped {
-        (&bytes[y_len + uv_len..], &bytes[y_len..y_len + uv_len])
-    } else {
-        (&bytes[y_len..y_len + uv_len], &bytes[y_len + uv_len..])
-    };
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for row in 0..h {
-        for col in 0..w {
-            let y = y_plane[row * w + col] as f32;
-            let chroma = (row / 2) * cw + col / 2;
-            push_yuv_pixel(
-                &mut rgb,
-                y,
-                u_plane[chroma] as f32 - 128.0,
-                v_plane[chroma] as f32 - 128.0,
-            );
-        }
-    }
-    encode_rgb_to_jpeg(width, height, rgb)
+    let fourcc = if uv_swapped { b"YV12" } else { b"YU12" };
+    pixel_format::PixelFormat::encode(width, height, fourcc, bytes)
 }
 
 /// Convert a bi-planar NV12 frame (full-resolution Y plane followed by an
 /// interleaved U/V plane at half resolution) to JPEG.
+///
+/// Adapter over [`pixel_format::PixelFormat::encode`].
 pub fn nv12_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-    let (w, h) = (width as usize, height as usize);
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let y_len = w * h;
-    let expected = y_len + cw * ch * 2;
-    if bytes.len() != expected {
-        bail!(
-            "invalid NV12 buffer length: expected {expected} bytes for {width}x{height}, got {}",
-            bytes.len()
-        );
-    }
-    let y_plane = &bytes[..y_len];
-    let uv_plane = &bytes[y_len..];
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for row in 0..h {
-        for col in 0..w {
-            let y = y_plane[row * w + col] as f32;
-            let uv_off = (row / 2) * (cw * 2) + (col / 2) * 2;
-            push_yuv_pixel(
-                &mut rgb,
-                y,
-                uv_plane[uv_off] as f32 - 128.0,
-                uv_plane[uv_off + 1] as f32 - 128.0,
-            );
-        }
-    }
-    encode_rgb_to_jpeg(width, height, rgb)
+    pixel_format::PixelFormat::encode(width, height, b"NV12", bytes)
 }
 
 /// Convert a tightly-packed 24-bit RGB (RGB3) frame to JPEG.
+///
+/// Adapter over [`pixel_format::PixelFormat::encode`].
 pub fn rgb24_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-    let expected = (width as usize) * (height as usize) * 3;
-    if bytes.len() != expected {
-        bail!(
-            "invalid RGB buffer length: expected {expected} bytes for {width}x{height}, got {}",
-            bytes.len()
-        );
-    }
-    encode_rgb_to_jpeg(width, height, bytes.to_vec())
+    pixel_format::PixelFormat::encode(width, height, b"RGB3", bytes)
 }
 
 /// Convert a tightly-packed 24-bit BGR (BGR3) frame to JPEG.
+///
+/// Adapter over [`pixel_format::PixelFormat::encode`].
 pub fn bgr24_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-    let expected = (width as usize) * (height as usize) * 3;
-    if bytes.len() != expected {
-        bail!(
-            "invalid BGR buffer length: expected {expected} bytes for {width}x{height}, got {}",
-            bytes.len()
-        );
-    }
-    let mut rgb = Vec::with_capacity(expected);
-    for chunk in bytes.as_chunks::<3>().0 {
-        rgb.extend_from_slice(&[chunk[2], chunk[1], chunk[0]]);
-    }
-    encode_rgb_to_jpeg(width, height, rgb)
+    pixel_format::PixelFormat::encode(width, height, b"BGR3", bytes)
 }
 
 #[cfg(test)]
