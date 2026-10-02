@@ -1456,12 +1456,14 @@ pub async fn stop_daemon() -> Result<()> {
 /// only once `TcpListener::bind` has succeeded: writing them earlier would leave
 /// a pid/addr pair behind describing a daemon that never came up.
 ///
-/// `AEYES_DAEMON` is set by `start_daemon` on the child it spawns. In-process
-/// callers must not touch the registry — notably the test suite, which binds
-/// throwaway ports and would otherwise clobber the pid/addr files of a daemon
-/// actually running on this machine.
+/// `AEYES_DAEMON` is set to `1` by `start_daemon` on the child it spawns, and
+/// `main` checks for exactly that value before handing off to `run_daemon_from_env`,
+/// so the spawned daemon is the only process that publishes. In-process callers
+/// must not touch the registry — notably the test suite, which binds throwaway
+/// ports and would otherwise clobber the pid/addr files of a daemon actually
+/// running on this machine.
 fn publish_runtime_registry(bind: SocketAddr) -> Result<()> {
-    if env::var_os("AEYES_DAEMON").is_none() {
+    if env::var("AEYES_DAEMON").ok().as_deref() != Some("1") {
         return Ok(());
     }
     fs::create_dir_all(runtime_dir())?;
@@ -1470,30 +1472,42 @@ fn publish_runtime_registry(bind: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-/// Whether `pid` is still a live aeyes daemon we may safely signal.
+/// Whether `pid` is a process we may safely signal on behalf of `stop_daemon`.
 ///
 /// The registry goes stale whenever a daemon dies, fails to bind, or loses a
-/// start-up race, and the OS recycles stale pids. Signalling a recycled pid
-/// would take down an unrelated process, so `stop_daemon` checks identity first.
-/// This deliberately errs towards "do not kill": the HTTP `/shutdown` path runs
-/// first and handles the normal case, so a missed force-kill is much cheaper than
-/// killing a bystander.
+/// start-up race, and the OS recycles stale pids. Signalling a recycled pid would
+/// take down an unrelated process, so `stop_daemon` checks first. This deliberately
+/// errs towards "do not kill": the HTTP `/shutdown` path runs first and handles the
+/// normal case, so a missed force-kill is far cheaper than killing a bystander.
+///
+/// The strength of the check is platform-dependent, because a dependency-free
+/// identity check only exists on Linux:
+///
+/// * Linux — identity. `/proc/<pid>/exe` must resolve to the very executable we
+///   are running, so a shell, an editor, or a build whose *path* happens to
+///   contain "aeyes" is correctly rejected.
+/// * Other unix — liveness only, via `kill -0`. Identity is not available without
+///   pulling in a dependency.
+/// * Windows — no cheap check, so the previous unconditional behaviour is kept.
 fn daemon_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        // /proc/<pid>/cmdline is NUL-separated; the first field is the executable.
-        match fs::read_to_string(format!("/proc/{pid}/cmdline")) {
-            Ok(cmdline) => cmdline
-                .split('\0')
-                .next()
-                .is_some_and(|exe| exe.contains("aeyes")),
-            // No /proc entry means the process is gone.
-            Err(_) => false,
-        }
+        // An unresolvable /proc/<pid>/exe means there is no such process.
+        let Ok(theirs) = fs::read_link(format!("/proc/{pid}/exe")) else {
+            return false;
+        };
+        env::current_exe().is_ok_and(|ours| ours == theirs)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // No portable identity check; retain the previous behaviour.
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(unix))]
+    {
         let _ = pid;
         true
     }
