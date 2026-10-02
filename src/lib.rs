@@ -966,19 +966,24 @@ impl V4l2OpenCamera {
                 }
             }
             Err(err) => {
-                let refused = self
+                // Tolerant of a missing controller on purpose, matching the
+                // success arm above. Nothing clears `exposure_controller` while
+                // `&mut self` is held, so this arm is not reachable today — but
+                // a camera error must log, never abort the capture thread.
+                let refusal = self
                     .exposure_controller
                     .as_mut()
-                    .map(|controller| controller.record_refused(value))
-                    .expect("an exposure decision implies a controller");
-                warn!(
-                    ?err,
-                    device = %self.device_path,
-                    exposure = value,
-                    refusals = refused.refusals,
-                    suppressed = refused.suppressed,
-                    "camera refused exposure value"
-                );
+                    .map(|controller| controller.record_refused(value));
+                if let Some(refused) = refusal {
+                    warn!(
+                        ?err,
+                        device = %self.device_path,
+                        exposure = value,
+                        refusals = refused.refusals,
+                        suppressed = refused.suppressed,
+                        "camera refused exposure value"
+                    );
+                }
                 return Ok(());
             }
         }
@@ -4522,37 +4527,88 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_a_refused_value_is_latched_suppressed() {
-        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
-        let value = 280;
-
-        let mut states = Vec::new();
-        for _ in 0..EXPOSURE_MAX_REFUSALS {
-            states.push(controller.record_refused(value).suppressed);
-        }
-        assert_eq!(
-            states,
-            vec![false, false, true,],
-            "suppression must latch exactly on the last budgeted refusal"
-        );
-
-        // While latched, `plan` refuses to propose it again -- without this the
-        // warning would recur at every sampling interval indefinitely.
+    fn test_the_backoff_gates_the_frames_after_a_refusal() {
+        // The backoff branch is consulted ahead of the interval branch, so the
+        // frames between a refusal and the next proposal are `Backoff`, not
+        // `Interval`. That ordering is what stops a refused value being
+        // re-proposed on the very next sample.
         let spec = pixel_format::PixelFormat::get(b"YUYV").expect("YUYV is encodable");
         let (width, height, bytes) = blown_frame(spec, 255);
-        for _ in 0..80 {
-            let decision = controller
-                .plan(&CapturedFrame {
-                    format: spec,
-                    width,
-                    height,
-                    bytes: &bytes,
-                })
-                .expect("plan a blown frame");
-            if let ExposureDecision::Apply { value, .. } = decision {
-                controller.record_refused(value);
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+        let frame = CapturedFrame {
+            format: spec,
+            width,
+            height,
+            bytes: &bytes,
+        };
+
+        // Frame 0 samples and applies; the camera refuses.
+        let ExposureDecision::Apply { value, .. } = controller.plan(&frame).unwrap() else {
+            panic!("the first frame should be sampled");
+        };
+        controller.record_refused(value);
+
+        let mut backoff = 0u32;
+        for _ in 0..EXPOSURE_RETRY_FRAMES {
+            match controller.plan(&frame).unwrap() {
+                ExposureDecision::Skip(SkipReason::Backoff { .. }) => backoff += 1,
+                other => panic!("expected a backoff frame, got {other:?}"),
             }
         }
+        assert_eq!(backoff, EXPOSURE_RETRY_FRAMES);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_a_refused_value_is_latched_suppressed() {
+        // Driven end to end through `plan`, because the value a seeded refusal
+        // would need to name is the value the planner actually computes.
+        let spec = pixel_format::PixelFormat::get(b"YUYV").expect("YUYV is encodable");
+        let (width, height, bytes) = blown_frame(spec, 255);
+        let frame = CapturedFrame {
+            format: spec,
+            width,
+            height,
+            bytes: &bytes,
+        };
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+
+        let mut writes = 0u32;
+        let mut latched_on_write = None;
+        let mut suppressed_frames = 0u32;
+
+        // 600 frames is far past the point where the old code would have been
+        // writing every EXPOSURE_SAMPLE_INTERVAL frames for the life of the
+        // daemon. The write *count* is the assertion that matters: asserting on
+        // the `suppressed` flag alone would pass even with the loop running,
+        // because `record_refused` keeps raising `refusals` while latched.
+        for _ in 0..600 {
+            match controller.plan(&frame).expect("plan a blown frame") {
+                ExposureDecision::Apply { value, .. } => {
+                    writes += 1;
+                    let refused = controller.record_refused(value);
+                    if refused.suppressed && latched_on_write.is_none() {
+                        latched_on_write = Some(writes);
+                    }
+                }
+                ExposureDecision::Skip(SkipReason::Suppressed { .. }) => suppressed_frames += 1,
+                ExposureDecision::Skip(_) | ExposureDecision::Hold(_) => {}
+            }
+        }
+
+        assert_eq!(
+            latched_on_write,
+            Some(EXPOSURE_MAX_REFUSALS),
+            "the latch must fall on the last budgeted refusal, not before"
+        );
+        assert_eq!(
+            writes, EXPOSURE_MAX_REFUSALS,
+            "a latched value must never be written again for the same frame"
+        );
+        assert!(
+            suppressed_frames > 0,
+            "the latch must actually be reached during the run"
+        );
         assert!(
             controller
                 .sampling
