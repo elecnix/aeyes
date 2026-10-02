@@ -2008,13 +2008,38 @@ async fn web_ui_handler(AxumPath(id): AxumPath<String>, State(state): State<AppS
         id.clone()
     };
 
-    // Validate camera exists
-    let camera_name = state
+    // Validate camera exists. An unknown id must not fall through to a page
+    // whose <img> would 404 afterwards: return the same structured 404 the
+    // streaming handlers use.
+    let camera_name = match state
         .streams
         .get(&requested)
         .and_then(|_| state.cameras.iter().find(|c| c.id == requested))
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| requested.clone());
+    {
+        Some(camera) => camera.name.clone(),
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                DaemonErrorState::new(format!(
+                    "camera '{requested}' is not managed by this daemon"
+                ))
+                .with_detail(format!(
+                    "available cameras: {}",
+                    state.streams.keys().cloned().collect::<Vec<_>>().join(", ")
+                ))
+                .with_detail("request one of the IDs returned by GET /cams"),
+            );
+        }
+    };
+
+    // Both the camera name (from `v4l2-ctl --info` "Card type", i.e. whatever
+    // the driver/udev reports) and the camera id (a percent-decoded axum path
+    // parameter, so attacker-influenced) reach an HTML document here. Build
+    // the values we interpolate, then escape them for the HTML context. The
+    // stream URL is emitted only as escaped attributes and read back from the
+    // DOM by the script, so no untrusted value is ever concatenated into a
+    // JavaScript string literal.
+    let stream_url = format!("/cams/{requested}/stream");
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -2022,7 +2047,7 @@ async fn web_ui_handler(AxumPath(id): AxumPath<String>, State(state): State<AppS
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>aeyes - {camera_name}</title>
+    <title>aeyes - {camera_name_html}</title>
     <style>
         * {{
             margin: 0;
@@ -2091,16 +2116,16 @@ async fn web_ui_handler(AxumPath(id): AxumPath<String>, State(state): State<AppS
 <body>
     <header>
         <h1>aeyes</h1>
-        <span class="camera-info">{camera_name}</span>
+        <span class="camera-info">{camera_name_html}</span>
     </header>
     <div class="stream-container">
-        <img src="/cams/{id}/stream" alt="Live stream from {camera_name}" onerror="reconnect()" onload="setStatus('connected', 'Connected')">
+        <img src="{stream_url_html}" data-stream-url="{stream_url_html}" alt="Live stream from {camera_name_html}" onerror="reconnect()" onload="setStatus('connected', 'Connected')">
         <script>
             function reconnect() {{
                 setStatus('error', 'Reconnecting…');
                 setTimeout(() => {{
                     const img = document.querySelector('img');
-                    if (img) img.src = '/cams/{id}/stream?t=' + Date.now();
+                    if (img) img.src = img.getAttribute('data-stream-url') + '?t=' + Date.now();
                 }}, 2000);
             }}
         </script>
@@ -2115,8 +2140,8 @@ async fn web_ui_handler(AxumPath(id): AxumPath<String>, State(state): State<AppS
     </script>
 </body>
 </html>"#,
-        camera_name = camera_name,
-        id = id
+        camera_name_html = escape_html(&camera_name),
+        stream_url_html = escape_html(&stream_url),
     );
 
     Response::builder()
@@ -2124,6 +2149,218 @@ async fn web_ui_handler(AxumPath(id): AxumPath<String>, State(state): State<AppS
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(html))
         .unwrap()
+}
+
+/// Escape a value for interpolation into an HTML document.
+///
+/// Covers both HTML text nodes and double-quoted attribute values, which is
+/// every context this crate interpolates untrusted values into. `&` is escaped
+/// first so that already-escaped entities in the input are not double-decoded.
+/// Escaping the single quote as well is not required for a double-quoted
+/// attribute, but it makes the helper safe to reuse for single-quoted ones.
+fn escape_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod web_ui_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn state_with_cameras(cameras: Vec<CameraDescriptor>) -> AppState {
+        let mut streams = HashMap::new();
+        for camera in &cameras {
+            let (tx, _) = broadcast::channel(4);
+            streams.insert(
+                camera.id.clone(),
+                CameraStreamState {
+                    latest_jpeg: Arc::new(RwLock::new(None)),
+                    last_error: Arc::new(RwLock::new(None)),
+                    frame_tx: tx,
+                },
+            );
+        }
+        AppState {
+            selected_camera: cameras
+                .first()
+                .map(|c| c.id.clone())
+                .unwrap_or_else(|| "cam-a".to_string()),
+            streams: Arc::new(streams),
+            cameras: Arc::new(cameras),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            chrome_session: OptionChromeSession::default(),
+        }
+    }
+
+    fn front_cam() -> CameraDescriptor {
+        CameraDescriptor {
+            id: "cam-a".into(),
+            name: "Front Cam".into(),
+            backend: "fake".into(),
+        }
+    }
+
+    /// Render `GET /web/<uri>` through the real router, so axum performs the
+    /// percent-decoding the exploit relies on.
+    async fn render_web(state: AppState, uri: &str) -> (StatusCode, String) {
+        let app = Router::new()
+            .route("/web/{id}", get(web_ui_handler))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[test]
+    fn escape_html_covers_every_dangerous_character() {
+        assert_eq!(
+            escape_html("<img src=x onerror=alert(1)>"),
+            "&lt;img src=x onerror=alert(1)&gt;"
+        );
+        assert_eq!(escape_html("a&b"), "a&amp;b");
+        assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(escape_html("it's"), "it&#39;s");
+        assert_eq!(escape_html("Front Cam 0"), "Front Cam 0");
+    }
+
+    #[tokio::test]
+    async fn web_ui_renders_a_plain_camera_unchanged() {
+        let (status, body) = render_web(state_with_cameras(vec![front_cam()]), "/web/cam-a").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("<title>aeyes - Front Cam</title>"));
+        assert!(body.contains("<span class=\"camera-info\">Front Cam</span>"));
+        assert!(body.contains("src=\"/cams/cam-a/stream\""));
+        assert!(body.contains("alt=\"Live stream from Front Cam\""));
+        assert!(body.contains("img.src = img.getAttribute('data-stream-url')"));
+        // The CSS lives inside `format!`, so its braces stay doubled in the
+        // source and must render singly.
+        assert!(body.contains("        * {\n            margin: 0;"));
+        assert!(!body.contains("{{"));
+        assert!(!body.contains("}}"));
+    }
+
+    #[tokio::test]
+    async fn web_ui_escapes_a_hostile_camera_name() {
+        let hostile = "<script>alert('pwned')</script>\" onload=\"alert(1)";
+        let camera = CameraDescriptor {
+            id: "cam-a".into(),
+            name: hostile.into(),
+            backend: "fake".into(),
+        };
+        let (status, body) = render_web(state_with_cameras(vec![camera]), "/web/cam-a").await;
+        assert_eq!(status, StatusCode::OK);
+        // No raw payload may survive anywhere in the document.
+        assert!(!body.contains("<script>alert('pwned')</script>"));
+        assert!(!body.contains("\" onload=\"alert(1)"));
+        // ...but it must still be rendered, escaped, in all three contexts.
+        assert!(body.contains("<title>aeyes - &lt;script&gt;alert(&#39;pwned&#39;)&lt;/script&gt;&quot; onload=&quot;alert(1)</title>"));
+        assert!(body.contains(
+            "<span class=\"camera-info\">&lt;script&gt;alert(&#39;pwned&#39;)&lt;/script&gt;&quot; onload=&quot;alert(1)</span>"
+        ));
+        assert!(body.contains(
+            "alt=\"Live stream from &lt;script&gt;alert(&#39;pwned&#39;)&lt;/script&gt;&quot; onload=&quot;alert(1)\""
+        ));
+    }
+
+    #[tokio::test]
+    async fn web_ui_escapes_a_hostile_camera_id() {
+        // `%27` decodes to `'`, so the id below reaches the handler as
+        // `x';alert(1);//` and used to terminate the JS string literal.
+        let hostile_id = "x';alert(1);//";
+        let camera = CameraDescriptor {
+            id: hostile_id.into(),
+            name: "Front Cam".into(),
+            backend: "fake".into(),
+        };
+        let (status, body) = render_web(
+            state_with_cameras(vec![camera]),
+            "/web/x%27%3Balert(1)%3B%2F%2F",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The payload must not appear raw anywhere...
+        assert!(!body.contains("x';alert(1);//"));
+        // ...it must not escape the src attribute either...
+        assert!(!body.contains("/cams/x';alert(1);//stream"));
+        // ...and no untrusted value is concatenated into a JS string literal.
+        assert!(!body.contains("img.src = '/cams/"));
+        assert!(body.contains("img.src = img.getAttribute('data-stream-url')"));
+        // The URL still round-trips to the same value the browser will
+        // request: `getAttribute` entity-decodes `&#39;` back to `'`.
+        assert!(body.contains("src=\"/cams/x&#39;;alert(1);///stream\""));
+        assert!(body.contains("data-stream-url=\"/cams/x&#39;;alert(1);///stream\""));
+    }
+
+    #[tokio::test]
+    async fn web_ui_does_not_let_an_id_break_out_of_the_src_attribute() {
+        let hostile_id = "\"><script>alert(1)</script>";
+        let camera = CameraDescriptor {
+            id: hostile_id.into(),
+            name: "Front Cam".into(),
+            backend: "fake".into(),
+        };
+        let (status, body) = render_web(
+            state_with_cameras(vec![camera]),
+            "/web/%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("<script>alert(1)</script>"));
+        assert!(body.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+
+    #[tokio::test]
+    async fn web_ui_returns_404_for_an_unknown_camera() {
+        let (status, body) =
+            render_web(state_with_cameras(vec![front_cam()]), "/web/does-not-exist").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("is not managed by this daemon"));
+        // No page, hence no <img> left to 404 in a reconnect loop.
+        assert!(!body.contains("<img"));
+    }
+
+    #[tokio::test]
+    async fn web_ui_returns_404_for_a_hostile_unknown_id() {
+        let (status, _) = render_web(
+            state_with_cameras(vec![front_cam()]),
+            "/web/x%27%3Balert(1)%3B%2F%2F",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn web_ui_resolves_default_to_the_selected_camera() {
+        let (status, body) =
+            render_web(state_with_cameras(vec![front_cam()]), "/web/default").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("src=\"/cams/cam-a/stream\""));
+        assert!(!body.contains("/cams/default/stream"));
+    }
 }
 
 /// Create an AVI MJPEG video from a sequence of JPEG frames
