@@ -4052,6 +4052,10 @@ mod tests {
 
     /// A 400-pixel scene lit at luma 40 with exactly one blown-out pixel, used
     /// to pin the RGB sampling rate. Returns `(buffer, index_of_blown_pixel)`.
+    ///
+    /// Gated to Linux because its only callers are: on macOS and Windows it is
+    /// an unused function, and clippy runs with `-D warnings`.
+    #[cfg(target_os = "linux")]
     fn rgb_scene_with_one_blown_pixel(at: usize) -> (Vec<u8>, usize) {
         const PIXELS: usize = 400;
         let mut bytes = vec![40u8; PIXELS * 3];
@@ -4208,6 +4212,7 @@ mod tests {
     ///
     /// Every encodable format is reachable from here, which is the point: the
     /// old dispatch could only build two of the seven.
+    #[cfg(target_os = "linux")]
     fn blown_frame(format: &pixel_format::PixelFormat, luma: u8) -> (u32, u32, Vec<u8>) {
         const W: u32 = 8;
         const H: u32 = 8;
