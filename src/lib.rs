@@ -1398,8 +1398,10 @@ pub async fn start_daemon(
     }
     let child = cmd.spawn().context("failed to spawn daemon")?;
     let pid = child.id().context("missing daemon pid")?;
-    fs::write(pid_path(), pid.to_string())?;
-    fs::write(addr_path(), bind.to_string())?;
+    // The child owns the runtime registry: it publishes its pid/addr only after
+    // `TcpListener::bind` has succeeded. Writing them here would be a guess that
+    // races the child, and a child that loses the port would leave the registry
+    // naming a dead pid instead of the daemon that won it.
     println!(
         "Daemon started with PID {pid} at http://{bind} using camera {} ({})",
         chosen.id, chosen.name
@@ -1420,19 +1422,25 @@ pub async fn stop_daemon() -> Result<()> {
 
     if let Ok(pid_str) = fs::read_to_string(pid_path()) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            #[cfg(unix)]
-            {
-                let _ = tokio::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .status()
-                    .await;
-            }
-            #[cfg(windows)]
-            {
-                let _ = tokio::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/F"])
-                    .status()
-                    .await;
+            if !daemon_process_alive(pid) {
+                // Stale or recycled pid: signalling it would hit an unrelated
+                // process. Clearing the registry below is still correct.
+                warn!(pid, "pid file names no live aeyes daemon; skipping kill");
+            } else {
+                #[cfg(unix)]
+                {
+                    let _ = tokio::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .status()
+                        .await;
+                }
+                #[cfg(windows)]
+                {
+                    let _ = tokio::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/F"])
+                        .status()
+                        .await;
+                }
             }
         }
     }
@@ -1440,6 +1448,55 @@ pub async fn stop_daemon() -> Result<()> {
     let _ = fs::remove_file(addr_path());
     println!("Daemon stopped.");
     Ok(())
+}
+
+/// Publish this process in the runtime registry.
+///
+/// Only the process that actually owns the listener may write these files, and
+/// only once `TcpListener::bind` has succeeded: writing them earlier would leave
+/// a pid/addr pair behind describing a daemon that never came up.
+///
+/// `AEYES_DAEMON` is set by `start_daemon` on the child it spawns. In-process
+/// callers must not touch the registry — notably the test suite, which binds
+/// throwaway ports and would otherwise clobber the pid/addr files of a daemon
+/// actually running on this machine.
+fn publish_runtime_registry(bind: SocketAddr) -> Result<()> {
+    if env::var_os("AEYES_DAEMON").is_none() {
+        return Ok(());
+    }
+    fs::create_dir_all(runtime_dir())?;
+    fs::write(addr_path(), bind.to_string())?;
+    fs::write(pid_path(), std::process::id().to_string())?;
+    Ok(())
+}
+
+/// Whether `pid` is still a live aeyes daemon we may safely signal.
+///
+/// The registry goes stale whenever a daemon dies, fails to bind, or loses a
+/// start-up race, and the OS recycles stale pids. Signalling a recycled pid
+/// would take down an unrelated process, so `stop_daemon` checks identity first.
+/// This deliberately errs towards "do not kill": the HTTP `/shutdown` path runs
+/// first and handles the normal case, so a missed force-kill is much cheaper than
+/// killing a bystander.
+fn daemon_process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/<pid>/cmdline is NUL-separated; the first field is the executable.
+        match fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+            Ok(cmdline) => cmdline
+                .split('\0')
+                .next()
+                .is_some_and(|exe| exe.contains("aeyes")),
+            // No /proc entry means the process is gone.
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No portable identity check; retain the previous behaviour.
+        let _ = pid;
+        true
+    }
 }
 
 pub async fn status_cmd() -> Result<()> {
@@ -1723,9 +1780,6 @@ pub async fn run_daemon(
         });
     }
 
-    fs::write(addr_path(), bind.to_string())?;
-    fs::write(pid_path(), std::process::id().to_string())?;
-
     let state = AppState {
         selected_camera: chosen.id.clone(),
         streams: Arc::new(streams),
@@ -1747,6 +1801,8 @@ pub async fn run_daemon(
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    // Only now does this process own the socket, so only now may it publish.
+    publish_runtime_registry(bind)?;
     info!("daemon listening on http://{bind}");
     axum::serve(listener, app).await?;
     Ok(())
