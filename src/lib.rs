@@ -59,6 +59,16 @@ const EXPOSURE_SAMPLE_INTERVAL: u32 = 8;
 const EXPOSURE_SETTLE_FRAMES: u32 = 6;
 #[cfg(target_os = "linux")]
 const EXPOSURE_WARMUP_FRAMES: u32 = 8;
+/// How many times in a row one absolute exposure value may be refused before
+/// the sampling state machine latches and stops proposing it.
+///
+/// Bounded on purpose: an unbounded refusal is not a retry, it is a warning
+/// every [`EXPOSURE_SAMPLE_INTERVAL`] frames for the life of the daemon.
+#[cfg(target_os = "linux")]
+const EXPOSURE_MAX_REFUSALS: u32 = 3;
+/// Frames to wait before re-proposing a value the camera refused once.
+#[cfg(target_os = "linux")]
+const EXPOSURE_RETRY_FRAMES: u32 = EXPOSURE_SAMPLE_INTERVAL;
 #[cfg(target_os = "linux")]
 const HIGHLIGHT_CLIP_LUMA: u8 = 250;
 #[cfg(target_os = "linux")]
@@ -223,15 +233,204 @@ struct FrameLumaStats {
     dark_ratio: f32,
 }
 
+/// The exposure control range a device advertises, and where it sits now.
+///
+/// Pure plumbing: four numbers the camera told us, nothing about frames. This
+/// is the half of the exposure seam a test can build by hand.
 #[cfg(target_os = "linux")]
-#[derive(Copy, Clone, Debug)]
-struct ExposureController {
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ExposureRange {
     minimum: i32,
     maximum: i32,
     step: i32,
     current: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl ExposureRange {
+    /// Build a range from raw control values, normalising the two that are not
+    /// trustworthy: a step of 0 would divide by zero in
+    /// [`quantize_exposure_value`], and a reported current outside the range
+    /// would make every proposal a no-op.
+    fn new(minimum: i32, maximum: i32, step: i32, current: i32) -> Self {
+        Self {
+            minimum,
+            maximum,
+            step: step.max(1),
+            current: current.clamp(minimum, maximum),
+        }
+    }
+
+    /// Snap a value onto this control's step grid, inside its range.
+    fn quantize(&self, value: i32) -> i32 {
+        quantize_exposure_value(self.minimum, self.maximum, self.step, value)
+    }
+
+    /// What exposure, if any, this frame argues for.
+    fn propose(&self, stats: FrameLumaStats) -> Option<i32> {
+        recommend_exposure_value(*self, stats)
+    }
+}
+
+/// An exposure value the camera would not accept, and what to do about it.
+///
+/// The retry budget is the whole point: before this existed a refused write
+/// left `current` stale, so the next sample recomputed the identical value and
+/// was refused identically, once every [`EXPOSURE_SAMPLE_INTERVAL`] frames,
+/// forever.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct RefusedExposure {
+    /// The absolute exposure value the device refused.
+    value: i32,
+    /// Consecutive refusals of *this* value. A different value resets it.
+    refusals: u32,
+    /// Frames still to wait before this value may be proposed again.
+    retry_in: u32,
+    /// Latched once `refusals` reaches [`EXPOSURE_MAX_REFUSALS`]: stop
+    /// proposing it until the frame argues for something else.
+    suppressed: bool,
+}
+
+/// When the exposure subsystem may look at a frame, and what it already tried.
+///
+/// Pure state machine: no device, no pixels. This is the half of the exposure
+/// seam a test can drive a frame at a time.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug, Default)]
+struct ExposureSampling {
     frames_until_sample: u32,
-    cooldown_frames: u32,
+    settle_frames: u32,
+    refused: Option<RefusedExposure>,
+}
+
+#[cfg(target_os = "linux")]
+impl ExposureSampling {
+    /// Count down whichever gate is active and name it.
+    ///
+    /// Returns `None` exactly when this frame is the one to sample on, and in
+    /// that case arms [`EXPOSURE_SAMPLE_INTERVAL`] so the next sampling frame
+    /// is a full interval away.
+    fn skip_reason(&mut self) -> Option<SkipReason> {
+        if self.settle_frames > 0 {
+            self.settle_frames -= 1;
+            return Some(SkipReason::Settling {
+                frames_left: self.settle_frames,
+            });
+        }
+        if let Some(refused) = self.refused.as_mut().filter(|r| r.retry_in > 0) {
+            refused.retry_in -= 1;
+            return Some(SkipReason::Backoff {
+                value: refused.value,
+                refusals: refused.refusals,
+                frames_left: refused.retry_in,
+            });
+        }
+        if self.frames_until_sample > 0 {
+            self.frames_until_sample -= 1;
+            return Some(SkipReason::Interval {
+                frames_left: self.frames_until_sample,
+            });
+        }
+        self.frames_until_sample = EXPOSURE_SAMPLE_INTERVAL;
+        None
+    }
+
+    /// The frame was sampled and needs no change: forget any refusal, because
+    /// the scene has moved on from the value the camera would not take.
+    fn record_hold(&mut self) {
+        self.refused = None;
+    }
+
+    /// The control write succeeded: the new value is real and the camera needs
+    /// [`EXPOSURE_SETTLE_FRAMES`] frames to react before the next look.
+    fn record_applied(&mut self) {
+        self.refused = None;
+        self.settle_frames = EXPOSURE_SETTLE_FRAMES;
+        self.frames_until_sample = EXPOSURE_SAMPLE_INTERVAL;
+    }
+
+    /// The control write failed. Count it against the value that was refused
+    /// and return the resulting state so the caller can log it.
+    fn record_refused(&mut self, value: i32) -> RefusedExposure {
+        let refused = self.refused.get_or_insert(RefusedExposure {
+            value,
+            refusals: 0,
+            retry_in: 0,
+            suppressed: false,
+        });
+        // A refusal is a strike against *one* value. When the frame argues for
+        // a different one the old value's strikes are history, and inheriting
+        // them would let the camera be silenced by failures it never had.
+        if refused.value != value {
+            refused.refusals = 0;
+            refused.suppressed = false;
+        }
+        refused.value = value;
+        refused.refusals += 1;
+        refused.suppressed = refused.refusals >= EXPOSURE_MAX_REFUSALS;
+        refused.retry_in = if refused.suppressed {
+            0
+        } else {
+            EXPOSURE_RETRY_FRAMES
+        };
+        *refused
+    }
+
+    /// Latched suppression for `value`, if this exact value is the one the
+    /// camera keeps refusing.
+    fn suppression_for(&self, value: i32) -> Option<SkipReason> {
+        self.refused
+            .filter(|refused| refused.suppressed && refused.value == value)
+            .map(|refused| SkipReason::Suppressed {
+                value: refused.value,
+                refusals: refused.refusals,
+            })
+    }
+}
+
+/// Why the exposure subsystem is not acting on this frame.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SkipReason {
+    /// Still inside the settle window opened by the last successful change.
+    Settling { frames_left: u32 },
+    /// Waiting out the backoff before re-proposing a refused value.
+    Backoff {
+        value: i32,
+        refusals: u32,
+        frames_left: u32,
+    },
+    /// Just the sampling interval: nothing to look at yet.
+    Interval { frames_left: u32 },
+    /// This value has been refused [`EXPOSURE_MAX_REFUSALS`] times running and
+    /// is latched; the frame still argues for it, so acting is pointless.
+    Suppressed { value: i32, refusals: u32 },
+}
+
+/// What the exposure subsystem decided about one frame.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum ExposureDecision {
+    /// A gate held this frame back; `reason` says which one.
+    Skip(SkipReason),
+    /// Sampled, and the frame needs no change.
+    Hold(FrameLumaStats),
+    /// Sampled; write `value` to `CID_EXPOSURE_ABSOLUTE`.
+    Apply { value: i32, stats: FrameLumaStats },
+}
+
+/// Exposure adaptation, as a value: a control range plus a sampling state
+/// machine.
+///
+/// Deliberately two halves that share no state with a device. [`Self::new`] and
+/// [`Self::from_control`] both build it; only the second mentions `rscam`, so
+/// every behaviour below it is reachable from a test without a camera.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug)]
+struct ExposureController {
+    range: ExposureRange,
+    sampling: ExposureSampling,
 }
 
 #[cfg(target_os = "linux")]
@@ -692,6 +891,16 @@ impl V4l2OpenCamera {
         }
     }
 
+    /// Give the camera `EXPOSURE_WARMUP_FRAMES` frames in which to reach an
+    /// exposure aeyes is happy with.
+    ///
+    /// It drives the *same* [`Self::observe_exposure_from_frame`] a normal
+    /// capture does, rather than a forced variant. Warm-up used to pass
+    /// `force = true`, which short-circuited `should_sample` before either
+    /// counter was consulted, so all eight warm-up frames were written back to
+    /// back with no settle time and the state machine was dead for exactly the
+    /// phase it exists to govern. Now the first warm-up frame samples and the
+    /// remaining seven are spent letting the camera react.
     fn warm_up_exposure(&mut self) {
         if self.exposure_controller.is_none() {
             return;
@@ -706,50 +915,82 @@ impl V4l2OpenCamera {
                 }
             };
 
-            if let Err(err) = self.observe_exposure_from_frame(&frame, true) {
+            if let Err(err) = self.observe_exposure_from_frame(&frame) {
                 info!(?err, device = %self.device_path, "failed to warm up exposure");
                 break;
             }
         }
     }
 
-    fn observe_exposure_from_frame(&mut self, frame: &[u8], force: bool) -> Result<()> {
-        let Some(controller) = self.exposure_controller.as_mut() else {
+    fn observe_exposure_from_frame(&mut self, frame: &[u8]) -> Result<()> {
+        let Some(format) = pixel_format::PixelFormat::get(&self.format) else {
             return Ok(());
         };
-        if !controller.should_sample(force) {
-            return Ok(());
-        }
+        let input = CapturedFrame {
+            format,
+            width: self.width,
+            height: self.height,
+            bytes: frame,
+        };
 
-        let stats = if self.format == *b"MJPG" {
-            analyze_mjpeg_frame(frame).with_context(|| {
-                format!("failed to decode MJPEG frame from {}", self.device_path)
-            })?
-        } else if self.format == *b"YUYV" {
-            analyze_yuyv_frame(frame)?
-        } else {
+        let Some(decision) = self.exposure_controller.as_mut().map(|c| c.plan(&input)) else {
             return Ok(());
         };
 
-        let Some(next) = self
-            .exposure_controller
-            .as_ref()
-            .and_then(|controller| controller.proposed_value(stats))
-        else {
-            return Ok(());
+        let (value, stats) = match decision? {
+            // Skips are the common case -- seven frames in eight, plus every
+            // frame of a latched suppression -- so they are deliberately not
+            // logged. `ExposureDecision::Skip` still carries its reason for
+            // callers and tests that want it.
+            ExposureDecision::Skip(_reason) => return Ok(()),
+            ExposureDecision::Hold(stats) => {
+                info!(
+                    device = %self.device_path,
+                    average_luma = stats.average_luma,
+                    p95_luma = stats.p95_luma,
+                    "held exposure; frame is within tolerance"
+                );
+                return Ok(());
+            }
+            ExposureDecision::Apply { value, stats } => (value, stats),
         };
 
-        self.camera
-            .set_control(CID_EXPOSURE_ABSOLUTE, &next)
-            .with_context(|| format!("failed to set exposure {} on {}", next, self.device_path))?;
-
-        if let Some(controller) = self.exposure_controller.as_mut() {
-            controller.record_applied(next);
+        // The outcome is recorded either way. Dropping a refusal leaves
+        // `range.current` stale, and the next sampled frame then recomputes
+        // this same value and is refused identically, once every sampling
+        // interval, forever.
+        match self.camera.set_control(CID_EXPOSURE_ABSOLUTE, &value) {
+            Ok(()) => {
+                if let Some(controller) = self.exposure_controller.as_mut() {
+                    controller.record_applied(value);
+                }
+            }
+            Err(err) => {
+                // Tolerant of a missing controller on purpose, matching the
+                // success arm above. Nothing clears `exposure_controller` while
+                // `&mut self` is held, so this arm is not reachable today — but
+                // a camera error must log, never abort the capture thread.
+                let refusal = self
+                    .exposure_controller
+                    .as_mut()
+                    .map(|controller| controller.record_refused(value));
+                if let Some(refused) = refusal {
+                    warn!(
+                        ?err,
+                        device = %self.device_path,
+                        exposure = value,
+                        refusals = refused.refusals,
+                        suppressed = refused.suppressed,
+                        "camera refused exposure value"
+                    );
+                }
+                return Ok(());
+            }
         }
 
         info!(
             device = %self.device_path,
-            exposure = next,
+            exposure = value,
             average_luma = stats.average_luma,
             p95_luma = stats.p95_luma,
             clipped_ratio = stats.clipped_ratio,
@@ -776,7 +1017,7 @@ impl OpenCamera for V4l2OpenCamera {
             .capture()
             .with_context(|| format!("failed to capture frame from {}", self.device_path))?;
 
-        if let Err(err) = self.observe_exposure_from_frame(&frame, false) {
+        if let Err(err) = self.observe_exposure_from_frame(&frame) {
             warn!(?err, device = %self.device_path, "failed to adapt exposure from captured frame");
         }
 
@@ -1157,6 +1398,9 @@ fn summarize_supported(supported: &[SupportedFormat]) -> String {
 
 #[cfg(target_os = "linux")]
 impl ExposureController {
+    /// The only construction path that touches `rscam`: turn the control a
+    /// device advertises into an exposure range. `None` means the control is
+    /// not an integer range and aeyes cannot drive it.
     fn from_control(control: RsControl) -> Option<Self> {
         match control.data {
             CtrlData::Integer {
@@ -1165,42 +1409,57 @@ impl ExposureController {
                 maximum,
                 step,
                 ..
-            } => Some(Self {
-                minimum,
-                maximum,
-                step: step.max(1),
-                current: value.clamp(minimum, maximum),
-                frames_until_sample: 0,
-                cooldown_frames: 0,
-            }),
+            } => Some(Self::new(ExposureRange::new(minimum, maximum, step, value))),
             _ => None,
         }
     }
 
-    fn should_sample(&mut self, force: bool) -> bool {
-        if force {
-            return true;
+    /// Build from a control range, with a sampling state machine sitting on its
+    /// first frame. Needs no device, which is the whole reason the range and the
+    /// state machine are separate values.
+    fn new(range: ExposureRange) -> Self {
+        Self {
+            range,
+            sampling: ExposureSampling::default(),
         }
-        if self.cooldown_frames > 0 {
-            self.cooldown_frames -= 1;
-            return false;
-        }
-        if self.frames_until_sample == 0 {
-            self.frames_until_sample = EXPOSURE_SAMPLE_INTERVAL;
-            return true;
-        }
-        self.frames_until_sample -= 1;
-        false
     }
 
-    fn proposed_value(&self, stats: FrameLumaStats) -> Option<i32> {
-        recommend_exposure_value(self.minimum, self.maximum, self.step, self.current, stats)
+    /// The one question this subsystem exists to answer: given this frame and
+    /// its format, what exposure should be applied?
+    ///
+    /// Pure over its arguments apart from advancing the sampling counters,
+    /// which is the state machine doing its job. No camera, no device, no
+    /// ambient authority: the caller gets back a decision and owes two
+    /// answers -- [`Self::record_applied`] or [`Self::record_refused`] for an
+    /// [`ExposureDecision::Apply`], and nothing at all for the other two.
+    fn plan(&mut self, frame: &CapturedFrame<'_>) -> Result<ExposureDecision> {
+        if let Some(reason) = self.sampling.skip_reason() {
+            return Ok(ExposureDecision::Skip(reason));
+        }
+
+        let stats = frame.luma_stats()?;
+        let Some(value) = self.range.propose(stats) else {
+            self.sampling.record_hold();
+            return Ok(ExposureDecision::Hold(stats));
+        };
+
+        if let Some(reason) = self.sampling.suppression_for(value) {
+            return Ok(ExposureDecision::Skip(reason));
+        }
+
+        Ok(ExposureDecision::Apply { value, stats })
     }
 
+    /// The control write for `value` succeeded.
     fn record_applied(&mut self, value: i32) {
-        self.current = value;
-        self.cooldown_frames = EXPOSURE_SETTLE_FRAMES;
-        self.frames_until_sample = EXPOSURE_SAMPLE_INTERVAL;
+        self.range.current = value;
+        self.sampling.record_applied();
+    }
+
+    /// The control write for `value` failed. Recorded against `value` rather
+    /// than dropped, which is what stops the retry loop.
+    fn record_refused(&mut self, value: i32) -> RefusedExposure {
+        self.sampling.record_refused(value)
     }
 }
 
@@ -2711,17 +2970,47 @@ mod luma_histogram {
 #[cfg(target_os = "linux")]
 const RGB_SAMPLE_STRIDE: usize = 1;
 
-/// Adapter: read Rec. 601 luma out of interleaved RGB bytes.
+/// Which way round the first and third byte of a 24-bit pixel sit.
+///
+/// Rec. 601 weights red 54 and blue 19, so the order is not cosmetic: reading
+/// a BGR frame as RGB puts the red weight on a 19-weight channel, and a
+/// saturated red scene then reads as luma 18 instead of 53 -- under the
+/// `average_luma <= 45` brighten gate on its own, which would push exposure up
+/// on a frame that is blown out.
 #[cfg(target_os = "linux")]
-fn analyze_rgb_frame(bytes: &[u8]) -> FrameLumaStats {
+#[derive(Copy, Clone, Debug)]
+enum ChannelOrder {
+    Rgb,
+    Bgr,
+}
+
+/// Kernel: Rec. 601 luma out of interleaved 24-bit bytes, in `order`.
+#[cfg(target_os = "linux")]
+fn analyze_packed24(bytes: &[u8], order: ChannelOrder) -> FrameLumaStats {
     let mut histogram = luma_histogram::LumaHistogram::new();
     for pixel in bytes.as_chunks::<3>().0.iter().step_by(RGB_SAMPLE_STRIDE) {
-        let r = u64::from(pixel[0]);
+        let (first, last) = match order {
+            ChannelOrder::Rgb => (pixel[0], pixel[2]),
+            ChannelOrder::Bgr => (pixel[2], pixel[0]),
+        };
+        let r = u64::from(first);
         let g = u64::from(pixel[1]);
-        let b = u64::from(pixel[2]);
+        let b = u64::from(last);
         histogram.record(((54 * r + 183 * g + 19 * b) >> 8) as u8);
     }
     histogram.stats()
+}
+
+/// Adapter: read Rec. 601 luma out of interleaved RGB bytes.
+#[cfg(target_os = "linux")]
+fn analyze_rgb_frame(bytes: &[u8]) -> FrameLumaStats {
+    analyze_packed24(bytes, ChannelOrder::Rgb)
+}
+
+/// Adapter: read Rec. 601 luma out of interleaved BGR bytes.
+#[cfg(target_os = "linux")]
+fn analyze_bgr_frame(bytes: &[u8]) -> FrameLumaStats {
+    analyze_packed24(bytes, ChannelOrder::Bgr)
 }
 
 /// Adapter: decode an MJPEG frame, then read luma out of the resulting RGB.
@@ -2750,15 +3039,163 @@ fn analyze_yuyv_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
     Ok(histogram.stats())
 }
 
+/// Adapter: read the luma plane out of any subsampled 4:2:0 frame.
+///
+/// YU12, YV12 and NV12 differ *only* in how the chroma is packed -- planar U
+/// then V, planar V then U, or interleaved UV. All three put a full-resolution Y
+/// plane first, so one reader covers all three and there is deliberately
+/// nothing here that could tell them apart. Chroma is skipped entirely, which
+/// is what the YUYV reader already does, so all seven formats reduce to the
+/// same shared histogram.
 #[cfg(target_os = "linux")]
-fn recommend_exposure_value(
-    minimum: i32,
-    maximum: i32,
-    step: i32,
-    current: i32,
-    stats: FrameLumaStats,
-) -> Option<i32> {
-    let step = step.max(1);
+fn analyze_420_frame(width: u32, height: u32, bytes: &[u8]) -> Result<FrameLumaStats> {
+    let luma_len = (width as usize)
+        .checked_mul(height as usize)
+        .context("4:2:0 frame resolution overflows the address space")?;
+    let luma = bytes.get(..luma_len).with_context(|| {
+        format!(
+            "4:2:0 frame is too short for {width}x{height}: {} bytes, need at least {luma_len}",
+            bytes.len()
+        )
+    })?;
+
+    let mut histogram = luma_histogram::LumaHistogram::new();
+    histogram.record_slice(luma);
+    Ok(histogram.stats())
+}
+
+/// How a frame of one capture format becomes luma statistics.
+#[cfg(target_os = "linux")]
+type LumaReader = fn(u32, u32, &[u8]) -> Result<FrameLumaStats>;
+
+#[cfg(target_os = "linux")]
+fn luma_from_mjpeg(_: u32, _: u32, bytes: &[u8]) -> Result<FrameLumaStats> {
+    analyze_mjpeg_frame(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn luma_from_yuyv(_: u32, _: u32, bytes: &[u8]) -> Result<FrameLumaStats> {
+    analyze_yuyv_frame(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn luma_from_rgb24(_: u32, _: u32, bytes: &[u8]) -> Result<FrameLumaStats> {
+    Ok(analyze_rgb_frame(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn luma_from_bgr24(_: u32, _: u32, bytes: &[u8]) -> Result<FrameLumaStats> {
+    Ok(analyze_bgr_frame(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn luma_from_420(width: u32, height: u32, bytes: &[u8]) -> Result<FrameLumaStats> {
+    analyze_420_frame(width, height, bytes)
+}
+
+/// Adapter: the capture format, and the reader that gets luma out of it.
+///
+/// This is the one place the exposure path knows a *layout*, and it is keyed
+/// off [`pixel_format::PixelFormat`] rather than comparing fourccs inline in
+/// the middle of a capture method. The old form was
+/// `if MJPG { .. } else if YUYV { .. } else { return Ok(()) }`, whose fallthrough
+/// was indistinguishable from "this frame needs no change": five of the seven
+/// encodable formats were silently excluded from exposure adaptation.
+///
+/// The rows are spelled out against the format table instead of derived from it
+/// because `PixelFormat`'s `Encoding` discriminator is private to that module.
+/// `every_encodable_format_has_a_luma_reader` is what keeps the two lists in
+/// step: adding a format upstream without a reader here fails that test rather
+/// than silently opting the format out of exposure.
+///
+/// [`pixel_format::PixelFormat::supports_exposure_sampling`] is deliberately
+/// *not* the gate. It still reports `false` for RGB3, BGR3, YU12, YV12 and
+/// NV12, which is now untrue — every one of them has a full-resolution luma
+/// plane aeyes can read. Flipping that field belongs to the `pixel_format`
+/// module; changing it here would be reaching into an upstream interface that
+/// may move under this branch.
+#[cfg(target_os = "linux")]
+const LUMA_READERS: [(pixel_format::PixelFormat, LumaReader); pixel_format::PixelFormat::COUNT] = [
+    (
+        pixel_format::PixelFormat::of(*b"MJPG"),
+        luma_from_mjpeg as LumaReader,
+    ),
+    (
+        pixel_format::PixelFormat::of(*b"YUYV"),
+        luma_from_yuyv as LumaReader,
+    ),
+    (
+        pixel_format::PixelFormat::of(*b"RGB3"),
+        luma_from_rgb24 as LumaReader,
+    ),
+    (
+        pixel_format::PixelFormat::of(*b"BGR3"),
+        luma_from_bgr24 as LumaReader,
+    ),
+    (
+        pixel_format::PixelFormat::of(*b"YU12"),
+        luma_from_420 as LumaReader,
+    ),
+    (
+        pixel_format::PixelFormat::of(*b"YV12"),
+        luma_from_420 as LumaReader,
+    ),
+    (
+        pixel_format::PixelFormat::of(*b"NV12"),
+        luma_from_420 as LumaReader,
+    ),
+];
+
+#[cfg(target_os = "linux")]
+fn luma_reader(format: &pixel_format::PixelFormat) -> Option<LumaReader> {
+    LUMA_READERS
+        .iter()
+        .find(|(spec, _)| spec == format)
+        .map(|(_, reader)| *reader)
+}
+
+/// One captured frame, plus the two things needed to read luma out of it.
+///
+/// The seam this module deepens: everything above a `CapturedFrame` deals in
+/// bytes, everything below it talks to a device.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug)]
+struct CapturedFrame<'a> {
+    format: &'static pixel_format::PixelFormat,
+    width: u32,
+    height: u32,
+    bytes: &'a [u8],
+}
+
+#[cfg(target_os = "linux")]
+impl CapturedFrame<'_> {
+    /// Read luma out of this frame, whatever the capture format.
+    ///
+    /// The reader comes from [`luma_reader`], so the caller never names a
+    /// fourcc and a format with no reader is a loud error rather than a quiet
+    /// no-op.
+    fn luma_stats(&self) -> Result<FrameLumaStats> {
+        let reader = luma_reader(self.format).with_context(|| {
+            format!(
+                "no exposure luma reader for format '{}'",
+                self.format.label()
+            )
+        })?;
+        reader(self.width, self.height, self.bytes)
+            .with_context(|| format!("failed to sample luma from a {} frame", self.format.label()))
+    }
+}
+
+/// What exposure, if any, this frame argues for.
+///
+/// Two arguments where this used to take five: the control range travels as
+/// one [`ExposureRange`] value, so the decision is expressible without a
+/// camera and without remembering which of `minimum, maximum, step, current`
+/// goes where.
+#[cfg(target_os = "linux")]
+fn recommend_exposure_value(range: ExposureRange, stats: FrameLumaStats) -> Option<i32> {
+    let step = range.step.max(1);
+    let current = range.current;
 
     let decrease_ratio = if stats.clipped_ratio >= 0.10 || stats.p95_luma >= 252 {
         0.35
@@ -2771,7 +3208,7 @@ fn recommend_exposure_value(
     };
     if decrease_ratio > 0.0 {
         let delta = ((current as f32) * decrease_ratio).round() as i32;
-        let next = quantize_exposure_value(minimum, maximum, step, current - delta.max(step));
+        let next = range.quantize(current - delta.max(step));
         return (next != current).then_some(next);
     }
 
@@ -2791,7 +3228,7 @@ fn recommend_exposure_value(
         };
     if increase_ratio > 0.0 {
         let delta = ((current as f32) * increase_ratio).round() as i32;
-        let next = quantize_exposure_value(minimum, maximum, step, current + delta.max(step));
+        let next = range.quantize(current + delta.max(step));
         return (next != current).then_some(next);
     }
 
@@ -3620,6 +4057,10 @@ mod tests {
 
     /// A 400-pixel scene lit at luma 40 with exactly one blown-out pixel, used
     /// to pin the RGB sampling rate. Returns `(buffer, index_of_blown_pixel)`.
+    ///
+    /// Gated to Linux because its only callers are: on macOS and Windows it is
+    /// an unused function, and clippy runs with `-D warnings`.
+    #[cfg(target_os = "linux")]
     fn rgb_scene_with_one_blown_pixel(at: usize) -> (Vec<u8>, usize) {
         const PIXELS: usize = 400;
         let mut bytes = vec![40u8; PIXELS * 3];
@@ -3726,10 +4167,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_recommend_exposure_value_reduces_blown_highlights() {
         let next = recommend_exposure_value(
-            2,
-            40000,
-            1,
-            400,
+            ExposureRange::new(2, 40000, 1, 400),
             FrameLumaStats {
                 average_luma: 170.0,
                 p95_luma: 252,
@@ -3745,10 +4183,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_recommend_exposure_value_increases_dark_scene() {
         let next = recommend_exposure_value(
-            2,
-            40000,
-            1,
-            100,
+            ExposureRange::new(2, 40000, 1, 100),
             FrameLumaStats {
                 average_luma: 16.0,
                 p95_luma: 80,
@@ -3764,10 +4199,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_recommend_exposure_value_keeps_balanced_frame() {
         let next = recommend_exposure_value(
-            2,
-            40000,
-            1,
-            120,
+            ExposureRange::new(2, 40000, 1, 120),
             FrameLumaStats {
                 average_luma: 88.0,
                 p95_luma: 210,
@@ -3776,6 +4208,455 @@ mod tests {
             },
         );
         assert!(next.is_none());
+    }
+
+    // -- Exposure adaptation: dispatch across every encodable format ----------
+
+    /// A frame of `format` whose luma plane is entirely `luma`, plus the
+    /// resolution to declare it at.
+    ///
+    /// Every encodable format is reachable from here, which is the point: the
+    /// old dispatch could only build two of the seven.
+    #[cfg(target_os = "linux")]
+    fn blown_frame(format: &pixel_format::PixelFormat, luma: u8) -> (u32, u32, Vec<u8>) {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        match format.label() {
+            "MJPG" => {
+                let rgb = vec![luma; (W * H * 3) as usize];
+                (
+                    W,
+                    H,
+                    encode_rgb_to_jpeg(W, H, rgb).expect("encode test JPEG"),
+                )
+            }
+            "YUYV" => {
+                let mut bytes = Vec::with_capacity((W * H * 2) as usize);
+                for _ in 0..(W * H) {
+                    bytes.extend([luma, 128]);
+                }
+                (W, H, bytes)
+            }
+            "RGB3" | "BGR3" => (W, H, vec![luma; (W * H * 3) as usize]),
+            // YU12, YV12 and NV12 all put a full-resolution Y plane first; the
+            // chroma half is filled with the neutral 128 and never read.
+            "YU12" | "YV12" | "NV12" => {
+                let mut bytes = vec![luma; (W * H) as usize];
+                bytes.extend(std::iter::repeat_n(128u8, (W * H / 2) as usize));
+                (W, H, bytes)
+            }
+            other => panic!("no blown_frame builder for format {other}"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_every_encodable_format_has_a_luma_reader() {
+        // The property that used to be a silent `else { return Ok(()) }`: a
+        // format in the table with no reader here was not a build error, it was
+        // a camera that quietly got no exposure adaptation. A new row upstream
+        // now fails this test instead.
+        for spec in &pixel_format::PixelFormat::ALL {
+            assert!(
+                luma_reader(spec).is_some(),
+                "no luma reader for encodable format {}",
+                spec.label()
+            );
+        }
+        assert_eq!(
+            LUMA_READERS.len(),
+            pixel_format::PixelFormat::COUNT,
+            "one reader row per encodable format"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_every_encodable_format_yields_luma_stats() {
+        // All seven, including the five the old `if MJPG / else if YUYV / else`
+        // chain returned `Ok(())` for. RGB3, BGR3, YU12, YV12 and NV12 were
+        // added by PR #29 and had never been sampled.
+        for spec in &pixel_format::PixelFormat::ALL {
+            let (width, height, bytes) = blown_frame(spec, 255);
+            let stats = CapturedFrame {
+                format: spec,
+                width,
+                height,
+                bytes: &bytes,
+            }
+            .luma_stats()
+            .unwrap_or_else(|err| panic!("{} produced no luma stats: {err:#}", spec.label()));
+            assert!(
+                stats.clipped_ratio > 0.9,
+                "{} should read a fully clipped frame, got {:?}",
+                spec.label(),
+                stats.clipped_ratio
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_exposure_adapts_on_a_format_the_old_dispatch_skipped() {
+        // NV12 end to end through the controller: a clipped frame must produce
+        // an exposure decision. Before the dispatch went through the format
+        // table this returned `Ok(())` without ever reading luma.
+        let spec = pixel_format::PixelFormat::get(b"NV12").expect("NV12 is encodable");
+        let (width, height, bytes) = blown_frame(spec, 255);
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+
+        let decision = controller
+            .plan(&CapturedFrame {
+                format: spec,
+                width,
+                height,
+                bytes: &bytes,
+            })
+            .expect("plan a blown NV12 frame");
+
+        match decision {
+            ExposureDecision::Apply { value, .. } => assert!(value < 400, "expected a cut"),
+            other => panic!("expected an exposure change for NV12, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_all_three_420_layouts_read_the_same_luma_plane() {
+        // YU12, YV12 and NV12 are the same luma in three chroma packings. One
+        // reader, one set of stats -- the `luma_histogram` module's promise,
+        // extended to the formats the old dispatch never reached.
+        let greys = [0u8, 20, 40, 60, 128, 200, 240, 255];
+        let (width, height) = (8u32, 8u32);
+        let y_plane: Vec<u8> = greys.iter().copied().cycle().take(64).collect();
+        let chroma = vec![128u8; 32];
+
+        let planar_uv: Vec<u8> = y_plane
+            .iter()
+            .chain(&chroma)
+            .chain(&chroma)
+            .copied()
+            .collect();
+        let planar_vu: Vec<u8> = y_plane
+            .iter()
+            .chain(&chroma)
+            .chain(&chroma)
+            .copied()
+            .collect();
+        let interleaved: Vec<u8> = y_plane
+            .iter()
+            .chain(std::iter::repeat_n(&128u8, 32))
+            .copied()
+            .collect();
+
+        let stats = |bytes: &[u8]| analyze_420_frame(width, height, bytes).unwrap();
+        assert_eq!(stats(&planar_uv), stats(&planar_vu));
+        assert_eq!(stats(&planar_uv), stats(&interleaved));
+        assert_eq!(
+            stats(&planar_uv).average_luma,
+            greys.iter().map(|v| *v as f32).sum::<f32>() / greys.len() as f32
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_bgr_reader_swaps_the_rec601_red_and_blue_weights() {
+        // One saturated red frame, held as BGR bytes. Rec. 601 weights red 54
+        // and blue 19, so the channel order decides whether it reads as bright
+        // (53) or dark (18) -- and 18 is under the `average_luma <= 45` brighten
+        // gate on its own, for a scene that is blown out. Reading BGR frames
+        // with the RGB order would push exposure *up* on them.
+        let red_in_bgr = [0u8, 0, 255];
+        let luma_of = |stats: FrameLumaStats| u8::try_from(stats.average_luma as i32).unwrap();
+
+        assert_eq!(luma_of(analyze_bgr_frame(&red_in_bgr)), 53);
+        assert_eq!(luma_of(analyze_rgb_frame(&red_in_bgr)), 18);
+
+        // Rec. 601 leaves a neutral grey untouched, so the order cannot matter
+        // there -- only the chroma-weighted ends can go wrong.
+        assert_eq!(
+            analyze_rgb_frame(&[200, 200, 200]),
+            analyze_bgr_frame(&[200, 200, 200])
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_analyze_420_frame_rejects_a_short_buffer() {
+        let err = analyze_420_frame(8, 8, &[128u8; 16])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too short for 8x8"), "got {err}");
+    }
+
+    // -- Exposure adaptation: the sampling state machine ---------------------
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_exposure_controller_is_constructible_without_a_camera() {
+        // The property the old `ExposureController` lacked entirely: its only
+        // constructor was `from_control(RsControl)`, so `should_sample`,
+        // `record_applied` and the proposal logic were unreachable from a test.
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+        let spec = pixel_format::PixelFormat::get(b"YUYV").expect("YUYV is encodable");
+        let (width, height, bytes) = blown_frame(spec, 255);
+
+        let decision = controller
+            .plan(&CapturedFrame {
+                format: spec,
+                width,
+                height,
+                bytes: &bytes,
+            })
+            .expect("plan over bytes alone");
+
+        assert!(matches!(decision, ExposureDecision::Apply { .. }));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_warm_up_frames_respect_the_settle_window() {
+        // Defect: `should_sample(force)` returned true before either counter was
+        // consulted, and `warm_up_exposure` forced all eight warm-up frames, so
+        // every one of them wrote to the camera back to back and the two-counter
+        // state machine was dead for the only phase it was written for. Warm-up
+        // now drives the ordinary path: one change, then settle.
+        let spec = pixel_format::PixelFormat::get(b"YUYV").expect("YUYV is encodable");
+        let (width, height, bytes) = blown_frame(spec, 255);
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+
+        let mut applied = 0u32;
+        let mut skipped = 0u32;
+        let mut settling = 0u32;
+
+        for _ in 0..EXPOSURE_WARMUP_FRAMES {
+            let decision = controller
+                .plan(&CapturedFrame {
+                    format: spec,
+                    width,
+                    height,
+                    bytes: &bytes,
+                })
+                .expect("plan a warm-up frame");
+            match decision {
+                ExposureDecision::Apply { value, .. } => {
+                    applied += 1;
+                    controller.record_applied(value);
+                }
+                ExposureDecision::Skip(SkipReason::Settling { .. }) => {
+                    skipped += 1;
+                    settling += 1;
+                }
+                ExposureDecision::Skip(_) => skipped += 1,
+                ExposureDecision::Hold(_) => {}
+            }
+        }
+
+        assert_eq!(applied, 1, "warm-up must not force one write per frame");
+        assert_eq!(
+            settling, EXPOSURE_SETTLE_FRAMES,
+            "the rest are settle frames"
+        );
+        assert_eq!(applied + skipped, EXPOSURE_WARMUP_FRAMES);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_a_successful_change_opens_the_settle_window() {
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+        controller.record_applied(300);
+
+        for _ in 0..EXPOSURE_SETTLE_FRAMES {
+            assert!(
+                matches!(
+                    controller.sampling.skip_reason(),
+                    Some(SkipReason::Settling { .. })
+                ),
+                "a frame inside the settle window must not be sampled"
+            );
+        }
+        assert!(
+            matches!(
+                controller.sampling.skip_reason(),
+                Some(SkipReason::Interval { .. })
+            ),
+            "settling ends before the sampling interval does"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_a_refused_value_is_not_retried_forever() {
+        // Defect: `set_control(...)?` ran *before* `record_applied(next)`, so a
+        // control error left `current` stale, the next sampled frame recomputed
+        // the identical value, and the camera refused it identically -- once
+        // every EXPOSURE_SAMPLE_INTERVAL frames, for the life of the daemon.
+        // Here the camera refuses everything and we count the writes.
+        let spec = pixel_format::PixelFormat::get(b"YUYV").expect("YUYV is encodable");
+        let (width, height, bytes) = blown_frame(spec, 255);
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+
+        let mut attempted = Vec::new();
+        for _ in 0..400 {
+            let decision = controller
+                .plan(&CapturedFrame {
+                    format: spec,
+                    width,
+                    height,
+                    bytes: &bytes,
+                })
+                .expect("plan a blown frame");
+            if let ExposureDecision::Apply { value, .. } = decision {
+                attempted.push(value);
+                // The camera refuses. Before this change the outcome was
+                // dropped on the floor by the `?` on set_control.
+                controller.record_refused(value);
+            }
+        }
+
+        assert_eq!(
+            attempted.len(),
+            EXPOSURE_MAX_REFUSALS as usize,
+            "writes must stop at the refusal budget, not continue every interval"
+        );
+        assert!(
+            attempted.windows(2).all(|pair| pair[0] == pair[1]),
+            "each retry should have recomputed the same stale value: {attempted:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_the_backoff_gates_the_frames_after_a_refusal() {
+        // The backoff branch is consulted ahead of the interval branch, so the
+        // frames between a refusal and the next proposal are `Backoff`, not
+        // `Interval`. That ordering is what stops a refused value being
+        // re-proposed on the very next sample.
+        let spec = pixel_format::PixelFormat::get(b"YUYV").expect("YUYV is encodable");
+        let (width, height, bytes) = blown_frame(spec, 255);
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+        let frame = CapturedFrame {
+            format: spec,
+            width,
+            height,
+            bytes: &bytes,
+        };
+
+        // Frame 0 samples and applies; the camera refuses.
+        let ExposureDecision::Apply { value, .. } = controller.plan(&frame).unwrap() else {
+            panic!("the first frame should be sampled");
+        };
+        controller.record_refused(value);
+
+        let mut backoff = 0u32;
+        for _ in 0..EXPOSURE_RETRY_FRAMES {
+            match controller.plan(&frame).unwrap() {
+                ExposureDecision::Skip(SkipReason::Backoff { .. }) => backoff += 1,
+                other => panic!("expected a backoff frame, got {other:?}"),
+            }
+        }
+        assert_eq!(backoff, EXPOSURE_RETRY_FRAMES);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_a_refused_value_is_latched_suppressed() {
+        // Driven end to end through `plan`, because the value a seeded refusal
+        // would need to name is the value the planner actually computes.
+        let spec = pixel_format::PixelFormat::get(b"YUYV").expect("YUYV is encodable");
+        let (width, height, bytes) = blown_frame(spec, 255);
+        let frame = CapturedFrame {
+            format: spec,
+            width,
+            height,
+            bytes: &bytes,
+        };
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+
+        let mut writes = 0u32;
+        let mut latched_on_write = None;
+        let mut suppressed_frames = 0u32;
+
+        // 600 frames is far past the point where the old code would have been
+        // writing every EXPOSURE_SAMPLE_INTERVAL frames for the life of the
+        // daemon. The write *count* is the assertion that matters: asserting on
+        // the `suppressed` flag alone would pass even with the loop running,
+        // because `record_refused` keeps raising `refusals` while latched.
+        for _ in 0..600 {
+            match controller.plan(&frame).expect("plan a blown frame") {
+                ExposureDecision::Apply { value, .. } => {
+                    writes += 1;
+                    let refused = controller.record_refused(value);
+                    if refused.suppressed && latched_on_write.is_none() {
+                        latched_on_write = Some(writes);
+                    }
+                }
+                ExposureDecision::Skip(SkipReason::Suppressed { .. }) => suppressed_frames += 1,
+                ExposureDecision::Skip(_) | ExposureDecision::Hold(_) => {}
+            }
+        }
+
+        assert_eq!(
+            latched_on_write,
+            Some(EXPOSURE_MAX_REFUSALS),
+            "the latch must fall on the last budgeted refusal, not before"
+        );
+        assert_eq!(
+            writes, EXPOSURE_MAX_REFUSALS,
+            "a latched value must never be written again for the same frame"
+        );
+        assert!(
+            suppressed_frames > 0,
+            "the latch must actually be reached during the run"
+        );
+        assert!(
+            controller
+                .sampling
+                .refused
+                .expect("a refusal was recorded")
+                .suppressed
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_refusing_a_different_value_resets_the_budget() {
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+        controller.record_refused(280);
+        controller.record_refused(280);
+        assert!(!controller.sampling.refused.expect("recorded").suppressed);
+
+        // The scene moved; a different value deserves a fresh budget rather
+        // than inheriting the old value's strikes.
+        let refused = controller.record_refused(120);
+        assert_eq!(refused.value, 120);
+        assert_eq!(refused.refusals, 1);
+        assert!(!refused.suppressed);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_a_held_frame_clears_a_stale_refusal() {
+        let mut controller = ExposureController::new(ExposureRange::new(2, 40000, 1, 400));
+        controller.record_refused(280);
+        assert!(controller.sampling.refused.is_some());
+
+        controller.sampling.record_hold();
+        assert!(
+            controller.sampling.refused.is_none(),
+            "a frame back in tolerance means the refused value is history"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_exposure_range_normalises_an_untrustworthy_step_and_current() {
+        // A step of 0 divides by zero in `quantize_exposure_value`, and a
+        // reported current outside the range would make every proposal a no-op.
+        let range = ExposureRange::new(2, 40000, 0, 999_999);
+        assert_eq!(range.step, 1);
+        assert_eq!(range.current, 40000);
+        assert_eq!(range.quantize(40050), 40000);
     }
 
     #[test]
