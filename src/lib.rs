@@ -2594,53 +2594,145 @@ pub fn encode_rgb_to_jpeg(width: u32, height: u32, bytes: Vec<u8>) -> Result<Vec
     Ok(out)
 }
 
+/// Frame luma statistics, accumulated from samples of any pixel format.
+///
+/// The interface is deliberately narrower than what it hides. A caller hands it
+/// one 8-bit luma sample at a time and gets back a [`FrameLumaStats`]; the
+/// 256-bin histogram, the highlight/shadow classification, the percentile walk
+/// and the zero-sample guard all live behind that. Adding a pixel format
+/// therefore means answering a single question -- *what is the luma of the next
+/// sample?* -- rather than re-deriving the statistics that consume it.
+///
+/// [`HIGHLIGHT_CLIP_LUMA`] and [`SHADOW_LUMA_THRESHOLD`] were already shared
+/// constants before this module existed, but the algorithm reading them was
+/// duplicated per format, so changing a threshold meant finding every call
+/// site. Here the thresholds are read in exactly one place.
 #[cfg(target_os = "linux")]
-fn analyze_rgb_frame(bytes: &[u8]) -> FrameLumaStats {
-    let mut histogram = [0u32; 256];
-    let mut samples = 0u64;
-    let mut total_luma = 0u64;
-    let mut clipped = 0u64;
-    let mut dark = 0u64;
+mod luma_histogram {
+    use super::{FrameLumaStats, HIGHLIGHT_CLIP_LUMA, SHADOW_LUMA_THRESHOLD};
 
-    for pixel in bytes.as_chunks::<3>().0.iter().step_by(4) {
-        let r = pixel[0] as u64;
-        let g = pixel[1] as u64;
-        let b = pixel[2] as u64;
-        let luma = ((54 * r + 183 * g + 19 * b) >> 8) as u8;
-        histogram[luma as usize] += 1;
-        samples += 1;
-        total_luma += luma as u64;
-        if luma >= HIGHLIGHT_CLIP_LUMA {
-            clipped += 1;
-        }
-        if luma <= SHADOW_LUMA_THRESHOLD {
-            dark += 1;
-        }
+    /// Fraction of samples that must fall at or below [`LumaHistogram::stats`]'s
+    /// `p95_luma`.
+    const P95_FRACTION: f32 = 0.95;
+
+    /// Accumulator over luma samples on the 0..=255 luma scale.
+    ///
+    /// Deliberately format-agnostic: it knows how to count and summarise luma,
+    /// nothing about how pixels are laid out in a buffer.
+    pub(super) struct LumaHistogram {
+        bins: [u32; 256],
+        samples: u64,
+        total_luma: u64,
+        clipped: u64,
+        dark: u64,
     }
 
-    if samples == 0 {
-        return FrameLumaStats::default();
-    }
-
-    let target = ((samples as f32) * 0.95).ceil() as u64;
-    let mut cumulative = 0u64;
-    let mut p95_luma = 0u8;
-    for (index, count) in histogram.iter().enumerate() {
-        cumulative += *count as u64;
-        if cumulative >= target {
-            p95_luma = index as u8;
-            break;
+    // `Default` is spelled out rather than derived: `[u32; 256]` is past the
+    // length at which the standard library provides a `Default` impl.
+    impl Default for LumaHistogram {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
-    FrameLumaStats {
-        average_luma: total_luma as f32 / samples as f32,
-        p95_luma,
-        clipped_ratio: clipped as f32 / samples as f32,
-        dark_ratio: dark as f32 / samples as f32,
+    impl LumaHistogram {
+        pub(super) fn new() -> Self {
+            Self {
+                bins: [0u32; 256],
+                samples: 0,
+                total_luma: 0,
+                clipped: 0,
+                dark: 0,
+            }
+        }
+
+        /// Record one luma sample.
+        pub(super) fn record(&mut self, luma: u8) {
+            self.bins[usize::from(luma)] += 1;
+            self.samples += 1;
+            self.total_luma += u64::from(luma);
+            if luma >= HIGHLIGHT_CLIP_LUMA {
+                self.clipped += 1;
+            }
+            if luma <= SHADOW_LUMA_THRESHOLD {
+                self.dark += 1;
+            }
+        }
+
+        /// Record a contiguous run of luma samples, in order.
+        ///
+        /// This is the entry point for formats whose luma plane is already a
+        /// flat slice of bytes.
+        pub(super) fn record_slice(&mut self, luma: &[u8]) {
+            for sample in luma {
+                self.record(*sample);
+            }
+        }
+
+        /// Summarise everything recorded so far.
+        ///
+        /// An empty histogram yields the default all-zero stats rather than a
+        /// `NaN` average, which keeps callers free of a separate guard.
+        pub(super) fn stats(&self) -> FrameLumaStats {
+            if self.samples == 0 {
+                return FrameLumaStats::default();
+            }
+
+            let target = ((self.samples as f32) * P95_FRACTION).ceil() as u64;
+            let mut cumulative = 0u64;
+            let mut p95_luma = 0u8;
+            for (index, count) in self.bins.iter().enumerate() {
+                cumulative += u64::from(*count);
+                if cumulative >= target {
+                    p95_luma = index as u8;
+                    break;
+                }
+            }
+
+            let samples = self.samples as f32;
+            FrameLumaStats {
+                average_luma: self.total_luma as f32 / samples,
+                p95_luma,
+                clipped_ratio: self.clipped as f32 / samples,
+                dark_ratio: self.dark as f32 / samples,
+            }
+        }
     }
 }
 
+/// How many RGB pixels to advance between luma samples.
+///
+/// This used to be an inline `.step_by(4)` with no comment, which quietly
+/// sampled one pixel in four. That is not a free optimisation: a ratio taken
+/// over a strided subsample is right only on average, so a single blown-out
+/// pixel either vanishes (three positions in four) or is reported at four times
+/// its true weight (one position in four). `recommend_exposure_value` cuts
+/// exposure by 35% at a `clipped_ratio` of 0.008, so that 4x overstatement
+/// clears the gate on its own -- the decision ends up a function of the blown
+/// pixel's index mod 4. The stride also made the RGB and YUYV paths disagree
+/// about what the shared thresholds mean, since YUYV samples every Y byte.
+///
+/// Full-frame sampling costs about 15ms against 1.5ms at 1080p. That is
+/// acceptable here because this path runs only after a full JPEG decode and
+/// only every `EXPOSURE_SAMPLE_INTERVAL` frames. Keep the value named so the
+/// reasoning travels with the number.
+#[cfg(target_os = "linux")]
+const RGB_SAMPLE_STRIDE: usize = 1;
+
+/// Adapter: read Rec. 601 luma out of interleaved RGB bytes.
+#[cfg(target_os = "linux")]
+fn analyze_rgb_frame(bytes: &[u8]) -> FrameLumaStats {
+    let mut histogram = luma_histogram::LumaHistogram::new();
+    for pixel in bytes.as_chunks::<3>().0.iter().step_by(RGB_SAMPLE_STRIDE) {
+        let r = u64::from(pixel[0]);
+        let g = u64::from(pixel[1]);
+        let b = u64::from(pixel[2]);
+        histogram.record(((54 * r + 183 * g + 19 * b) >> 8) as u8);
+    }
+    histogram.stats()
+}
+
+/// Adapter: decode an MJPEG frame, then read luma out of the resulting RGB.
 #[cfg(target_os = "linux")]
 fn analyze_mjpeg_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
     let rgb = load_from_memory(bytes)
@@ -2649,53 +2741,21 @@ fn analyze_mjpeg_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
     Ok(analyze_rgb_frame(rgb.as_raw()))
 }
 
+/// Adapter: read the luma plane out of packed YUYV macro-pixels.
 #[cfg(target_os = "linux")]
 fn analyze_yuyv_frame(bytes: &[u8]) -> Result<FrameLumaStats> {
     if !bytes.len().is_multiple_of(2) {
         bail!("invalid YUYV buffer length: {}", bytes.len());
     }
 
-    let mut histogram = [0u32; 256];
-    let mut samples = 0u64;
-    let mut total_luma = 0u64;
-    let mut clipped = 0u64;
-    let mut dark = 0u64;
-
+    // YUYV packs two luma samples per four-byte macro-pixel as Y0 Cb Y1 Cr.
+    // Only the even bytes are luma; Cb and Cr are chroma and are skipped, so
+    // every Y in the frame is recorded exactly once.
+    let mut histogram = luma_histogram::LumaHistogram::new();
     for chunk in bytes.as_chunks::<4>().0 {
-        for y in [chunk[0], chunk[2]] {
-            histogram[y as usize] += 1;
-            samples += 1;
-            total_luma += y as u64;
-            if y >= HIGHLIGHT_CLIP_LUMA {
-                clipped += 1;
-            }
-            if y <= SHADOW_LUMA_THRESHOLD {
-                dark += 1;
-            }
-        }
+        histogram.record_slice(&[chunk[0], chunk[2]]);
     }
-
-    if samples == 0 {
-        return Ok(FrameLumaStats::default());
-    }
-
-    let target = ((samples as f32) * 0.95).ceil() as u64;
-    let mut cumulative = 0u64;
-    let mut p95_luma = 0u8;
-    for (index, count) in histogram.iter().enumerate() {
-        cumulative += *count as u64;
-        if cumulative >= target {
-            p95_luma = index as u8;
-            break;
-        }
-    }
-
-    Ok(FrameLumaStats {
-        average_luma: total_luma as f32 / samples as f32,
-        p95_luma,
-        clipped_ratio: clipped as f32 / samples as f32,
-        dark_ratio: dark as f32 / samples as f32,
-    })
+    Ok(histogram.stats())
 }
 
 #[cfg(target_os = "linux")]
@@ -3107,6 +3167,110 @@ mod tests {
         ]);
         assert!(stats.clipped_ratio > 0.45);
         assert!(stats.p95_luma >= 250);
+    }
+
+    /// A 400-pixel scene lit at luma 40 with exactly one blown-out pixel, used
+    /// to pin the RGB sampling rate. Returns `(buffer, index_of_blown_pixel)`.
+    fn rgb_scene_with_one_blown_pixel(at: usize) -> (Vec<u8>, usize) {
+        const PIXELS: usize = 400;
+        let mut bytes = vec![40u8; PIXELS * 3];
+        bytes[at * 3..at * 3 + 3].fill(255);
+        (bytes, PIXELS)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_analyze_rgb_frame_sees_a_pixel_the_old_stride_skipped() {
+        // Regression guard for the `.step_by(4)` that used to sit inline at the
+        // sampling loop. One blown-out pixel in 400, at index 123.
+        //
+        // The old 8-pixel test could not catch this: striding and not striding
+        // both yielded clipped_ratio 0.5 for its input. Here they disagree --
+        // sampling 1-in-4 skipped index 123 entirely (123 % 4 != 0) and reported
+        // a clipped_ratio of 0.0, while sampling every pixel reports the true
+        // 1/400. `analyze_rgb_frame` is called with the module's stride, so this
+        // assertion fails outright if the stride is ever dialled back up.
+        let (bytes, pixels) = rgb_scene_with_one_blown_pixel(123);
+        let stats = analyze_rgb_frame(&bytes);
+        assert_eq!(stats.clipped_ratio, 1.0 / pixels as f32);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_analyze_rgb_frame_does_not_overweight_a_strided_pixel() {
+        // The other direction, which the test above cannot reach: the same
+        // single blown-out pixel at index 100, i.e. a position the old stride
+        // *did* visit. Subsampling reported 1/100 = 0.01 -- four times the truth
+        // -- which clears the 0.008 gate in `recommend_exposure_value` and cuts
+        // exposure 35% on a scene a full-frame measurement would leave alone.
+        let (bytes, pixels) = rgb_scene_with_one_blown_pixel(100);
+        let stats = analyze_rgb_frame(&bytes);
+        assert_eq!(stats.clipped_ratio, 1.0 / pixels as f32);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_rgb_and_yuyv_analyses_agree_on_shared_luma() {
+        // The point of the `luma_histogram` module: two pixel formats, one set
+        // of statistics. Rec. 601 leaves a neutral grey untouched
+        // ((54 + 183 + 19) * v) >> 8 == v, so the same scene expressed as RGB
+        // and as YUYV must reduce to the same luma samples and therefore the
+        // same stats. The duplicated algorithm could not promise this.
+        let greys = [0u8, 20, 40, 60, 128, 200, 240, 255];
+
+        let mut rgb = Vec::new();
+        for &v in &greys {
+            rgb.extend([v, v, v]);
+        }
+
+        // YUYV is Y0 Cb Y1 Cr per macro-pixel. Chroma is never recorded, so 128
+        // is used and only the two even bytes contribute.
+        let mut yuyv = Vec::new();
+        for pair in greys.chunks(2) {
+            yuyv.extend([pair[0], 128, pair[1], 128]);
+        }
+
+        assert_eq!(analyze_rgb_frame(&rgb), analyze_yuyv_frame(&yuyv).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_analyze_yuyv_frame_rejects_odd_length() {
+        let err = analyze_yuyv_frame(&[80, 90, 81]).unwrap_err().to_string();
+        assert!(err.contains("invalid YUYV buffer length"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_luma_histogram_empty_yields_default_stats() {
+        let histogram = luma_histogram::LumaHistogram::new();
+        assert_eq!(histogram.stats(), FrameLumaStats::default());
+        assert_eq!(histogram.stats().average_luma, 0.0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_luma_histogram_classifies_against_shared_thresholds() {
+        // Pins the thresholds where they are now consumed: exactly once, inside
+        // the module. `HIGHLIGHT_CLIP_LUMA` is 250 and `SHADOW_LUMA_THRESHOLD`
+        // is 40, and both boundaries are inclusive.
+        let mut histogram = luma_histogram::LumaHistogram::new();
+        histogram.record_slice(&[
+            0,                     // dark, luma 0
+            SHADOW_LUMA_THRESHOLD, // dark, at the boundary
+            128,                   // neither
+            HIGHLIGHT_CLIP_LUMA,   // clipped, at the boundary
+            255,                   // clipped
+        ]);
+
+        let stats = histogram.stats();
+        assert_eq!(stats.clipped_ratio, 2.0 / 5.0);
+        assert_eq!(stats.dark_ratio, 2.0 / 5.0);
+        assert_eq!(
+            stats.average_luma,
+            (0.0 + 40.0 + 128.0 + 250.0 + 255.0) / 5.0
+        );
+        assert_eq!(stats.p95_luma, 255);
     }
 
     #[test]
