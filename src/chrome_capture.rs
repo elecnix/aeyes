@@ -1,17 +1,35 @@
-//! Chrome DevTools Protocol screenshot capture.
+//! Chrome DevTools Protocol transport and endpoint discovery.
 //!
-//! Supports multiple discovery methods:
+//! This module owns the request/response half of CDP. Endpoint discovery
+//! tries, in order:
 //! 1. DevToolsActivePort file (standard Chrome approach)
 //! 2. Direct port probing with /json/version fallback
 //! 3. Common debugging ports (9222, 9223, 9224)
+//!
+//! Connection *lifetime* is deliberately not owned here: the daemon keeps one
+//! persistent session open and drives [`cdp_request`] over that socket, so
+//! Chrome's "Allow debugging" permission is held across requests.
 
-use anyhow::{Context, Result};
-use base64::Engine;
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::time::Duration;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket};
 
 /// Common Chrome debugging ports to try.
 const COMMON_PORTS: &[u16] = &[9222, 9223, 9224];
+
+/// How long a single CDP handshake may block before it is treated as failed.
+///
+/// Chrome never stalls mid-handshake, so a slow answer means the endpoint is
+/// wedged. Without this bound a stalled connect would park the caller forever
+/// and, because the daemon creates its session under a lock, wedge every later
+/// Chrome request behind it.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The socket a CDP session runs over: plain TCP for a `ws://` endpoint.
+pub type CdpSocket = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
 
 /// Try to get WebSocket URL from DevToolsActivePort file.
 /// Returns None if file doesn't exist or is invalid.
@@ -44,6 +62,8 @@ fn try_port_json_version(port: u16) -> Option<String> {
 
 /// Get Chrome's DevTools WebSocket URL.
 /// Tries DevToolsActivePort first, then common ports.
+///
+/// This blocks: call it from a blocking task, not a tokio worker.
 pub fn get_browser_ws_url() -> Result<String> {
     // Method 1: Try DevToolsActivePort file first
     if let Some(ws_url) = try_devtools_active_port() {
@@ -82,110 +102,82 @@ pub fn get_browser_ws_url() -> Result<String> {
     );
 }
 
-/// Send a CDP command and receive the response.
-pub fn cdp_send_raw(
-    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
-    method: &str,
-    params: Value,
-) -> Result<Value> {
-    use tungstenite::Message;
-
-    let msg = json!({
-        "id": 1,
-        "method": method,
-        "params": params
-    });
-
-    ws.send(Message::Text(msg.to_string().into()))?;
-
-    loop {
-        let response = ws.read()?;
-        let text = response.to_text()?;
-        let value: Value = serde_json::from_str(text)?;
-
-        if value.get("id") == Some(&json!(1)) {
-            return Ok(value);
-        }
+/// Bound how long the next read may block.
+///
+/// Only a plain TCP stream is re-timed; a TLS stream is left as-is rather than
+/// silently mistimed. Failures are advisory: an endpoint that ignores the
+/// timeout still works, it just blocks.
+pub fn set_read_timeout(ws: &CdpSocket, timeout: Option<Duration>) {
+    if let MaybeTlsStream::Plain(stream) = ws.get_ref() {
+        let _ = stream.set_read_timeout(timeout);
     }
 }
 
-/// Capture a JPEG screenshot from the first available Chrome tab.
+/// Send one CDP command and read until the response with the same `id` comes
+/// back, discarding the unsolicited events Chrome interleaves.
 ///
-/// Chrome must be running with remote debugging enabled.
+/// `session_id` scopes the command to an attached target; `None` sends it as a
+/// browser-level command. Returns the whole decoded message so callers can
+/// read either `result` or `error` via [`cdp_result`].
 ///
-/// # Example
-/// ```no_run
-/// let jpeg = aeyes::chrome_capture::capture_screenshot(85).unwrap();
-/// std::fs::write("screenshot.jpg", jpeg).unwrap();
-/// ```
-pub fn capture_screenshot(quality: u32) -> Result<Vec<u8>> {
-    use tungstenite::connect;
-    use tungstenite::Message;
+/// Every failure here is a *transport* failure (send, read, decode). A command
+/// Chrome understood and refused arrives as `Ok` and becomes an `Err` only at
+/// [`cdp_result`], which is what lets a caller tell "the session is broken"
+/// apart from "Chrome said no".
+pub fn cdp_request(
+    ws: &mut CdpSocket,
+    id: u64,
+    method: &str,
+    params: Value,
+    session_id: Option<&str>,
+) -> Result<Value> {
+    let mut msg = json!({ "id": id, "method": method, "params": params });
+    if let Some(session_id) = session_id {
+        msg["sessionId"] = json!(session_id);
+    }
 
-    let ws_url = get_browser_ws_url()?;
-    let (mut ws, _) = connect(&ws_url).context("failed to connect to Chrome DevTools")?;
-
-    // Get list of targets
-    let response = cdp_send_raw(&mut ws, "Target.getTargets", json!({}))?;
-    let targets = response["result"]["targetInfos"]
-        .as_array()
-        .context("no targets in response")?;
-
-    // Find first page target
-    let page = targets
-        .iter()
-        .find(|t| t["type"] == "page")
-        .context("no Chrome page found")?;
-
-    let target_id = page["targetId"].as_str().context("targetId not a string")?;
-
-    // Attach to target
-    let attach_response = cdp_send_raw(
-        &mut ws,
-        "Target.attachToTarget",
-        json!({
-            "targetId": target_id,
-            "flatten": true
-        }),
-    )?;
-
-    let session_id = attach_response["result"]["sessionId"]
-        .as_str()
-        .context("sessionId not found")?;
-
-    // Send screenshot command
-    let msg = json!({
-        "id": 2,
-        "method": "Page.captureScreenshot",
-        "sessionId": session_id,
-        "params": {
-            "format": "jpeg",
-            "quality": quality,
-            "fromSurface": true
-        }
-    });
-
-    ws.send(Message::Text(msg.to_string().into()))?;
+    ws.send(Message::Text(msg.to_string().into()))
+        .with_context(|| format!("cdp send: {method}"))?;
 
     loop {
-        let response = ws.read()?;
-        let text = response.to_text()?;
-        let value: Value = serde_json::from_str(text)?;
+        let text = ws
+            .read()
+            .with_context(|| format!("cdp read: {method}"))?
+            .into_text()
+            .with_context(|| format!("cdp text: {method}"))?;
+        let value: Value =
+            serde_json::from_str(&text).with_context(|| format!("cdp decode: {method}"))?;
 
-        if value.get("id") == Some(&json!(2)) {
-            if let Some(err) = value.get("error") {
-                anyhow::bail!("CDP error: {}", err);
-            }
-
-            let data = value["result"]["data"]
-                .as_str()
-                .context("no screenshot data in response")?;
-
-            return base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .context("failed to decode base64 screenshot");
+        if value.get("id").and_then(Value::as_u64) == Some(id) {
+            return Ok(value);
         }
+        // Anything else is an event we did not ask for - keep reading.
     }
+}
+
+/// Unwrap a CDP response into its `result`, turning a protocol-level `error`
+/// object into an `Err`.
+pub fn cdp_result(message: Value) -> Result<Value> {
+    if let Some(err) = message.get("error") {
+        bail!("CDP error: {err}");
+    }
+
+    message
+        .get("result")
+        .cloned()
+        .context("CDP response carried no result")
+}
+
+/// Pick the first `page` target out of a `Target.getTargets` result.
+pub fn first_page_target(result: &Value) -> Result<String> {
+    result["targetInfos"]
+        .as_array()
+        .context("no targets in response")?
+        .iter()
+        .find(|target| target["type"] == "page")
+        .and_then(|target| target["targetId"].as_str())
+        .map(str::to_string)
+        .context("no Chrome page found")
 }
 
 /// Information about a Chrome debug target.
@@ -197,27 +189,113 @@ pub struct TargetInfo {
     pub target_type: String,
 }
 
-/// List available Chrome debug targets (pages, extensions, etc).
-pub fn list_targets() -> Result<Vec<TargetInfo>> {
-    use tungstenite::connect;
-
-    let ws_url = get_browser_ws_url()?;
-    let (mut ws, _) = connect(&ws_url).context("failed to connect to Chrome DevTools")?;
-
-    let response = cdp_send_raw(&mut ws, "Target.getTargets", json!({}))?;
-    let targets = response["result"]["targetInfos"]
-        .as_array()
-        .context("no targets in response")?;
-
-    Ok(targets
-        .iter()
-        .filter_map(|t| {
-            Some(TargetInfo {
-                target_id: t["targetId"].as_str()?.to_string(),
-                title: t["title"].as_str().unwrap_or("").to_string(),
-                url: t["url"].as_str().unwrap_or("").to_string(),
-                target_type: t["type"].as_str().unwrap_or("").to_string(),
-            })
+impl TargetInfo {
+    /// Describe one entry of a `Target.getTargets` result, or `None` if it has
+    /// no target id.
+    pub fn from_value(target: &Value) -> Option<Self> {
+        Some(Self {
+            target_id: target["targetId"].as_str()?.to_string(),
+            title: target["title"].as_str().unwrap_or_default().to_string(),
+            url: target["url"].as_str().unwrap_or_default().to_string(),
+            target_type: target["type"].as_str().unwrap_or_default().to_string(),
         })
-        .collect())
+    }
+
+    /// Map a `Target.getTargets` result into target descriptions.
+    pub fn list_from_result(result: &Value) -> Vec<Self> {
+        result["targetInfos"]
+            .as_array()
+            .map(|targets| targets.iter().filter_map(Self::from_value).collect())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn targets_result(json: Value) -> Value {
+        json!({ "targetInfos": json })
+    }
+
+    #[test]
+    fn cdp_result_unwraps_a_successful_response() {
+        let message = json!({ "id": 3, "result": { "data": "abc" } });
+        assert_eq!(cdp_result(message).unwrap()["data"], json!("abc"));
+    }
+
+    #[test]
+    fn cdp_result_turns_a_protocol_error_into_err() {
+        let message = json!({ "id": 3, "error": { "code": -32000, "message": "nope" } });
+        let err = cdp_result(message).unwrap_err().to_string();
+        assert!(err.contains("CDP error"), "unexpected error: {err}");
+        assert!(err.contains("nope"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn cdp_result_rejects_a_response_without_a_result() {
+        let message = json!({ "id": 3 });
+        assert!(cdp_result(message).is_err());
+    }
+
+    #[test]
+    fn first_page_target_picks_the_first_page() {
+        let result = targets_result(json!([
+            { "type": "service_worker", "targetId": "sw" },
+            { "type": "page", "targetId": "page-a", "title": "A" },
+            { "type": "page", "targetId": "page-b" },
+        ]));
+
+        assert_eq!(first_page_target(&result).unwrap(), "page-a");
+    }
+
+    #[test]
+    fn first_page_target_reports_a_browser_with_no_pages() {
+        let result = targets_result(json!([{ "type": "service_worker", "targetId": "sw" }]));
+        let err = first_page_target(&result).unwrap_err().to_string();
+        assert!(err.contains("no Chrome page found"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn list_from_result_maps_targets_and_skips_malformed_ones() {
+        let result = targets_result(json!([
+            { "type": "page", "targetId": "page-a", "title": "A", "url": "https://a" },
+            { "type": "page", "title": "no id" },
+        ]));
+
+        let listed = TargetInfo::list_from_result(&result);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].target_id, "page-a");
+        assert_eq!(listed[0].title, "A");
+        assert_eq!(listed[0].url, "https://a");
+        assert_eq!(listed[0].target_type, "page");
+    }
+
+    #[test]
+    fn list_from_result_defaults_absent_fields() {
+        let result = targets_result(json!([{ "type": "page", "targetId": "page-a" }]));
+        let listed = TargetInfo::list_from_result(&result);
+        assert_eq!(listed[0].title, "");
+        assert_eq!(listed[0].url, "");
+    }
+
+    #[test]
+    fn list_from_result_tolerates_a_missing_target_list() {
+        assert!(TargetInfo::list_from_result(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn list_from_result_preserves_the_json_shape_the_cli_reads() {
+        let result = targets_result(json!([{
+            "type": "page", "targetId": "abcdef0123", "title": "T", "url": "u"
+        }]));
+
+        let serialized = serde_json::to_value(TargetInfo::list_from_result(&result)[0].clone())
+            .expect("TargetInfo serializes");
+
+        assert_eq!(serialized["target_id"], json!("abcdef0123"));
+        assert_eq!(serialized["title"], json!("T"));
+        assert_eq!(serialized["url"], json!("u"));
+        assert_eq!(serialized["target_type"], json!("page"));
+    }
 }

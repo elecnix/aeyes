@@ -312,6 +312,7 @@ pub struct AppState {
 }
 
 /// Persistent Chrome CDP session with a background WebSocket handler.
+/// Persistent Chrome CDP session with a background WebSocket handler.
 /// The WebSocket stays connected in a background thread so Chrome's
 /// "Allow debugging" permission persists across requests.
 #[derive(Clone)]
@@ -323,76 +324,89 @@ impl Default for OptionChromeSession {
     }
 }
 
+impl OptionChromeSession {
+    /// Forget the cached session. The background thread sees its command
+    /// channel close and exits on its own.
+    async fn clear(&self) {
+        *self.0.lock().await = None;
+    }
+
+    /// Return the cached session, running `make` to build one if there is none.
+    ///
+    /// `make` runs with the lock held, so two concurrent callers cannot both
+    /// connect and attach to the same target: the loser waits and then finds
+    /// the winner's session in the cache. It must not call back into this
+    /// cache, or it deadlocks against itself.
+    async fn get_or_insert_with<F, Fut>(&self, make: F) -> Result<ChromeSession>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<ChromeSession>>,
+    {
+        let mut cached = self.0.lock().await;
+
+        if let Some(session) = cached.as_ref() {
+            info!("Chrome: reusing cached CDP session");
+            return Ok(session.clone());
+        }
+
+        info!("Chrome: creating new persistent CDP session");
+        let session = make().await?;
+        *cached = Some(session.clone());
+
+        Ok(session)
+    }
+}
+
 #[derive(Clone)]
 pub struct ChromeSession {
     /// Channel to send CDP commands to the background thread
     cmd_tx: std::sync::mpsc::Sender<CdpCommand>,
+    /// CDP session the background thread is attached to.
+    session_id: String,
 }
 
 struct CdpCommand {
     method: String,
     params: serde_json::Value,
+    /// `None` sends a browser-level command, `Some` scopes it to this session.
+    session_id: Option<String>,
     respond_to: std::sync::mpsc::Sender<Result<serde_json::Value>>,
 }
 
 /// Spawn a persistent CDP connection - ONE connection for everything.
 fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
-    use tungstenite::{connect, Message};
+    use tungstenite::connect;
 
     // Connect to Chrome ONCE
     let (mut ws, _) = connect(&ws_url).map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
-    // Get targets using the SAME connection
-    let targets_msg = json!({"id": 1, "method": "Target.getTargets", "params": {}});
-    ws.send(Message::Text(targets_msg.to_string().into()))
-        .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+    // The handshake is the one step a wedged Chrome could park this thread on
+    // forever, and callers build it under a lock - so bound it here and let go
+    // again once the thread owns the socket.
+    chrome_capture::set_read_timeout(&ws, Some(chrome_capture::HANDSHAKE_TIMEOUT));
 
-    let target_id = loop {
-        let msg = ws.read().map_err(|e| anyhow::anyhow!("read: {e}"))?;
-        if let Ok(text) = msg.to_text() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                if value.get("id") == Some(&json!(1)) {
-                    let targets = value["result"]["targetInfos"]
-                        .as_array()
-                        .context("no targets")?;
-                    let page = targets
-                        .iter()
-                        .find(|t| t["type"] == "page")
-                        .context("no Chrome page found")?;
-                    break page["targetId"]
-                        .as_str()
-                        .context("no targetId")?
-                        .to_string();
-                }
-            }
-        }
-    };
+    // Get targets using the SAME connection
+    let targets = chrome_capture::cdp_request(&mut ws, 1, "Target.getTargets", json!({}), None)?;
+    let target_id = chrome_capture::first_page_target(&targets)?;
 
     // Attach using the SAME connection
-    let attach_msg = json!({
-        "id": 2,
-        "method": "Target.attachToTarget",
-        "params": { "targetId": &target_id, "flatten": true }
-    });
-    ws.send(Message::Text(attach_msg.to_string().into()))
-        .map_err(|e| anyhow::anyhow!("attach: {e}"))?;
+    let attached = chrome_capture::cdp_request(
+        &mut ws,
+        2,
+        "Target.attachToTarget",
+        json!({
+            "targetId": target_id,
+            "flatten": true
+        }),
+        None,
+    )?;
+    let session_id = chrome_capture::cdp_result(attached)?["sessionId"]
+        .as_str()
+        .context("no sessionId")?
+        .to_string();
 
-    let session_id = loop {
-        let msg = ws.read().map_err(|e| anyhow::anyhow!("read: {e}"))?;
-        if let Ok(text) = msg.to_text() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                if value.get("id") == Some(&json!(2)) {
-                    if let Some(err) = value.get("error") {
-                        anyhow::bail!("attach: {err}");
-                    }
-                    break value["result"]["sessionId"]
-                        .as_str()
-                        .context("no sessionId")?
-                        .to_string();
-                }
-            }
-        }
-    };
+    // Steady state has no deadline: Chrome may stay silent indefinitely.
+    chrome_capture::set_read_timeout(&ws, None);
 
     info!("Chrome: ONE connection for targets+attach+commands, session {session_id}");
 
@@ -406,45 +420,38 @@ fn spawn_persistent_chrome_session(ws_url: String) -> Result<ChromeSession> {
         while let Ok(cmd) = cmd_rx.recv() {
             let cmd_id = next_id;
             next_id += 1;
-            let cmd_msg = json!({
-                "id": cmd_id,
-                "sessionId": session_id.as_str(),
-                "method": cmd.method,
-                "params": cmd.params
-            });
 
-            if let Err(e) = ws.send(Message::Text(cmd_msg.to_string().into())) {
-                let _ = cmd.respond_to.send(Err(anyhow::anyhow!("send: {e}")));
-                break;
-            }
-
-            // Read until we get our response (skip events)
-            let result = loop {
-                match ws.read() {
-                    Ok(msg) => {
-                        if let Ok(text) = msg.to_text() {
-                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-                                if value.get("id") == Some(&json!(cmd_id)) {
-                                    if let Some(err) = value.get("error") {
-                                        break Err(anyhow::anyhow!("CDP error: {err}"));
-                                    }
-                                    break Ok(value["result"].clone());
-                                }
-                                // Skip events
-                            }
-                        }
-                    }
-                    Err(e) => break Err(anyhow::anyhow!("read: {e}")),
+            let stop = match chrome_capture::cdp_request(
+                &mut ws,
+                cmd_id,
+                &cmd.method,
+                cmd.params,
+                cmd.session_id.as_deref(),
+            ) {
+                // Chrome understood the command: a refusal is the caller's
+                // problem, the connection is still good.
+                Ok(message) => {
+                    let response = chrome_capture::cdp_result(message);
+                    let refused = response.is_err();
+                    let _ = cmd.respond_to.send(response);
+                    refused
+                }
+                // The socket itself failed - there is nothing left to talk to.
+                Err(e) => {
+                    let _ = cmd.respond_to.send(Err(e));
+                    true
                 }
             };
 
-            let _ = cmd.respond_to.send(result);
+            if stop {
+                break;
+            }
         }
 
         info!("Chrome: persistent CDP session ended");
     });
 
-    Ok(ChromeSession { cmd_tx })
+    Ok(ChromeSession { cmd_tx, session_id })
 }
 
 impl ChromeSession {
@@ -454,12 +461,36 @@ impl ChromeSession {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.dispatch(method, params, Some(self.session_id.clone()))
+            .await
+    }
+
+    /// Execute a browser-level CDP command over the same connection.
+    ///
+    /// Used for domains such as `Target` that are answered by the browser
+    /// rather than by the attached target, so the command must not carry a
+    /// `sessionId`.
+    pub async fn execute_browser(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.dispatch(method, params, None).await
+    }
+
+    async fn dispatch(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        session_id: Option<String>,
+    ) -> Result<serde_json::Value> {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
 
         self.cmd_tx
             .send(CdpCommand {
                 method: method.to_string(),
                 params,
+                session_id,
                 respond_to,
             })
             .map_err(|_| anyhow::anyhow!("chrome session thread not running"))?;
@@ -2266,40 +2297,47 @@ pub fn create_avi_mjpeg(frames: &[Vec<u8>], fps: u32) -> Result<Vec<u8>> {
 
 /// Get or create a Chrome CDP session - connects ONCE.
 async fn get_or_create_chrome_session(state: &AppState) -> Result<ChromeSession> {
-    // Check if we have a valid cached session
-    {
-        let session_guard = state.chrome_session.0.lock().await;
-        if let Some(ref session) = *session_guard {
-            info!("Chrome: reusing cached CDP session");
-            return Ok(session.clone());
-        }
-    }
-
-    // Create new session - single connection for everything
-    info!("Chrome: creating new persistent CDP session");
-    let ws_url = chrome_capture::get_browser_ws_url()?;
-
-    // spawn_persistent_chrome_session connects ONCE, gets targets, attaches, keeps connection
-    let session = spawn_persistent_chrome_session(ws_url)?;
-
-    // Cache the session
-    *state.chrome_session.0.lock().await = Some(session.clone());
-
-    Ok(session)
+    state
+        .chrome_session
+        .get_or_insert_with(|| async {
+            // Both discovery and the handshake block on file reads, HTTP and
+            // socket reads, so neither belongs on a tokio worker thread.
+            tokio::task::spawn_blocking(|| {
+                let ws_url = chrome_capture::get_browser_ws_url()?;
+                spawn_persistent_chrome_session(ws_url)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("chrome session task: {e}"))?
+        })
+        .await
 }
 
 /// GET /chrome/tabs - List Chrome tabs
 async fn chrome_tabs_handler(State(state): State<AppState>) -> impl IntoResponse {
     *state.last_activity.write().await = Instant::now();
 
-    match chrome_capture::list_targets() {
+    // The cached session already holds the debugging permission this endpoint
+    // exists to keep, so listing tabs rides the same connection instead of
+    // opening a second WebSocket Chrome would have to prompt for again.
+    let listed = match get_or_create_chrome_session(&state).await {
+        Ok(session) => {
+            session
+                .execute_browser("Target.getTargets", json!({}))
+                .await
+        }
+        Err(e) => Err(e),
+    };
+
+    match listed {
         Ok(targets) => {
-            let tabs: Vec<_> = targets
+            let tabs: Vec<_> = chrome_capture::TargetInfo::list_from_result(&targets)
                 .into_iter()
                 .filter(|t| t.target_type == "page")
                 .collect();
             Json(serde_json::json!({ "tabs": tabs })).into_response()
         }
+        // Deliberately does not clear the session: a refusal from the Target
+        // domain says nothing about the connection the screenshots ride on.
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -2350,7 +2388,7 @@ async fn chrome_screenshot_handler(
                 }
                 Err(e) => {
                     // Clear session on error
-                    *state.chrome_session.0.lock().await = None;
+                    state.chrome_session.clear().await;
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(serde_json::json!({ "error": e.to_string() })),
