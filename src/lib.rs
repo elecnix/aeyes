@@ -3171,6 +3171,11 @@ mod tests {
 
     /// A 400-pixel scene lit at luma 40 with exactly one blown-out pixel, used
     /// to pin the RGB sampling rate. Returns `(buffer, index_of_blown_pixel)`.
+    ///
+    /// Gated to match `analyze_rgb_frame` and the two tests below, all of which
+    /// are Linux-only. Without the gate this helper compiles on macOS and
+    /// Windows as dead code, and `clippy -D warnings` fails there.
+    #[cfg(target_os = "linux")]
     fn rgb_scene_with_one_blown_pixel(at: usize) -> (Vec<u8>, usize) {
         const PIXELS: usize = 400;
         let mut bytes = vec![40u8; PIXELS * 3];
