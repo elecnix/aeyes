@@ -1606,6 +1606,9 @@ async fn http_get_bytes(addr: SocketAddr, path: &str) -> Result<Vec<u8>> {
         .send()
         .await
         .with_context(|| format!("failed to GET {path}"))?;
+    // The status is captured before the body because `bytes()` consumes the
+    // response: the status must be read off the response first, then the body
+    // is read unconditionally so that an error payload is available to decode.
     let status = resp.status();
     let body = resp
         .bytes()
