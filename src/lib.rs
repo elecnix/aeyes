@@ -1419,7 +1419,10 @@ pub async fn stop_daemon() -> Result<()> {
     let target = match registered {
         Some(addr) if daemon_responding(addr).await => Some(addr),
         _ => match fallback_probe_addr() {
-            Some(addr) if daemon_responding(addr).await => {
+            // Identity, not mere reachability: this branch is about to send
+            // `/shutdown` at whatever answers and then report success, so a bare
+            // connect would aim that at any unrelated service holding the port.
+            Some(addr) if aeyes_responding(addr).await => {
                 unregistered = true;
                 Some(addr)
             }
@@ -1436,12 +1439,14 @@ pub async fn stop_daemon() -> Result<()> {
             sleep(Duration::from_millis(100)).await;
         }
         if unregistered {
-            // There is no registry entry for this daemon, so there is no pid we
-            // can attribute to it; signalling anything here would be a guess.
-            let _ = fs::remove_file(pid_path());
-            let _ = fs::remove_file(addr_path());
+            // We proved this is an aeyes daemon and stopped it, but no registry
+            // entry names its pid, so nothing here can be attributed to a
+            // process — including any pid/addr pair the files happen to hold,
+            // which may name a *different* live daemon. Leave them alone: a
+            // later `stop` re-classifies that pid and clears the files only when
+            // there is genuinely nothing left to lose.
             println!(
-                "Daemon stopped at http://{addr} (found by probing the bind address; it had no runtime registry entry, so it was not started by `aeyes start`)."
+                "Daemon stopped at http://{addr} (found by probing the bind address; it had no runtime registry entry, so it was not started by `aeyes start`). The runtime registry was left as it was, since no pid could be attributed to the daemon that was stopped."
             );
             return Ok(());
         }
@@ -1490,17 +1495,23 @@ pub async fn stop_daemon() -> Result<()> {
             }
         }
     }
+    if let Some(pid) = refused {
+        // Refusal keeps the registry. The pid file is the only handle this
+        // process has on a daemon it just declined to signal, and clearing it
+        // here would leave that daemon running with nothing left to stop it —
+        // the next `stop` would find no registry at all and fall back to
+        // probing the bind address.
+        println!(
+            "Did NOT stop PID {pid}: it is alive but is running a different executable, so signalling it could kill an unrelated process. The runtime registry has been left in place; stop that process yourself if it really is an aeyes daemon."
+        );
+        return Ok(());
+    }
+    // Either we signalled the pid, or `PidVerdict::Absent` proved nothing is
+    // running there. Both satisfy the command's contract: no daemon of ours is
+    // left serving, and the registry names nothing live any more.
     let _ = fs::remove_file(pid_path());
     let _ = fs::remove_file(addr_path());
-    match refused {
-        Some(pid) => println!(
-            "Did NOT stop PID {pid}: it is alive but is running a different executable, so signalling it could kill an unrelated process. The stale runtime registry has been cleared; stop that process yourself if it really is an aeyes daemon."
-        ),
-        // Either we signalled the pid, or `PidVerdict::Absent` proved nothing is
-        // running there. Both satisfy the command's contract: no daemon of ours
-        // is left serving.
-        None => println!("Daemon stopped."),
-    }
+    println!("Daemon stopped.");
     Ok(())
 }
 
@@ -1566,9 +1577,14 @@ enum PidVerdict {
 /// * Linux — a real identity check. `/proc/<pid>/exe` must resolve to the very
 ///   executable we are running, so a shell running `aeyes stop`, an editor with
 ///   the checkout open, or a build under a directory that merely contains
-///   "aeyes" all resolve elsewhere and are rejected as `Foreign`. An
-///   unreadable `/proc/<pid>/exe` — no such process, or one owned by another
-///   user — reads as `Absent`, i.e. fail-closed.
+///   "aeyes" all resolve elsewhere and are rejected as `Foreign`. The two paths
+///   are compared canonically rather than byte-for-byte (`same_executable`),
+///   because `read_link` returns a kernel-resolved path while `current_exe` is
+///   derived from `/proc/self/exe` and the two spellings diverge as soon as a
+///   symlinked directory sits between them — which would turn the real daemon
+///   into the very `Foreign` verdict this check exists to avoid. An unreadable
+///   `/proc/<pid>/exe` — no such process, or one owned by another user — reads
+///   as `Absent`, i.e. fail-closed.
 /// * Other unix — `kill -0` proves a process exists but says nothing about which
 ///   executable it is, so the answer is `Alive`: identity is not checkable
 ///   without adding a dependency, and liveness is the best available proxy.
@@ -1589,9 +1605,13 @@ fn classify_daemon_pid(pid: u32) -> PidVerdict {
         let Ok(theirs) = fs::read_link(format!("/proc/{pid}/exe")) else {
             return PidVerdict::Absent;
         };
-        match env::current_exe() {
-            Ok(ours) if ours == theirs => PidVerdict::Ours,
-            _ => PidVerdict::Foreign,
+        let Ok(ours) = env::current_exe() else {
+            return PidVerdict::Foreign;
+        };
+        if same_executable(&ours, &theirs) {
+            PidVerdict::Ours
+        } else {
+            PidVerdict::Foreign
         }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -1611,6 +1631,40 @@ fn classify_daemon_pid(pid: u32) -> PidVerdict {
     {
         let _ = pid;
         PidVerdict::Alive
+    }
+}
+
+/// Do `ours` and `theirs` name the same executable file?
+///
+/// Identity belongs to the file, not to the spelling of its path.
+/// `/proc/<pid>/exe` is already kernel-resolved while `env::current_exe()` is
+/// derived from `/proc/self/exe`; the two agree byte-for-byte on a plain path but
+/// not once a symlinked directory is involved (a `cargo install` prefix reached
+/// through a symlink, a version-manager shim, a bind-mounted home). Comparing
+/// them literally then reports the real daemon as `Foreign`, and the refusal
+/// that follows leaves a live aeyes daemon unstoppable.
+///
+/// So compare device+inode when the kernel will tell us — that is exact and
+/// immune to path spelling — then fall back to canonical paths for the cases
+/// where `stat` is unavailable, and only then to a literal comparison.
+///
+/// Linux-only: this exists solely for the `/proc/<pid>/exe` check in
+/// `classify_daemon_pid`, and gating it keeps the other targets free of the
+/// dead code that `--all-features` clippy flags there.
+#[cfg(target_os = "linux")]
+fn same_executable(ours: &Path, theirs: &Path) -> bool {
+    if ours == theirs {
+        return true;
+    }
+    use std::os::unix::fs::MetadataExt;
+    if let (Ok(a), Ok(b)) = (fs::metadata(ours), fs::metadata(theirs)) {
+        if a.dev() == b.dev() && a.ino() == b.ino() {
+            return true;
+        }
+    }
+    match (fs::canonicalize(ours), fs::canonicalize(theirs)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -1647,9 +1701,11 @@ pub async fn status_cmd() -> Result<()> {
     // No registry, or the registered address is dead. A daemon started outside
     // `aeyes start` never publishes the registry, so probe the address it would
     // have bound before reporting that nothing is running — "not running" for a
-    // port that is listening is a false negative the user cannot act on.
+    // port that is listening is a false negative the user cannot act on. The
+    // probe asks for identity, not merely reachability, because the sentence it
+    // prints ("Daemon running at …") is a claim about aeyes specifically.
     if let Some(addr) = fallback_probe_addr() {
-        if daemon_responding(addr).await {
+        if aeyes_responding(addr).await {
             println!(
                 "Daemon running at http://{addr} (not in the runtime registry — it was not started by `aeyes start`)"
             );
@@ -1660,8 +1716,70 @@ pub async fn status_cmd() -> Result<()> {
     Ok(())
 }
 
+/// Can we open a TCP connection to `addr`?
+///
+/// This is a *reachability* check and nothing more: it does not establish that
+/// the peer speaks HTTP, let alone that it is aeyes. That is enough for the
+/// address this process published in the registry — it wrote the file itself
+/// after its own successful bind — and for the polling loops around
+/// `ensure_daemon_running`. Anywhere a decision is made *about* the peer rather
+/// than about our own daemon, use [`aeyes_responding`].
 async fn daemon_responding(addr: SocketAddr) -> bool {
     TcpStream::connect(addr).await.is_ok()
+}
+
+/// The exact body `health_handler` returns for a live aeyes daemon.
+const AEYES_HEALTH_BODY: &[u8] = b"ok";
+
+/// Budget for each request of the identity probe.
+///
+/// A bystander on the probe port may accept the connection and then never say
+/// anything, so the probe has to be bounded — `http_get_bytes` reads until EOF
+/// and would otherwise hang `stop` forever on a socket that is not a daemon.
+const IDENTITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Does the OpenAPI document served at `/` identify an aeyes daemon?
+///
+/// Split out from [`aeyes_responding`] so the decision is testable without a
+/// socket: what matters is the parsed `info.title`, not the byte layout, so
+/// whitespace and key order cannot make a real daemon look like an impostor.
+fn openapi_identifies_aeyes(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|doc| {
+            doc.get("info")
+                .and_then(|info| info.get("title"))
+                .and_then(|title| title.as_str())
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("aeyes")
+}
+
+/// Whether the peer listening on `addr` is a running aeyes daemon.
+///
+/// [`daemon_responding`] only proves that *something* accepts TCP there, which
+/// is enough for the registered address — this process wrote that file itself
+/// after its own successful bind — and nowhere near enough for the fallback
+/// probe. `stop_daemon` acts destructively on whatever the fallback finds: it
+/// sends `/shutdown` and reports success. A bare connect there would aim that at
+/// any unrelated service holding the port, so the fallback must first establish
+/// that the peer speaks HTTP *and* is aeyes.
+///
+/// Two requests, because either alone is weak: `/health` returning `ok` is
+/// suggestive but not distinctive, and `/` returns this daemon's OpenAPI
+/// document, whose `info.title` is `aeyes`. Anything that is not us fails one or
+/// both — a non-HTTP listener fails to parse, a different HTTP server 404s, and
+/// a lookalike health endpoint fails the title check.
+async fn aeyes_responding(addr: SocketAddr) -> bool {
+    match tokio::time::timeout(IDENTITY_PROBE_TIMEOUT, http_get_bytes(addr, "/health")).await {
+        Ok(Ok(body)) if body.as_slice() == AEYES_HEALTH_BODY => {}
+        _ => return false,
+    }
+    match tokio::time::timeout(IDENTITY_PROBE_TIMEOUT, http_get_bytes(addr, "/")).await {
+        Ok(Ok(body)) => openapi_identifies_aeyes(&body),
+        _ => false,
+    }
 }
 
 /// Ensure daemon is running, auto-starting if needed. Returns daemon address.
@@ -4302,5 +4420,217 @@ mod tests {
         let summary = summarize_supported(&supported);
         assert!(summary.contains("YUYV"));
         assert!(summary.contains("320x320"));
+    }
+
+    // ---- identity probe (`aeyes_responding`) and executable identity ----
+
+    /// The OpenAPI document this daemon serves at `/`.
+    fn aeyes_openapi_doc() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "openapi": "3.0.3",
+            "info": { "title": "aeyes", "version": "0.1.0" }
+        }))
+        .expect("serialize openapi")
+    }
+
+    /// Serve `handler(path) -> Option<body>` on an ephemeral loopback port.
+    ///
+    /// The identity probe exists to tell three peers apart — one that is not
+    /// HTTP at all, one that is HTTP but not aeyes, and aeyes — which cannot be
+    /// checked without a real socket.
+    fn serve_http<F>(handler: F) -> SocketAddr
+    where
+        F: Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let read = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let response = match handler(&path) {
+                    Some(body) => {
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(&body);
+                        r
+                    }
+                    None => {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    }
+                };
+                let _ = std::io::Write::write_all(&mut stream, &response);
+                let _ = std::io::Write::flush(&mut stream);
+            }
+        });
+        addr
+    }
+
+    /// The identity probe must accept a peer that really is an aeyes daemon —
+    /// otherwise `stop` would never reach the unregistered daemons it exists for.
+    #[tokio::test]
+    async fn identity_probe_accepts_a_peer_that_answers_as_aeyes() {
+        let addr = serve_http(|path| match path {
+            "/health" => Some(b"ok".to_vec()),
+            "/" => Some(aeyes_openapi_doc()),
+            _ => None,
+        });
+
+        assert!(
+            aeyes_responding(addr).await,
+            "a peer serving this daemon's own routes was not recognised as aeyes"
+        );
+    }
+
+    /// A different HTTP service that happens to answer `/health` with `ok` must
+    /// not be mistaken for a daemon — it would then be handed a `/shutdown`.
+    #[tokio::test]
+    async fn identity_probe_rejects_an_http_peer_that_is_not_aeyes() {
+        let addr = serve_http(|path| match path {
+            "/health" => Some(b"ok".to_vec()),
+            // Right route, wrong document.
+            "/" => Some(br#"{"openapi":"3.0.3","info":{"title":"somethingelse"}}"#.to_vec()),
+            _ => None,
+        });
+
+        assert!(
+            !aeyes_responding(addr).await,
+            "a foreign HTTP server answering /health with 'ok' was accepted as aeyes"
+        );
+    }
+
+    /// Most of what actually listens on a developer's port 43210 is not an aeyes
+    /// daemon and has no `/health` at all.
+    #[tokio::test]
+    async fn identity_probe_rejects_an_http_peer_without_health() {
+        let addr = serve_http(|_| None);
+
+        assert!(
+            !aeyes_responding(addr).await,
+            "a peer with no /health route was accepted as aeyes"
+        );
+    }
+
+    /// A socket that accepts the connection and then says nothing must not hang
+    /// `stop` forever: the probe is bounded, so it gives up rather than blocking
+    /// the command.
+    #[tokio::test]
+    async fn identity_probe_gives_up_on_a_peer_that_never_answers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            // Hold the connections open without ever writing a response.
+            for stream in listener.incoming() {
+                std::thread::spawn(move || {
+                    if let Ok(mut s) = stream {
+                        let mut sink = Vec::new();
+                        let _ = std::io::Read::read_to_end(&mut s, &mut sink);
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                    }
+                });
+            }
+        });
+
+        assert!(
+            !aeyes_responding(addr).await,
+            "the identity probe waited on a silent peer instead of giving up"
+        );
+    }
+
+    /// The OpenAPI check must key on the parsed title, not on a byte pattern, so
+    /// key order and pretty-printing cannot reject the real daemon.
+    #[test]
+    fn openapi_identity_keys_on_the_title_not_the_bytes() {
+        assert!(openapi_identifies_aeyes(&aeyes_openapi_doc()));
+        assert!(openapi_identifies_aeyes(
+            br#"{ "info" : { "title" : "aeyes" } }"#.as_slice()
+        ));
+
+        assert!(!openapi_identifies_aeyes(b"not json at all"));
+        assert!(!openapi_identifies_aeyes(b""));
+        assert!(!openapi_identifies_aeyes(
+            br#"{"info":{"title":"aeyes-ctl"}}"#
+        ));
+        assert!(!openapi_identifies_aeyes(
+            br#"{"info":{"version":"1.0.1"}}"#
+        ));
+        // The title has to be the title, not merely present somewhere in the
+        // document.
+        assert!(!openapi_identifies_aeyes(
+            br#"{"info":{"title":"other"},"paths":{"/":{"summary":"aeyes"}}}"#
+        ));
+    }
+
+    /// `/proc/<pid>/exe` comes back kernel-resolved while `current_exe()` comes
+    /// from `/proc/self/exe`, and the two spellings diverge as soon as a
+    /// symlinked directory sits between them. Comparing them literally reports
+    /// the real daemon as `Foreign` and leaves it unstoppable — the exact
+    /// failure the identity check exists to prevent.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn same_executable_survives_a_symlinked_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("releases").join("v1.0.0");
+        fs::create_dir_all(&real).expect("create real dir");
+        let binary = real.join("aeyes");
+        fs::write(&binary, b"#!/bin/true\n").expect("write binary");
+
+        let link = dir.path().join("current");
+        std::os::unix::fs::symlink(dir.path().join("releases"), &link).expect("symlink dir");
+        let via_link = link.join("v1.0.0").join("aeyes");
+
+        // The premise: the two paths genuinely differ byte-for-byte...
+        assert_ne!(
+            binary, via_link,
+            "test premise broken: the symlinked path resolved to the same string"
+        );
+        // ...while naming one and the same executable file.
+        assert!(
+            same_executable(&binary, &via_link),
+            "same_executable called one file two ways a pair of different files"
+        );
+        assert!(
+            same_executable(&via_link, &binary),
+            "same_executable is not symmetric"
+        );
+    }
+
+    /// The other half of the contract: canonicalising must not make every path
+    /// match. A different file is still `Foreign`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn same_executable_still_separates_different_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one = dir.path().join("aeyes-one");
+        let other = dir.path().join("aeyes-two");
+        fs::write(&one, b"one").expect("write one");
+        fs::write(&other, b"two").expect("write other");
+
+        assert!(
+            !same_executable(&one, &other),
+            "same_executable called two distinct files identical"
+        );
+        assert!(
+            !same_executable(&one, &dir.path().join("absent")),
+            "same_executable matched a file that does not exist"
+        );
+    }
+
+    /// Our own pid must classify as `Ours` — the positive half of the identity
+    /// check, which a regression in the canonicalisation would break.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn classify_daemon_pid_recognises_this_process() {
+        assert!(
+            matches!(classify_daemon_pid(std::process::id()), PidVerdict::Ours),
+            "the running aeyes executable was not recognised as our own"
+        );
     }
 }
