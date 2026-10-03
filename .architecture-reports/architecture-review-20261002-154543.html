@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aeyes — Architecture Review — 2026-10-02</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --ink:#0b1220; --muted:#5b6779; --line:#e2e6ec;
+    --shallow:#c2410c; --deep:#0f766e; --accent:#4338ca;
+  }
+  body{background:#f6f7f9;color:var(--ink);font-feature-settings:"tnum";}
+  .card{background:#fff;border:1px solid var(--line);border-radius:14px;
+        box-shadow:0 1px 2px rgba(11,18,32,.04),0 8px 24px -18px rgba(11,18,32,.25);}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .kv{display:grid;grid-template-columns:8.5rem 1fr;gap:.35rem .9rem}
+  .kv dt{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;padding-top:.15rem}
+  .kv dd{font-size:.9rem}
+
+  /* ---- depth diagram primitives ---- */
+  .depthwrap{border:1px solid var(--line);border-radius:10px;background:#fbfcfd;padding:.85rem}
+  .depthwrap.before{background:#fff7f3;border-color:#f3d5c4}
+  .depthwrap.after{background:#f0fbf8;border-color:#b9e2d8}
+  .depthcap{font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.4rem;font-weight:600}
+  .iface{border:1.5px solid var(--shallow);background:#fff;border-radius:7px;
+         padding:.34rem .5rem;font-size:.7rem;display:flex;flex-direction:column;gap:.12rem}
+  .iface .row{color:var(--muted)}
+  .body{border:1.5px dashed var(--shallow);background:repeating-linear-gradient(45deg,#fff,#fff 6px,#fff4ee 6px,#fff4ee 12px);
+        border-radius:7px;padding:.45rem .5rem;font-size:.66rem;color:#7c2d12;margin-top:.3rem}
+  .body.tall{min-height:92px}
+  .body.short{min-height:26px}
+  .iface.wide{width:100%}
+  .iface.narrow{width:56%;margin:0 auto}
+  .after .iface{border-color:var(--deep)}
+  .after .body{border-color:var(--deep);color:#115e59;
+        background:repeating-linear-gradient(45deg,#fff,#fff 6px,#e6f6f1 6px,#e6f6f1 12px)}
+  .ratio{display:flex;align-items:center;gap:.5rem;margin-top:.5rem;font-size:.63rem;color:var(--muted)}
+  .ratiobar{flex:1;height:7px;border-radius:4px;background:#e8ebf0;overflow:hidden}
+  .ratiobar span{display:block;height:100%;border-radius:4px}
+  .before .ratiobar span{background:var(--shallow)}
+  .after  .ratiobar span{background:var(--deep)}
+  .arrowmark{text-align:center;font-size:.62rem;color:var(--muted);padding:.28rem 0}
+
+  /* stat chips */
+  .chip{display:inline-flex;align-items:center;gap:.3rem;font-size:.7rem;padding:.16rem .5rem;
+        border-radius:999px;border:1px solid var(--line);background:#fafbfc;color:var(--muted)}
+  .chip.bad{border-color:#f3c9b4;background:#fff4ed;color:#9a3412}
+  .chip.good{border-color:#b9e2d8;background:#f0fbf8;color:#0f766e}
+  .badge{font-size:.66rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+         padding:.2rem .55rem;border-radius:999px}
+  .b-strong{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}
+  .b-worth{background:#fef3c7;color:#92400e;border:1px solid #fde68a}
+  .b-spec{background:#e0e7ff;color:#3730a3;border:1px solid #c7d2fe}
+
+  code{background:#f2f4f7;padding:.08rem .3rem;border-radius:4px;font-size:.8em;
+       font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .fileline{font-size:.72rem;color:var(--muted)}
+  .quote{border-left:3px solid var(--shallow);background:#fffaf7;padding:.6rem .8rem;
+         font-size:.78rem;border-radius:0 8px 8px 0;color:#7c2d12}
+  table{width:100%;border-collapse:collapse;font-size:.78rem}
+  th,td{text-align:left;padding:.42rem .6rem;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+  .anchor{color:var(--accent);text-decoration:none;border-bottom:1px solid #c7d2fe}
+</style>
+</head>
+<body class="antialiased">
+
+<!-- ===================== HEADER ===================== -->
+<header class="border-b bg-white">
+  <div class="max-w-6xl mx-auto px-6 py-8">
+    <div class="flex items-start justify-between gap-6 flex-wrap">
+      <div>
+        <div class="text-[11px] uppercase tracking-[.18em] text-slate-400 font-semibold mb-2">
+          Architecture Review · elecnix/aeyes
+        </div>
+        <h1 class="text-3xl md:text-4xl font-bold tracking-tight">Deepening opportunities</h1>
+        <p class="mt-2 text-slate-600 max-w-2xl text-[15px] leading-relaxed">
+          Thirteen findings across a <span class="mono">4,097</span>-line
+          <span class="mono">src/lib.rs</span> monolith. Scored by
+          <strong>leverage</strong> — how much a deepening pays back on the <em>next</em> change —
+          and <strong>locality</strong> — whether related knowledge sits together or scatters.
+        </p>
+      </div>
+      <div class="text-right text-xs text-slate-500 leading-relaxed mono">
+        <div>2026-10-02</div>
+        <div>main @ <span class="text-slate-700">b979605</span></div>
+        <div>2,884 prod LOC · 80 tests</div>
+        <div class="mt-2"><span class="chip bad">63</span> <span class="chip">cfg attrs</span></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-6xl mx-auto px-6 py-8 space-y-8">
+
+  <!-- ===================== SCOPE / METHOD ===================== -->
+  <section class="card p-6">
+    <h2 class="text-lg font-bold mb-1">Scope &amp; method</h2>
+    <p class="text-sm text-slate-600 mb-4 max-w-3xl leading-relaxed">
+      Scoped by <strong>YAGNI</strong>: extra weight went to the paths that keep coming up in history.
+      The two most recent feature commits — <span class="mono">#27</span> (native format fallback) and
+      <span class="mono">#29</span> (encode YU12/YV12/NV12/RGB3/BGR3) — are both
+      <em>pixel-format</em> work, and both required edits across many files. That made the format
+      family the primary suspect before a line was read.
+    </p>
+    <div class="grid md:grid-cols-3 gap-4 text-sm">
+      <div>
+        <div class="text-[11px] uppercase tracking-wider text-slate-400 font-semibold mb-2">Shape</div>
+        <ul class="space-y-1 text-slate-600">
+          <li><span class="mono">src/lib.rs</span> — 4,097 lines, 1 module inside it</li>
+          <li><span class="mono">src/chrome_capture.rs</span> — 223 lines</li>
+          <li>Tests are one 1,213-line block at the bottom</li>
+        </ul>
+      </div>
+      <div>
+        <div class="text-[11px] uppercase tracking-wider text-slate-400 font-semibold mb-2">Vocabulary</div>
+        <ul class="space-y-1 text-slate-600">
+          <li><strong>module</strong> · <strong>interface</strong> · <strong>depth</strong></li>
+          <li><strong>seam</strong> · <strong>adapter</strong></li>
+          <li><strong>leverage</strong> · <strong>locality</strong></li>
+        </ul>
+      </div>
+      <div>
+        <div class="text-[11px] uppercase tracking-wider text-slate-400 font-semibold mb-2">Test applied</div>
+        <ul class="space-y-1 text-slate-600">
+          <li>The <strong>deletion test</strong> — does deleting it concentrate complexity, or just move it?</li>
+          <li>One adapter = hypothetical seam. Two = real.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="mt-4 pt-4 border-t border-slate-100 text-xs text-slate-500">
+      <strong class="text-slate-600">Note on domain language:</strong> this repo has no
+      <span class="mono">CONTEXT.md</span> and no <span class="mono">docs/adr/</span>, so there is no
+      recorded domain model to draw names from and no decision to re-litigate. Domain terms below are
+      taken from the code as it stands — <em>Frame</em>, <em>Camera</em>, <em>Stream</em>,
+      <em>Capture Preset</em>, <em>Exposure</em>, <em>Chrome Session</em>, <em>Daemon</em>.
+      Writing that glossary down is itself a candidate (see A9).
+    </div>
+  </section>
+
+  <!-- ===================== SUMMARY TABLE ===================== -->
+  <section class="card p-6">
+    <h2 class="text-lg font-bold mb-1">The findings at a glance</h2>
+    <p class="text-sm text-slate-500 mb-4">Thirteen, ordered by leverage. Eight are deep enough to propose; all thirteen are linked from the tracking issue.</p>
+    <div class="overflow-x-auto">
+      <table>
+        <thead>
+          <tr>
+            <th class="w-8">#</th><th>Finding</th><th>Signal</th><th>Evidence</th><th>Strength</th>
+          </tr>
+        </thead>
+        <tbody id="summary-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================== TOP RECOMMENDATION ===================== -->
+  <section class="rounded-2xl p-7 text-white" style="background:linear-gradient(135deg,#0f766e,#134e4a 55%,#1e1b4b)">
+    <div class="text-[11px] uppercase tracking-[.18em] text-teal-200 font-semibold mb-2">Top recommendation</div>
+    <h2 class="text-2xl font-bold mb-3">Consolidate pixel-format knowledge into one module — then hang the converters off it</h2>
+    <p class="text-teal-50/90 text-[15px] leading-relaxed max-w-3xl">
+      It wins on every axis at once, and the history is unusually clear about why.
+    </p>
+    <div class="grid md:grid-cols-3 gap-4 mt-6">
+      <div class="rounded-xl bg-white/10 p-4 backdrop-blur">
+        <div class="text-2xl font-bold">7</div>
+        <div class="text-[13px] text-teal-100/80 mt-1 leading-snug">
+          sites must change to add <strong>one</strong> pixel format today. Commits
+          <span class="mono">#27</span> and <span class="mono">#29</span> both paid that tax.
+        </div>
+      </div>
+      <div class="rounded-xl bg-white/10 p-4 backdrop-blur">
+        <div class="text-2xl font-bold">5 of 7</div>
+        <div class="text-[13px] text-teal-100/80 mt-1 leading-snug">
+          formats silently skip exposure adaptation at <span class="mono">lib.rs:731</span> — the exact
+          formats <span class="mono">#29</span> just added.
+        </div>
+      </div>
+      <div class="rounded-xl bg-white/10 p-4 backdrop-blur">
+        <div class="text-2xl font-bold">20 lines</div>
+        <div class="text-[13px] text-teal-100/80 mt-1 leading-snug">
+          of luma analysis duplicated verbatim, over a shared histogram that was never extracted.
+        </div>
+      </div>
+    </div>
+    <p class="text-teal-50/90 text-[15px] leading-relaxed max-w-3xl mt-5">
+      Three independent findings — the converter family, the scattered fourcc list, and the exposure
+      dispatch — collapse into <strong>one</strong> seam. That is the signature of a genuinely deep
+      module rather than a tidy-up: the interface gets <em>smaller</em> (callers stop naming fourccs)
+      while it hides <em>more</em> (plane geometry, chroma addressing, the encoder choice).
+      It also unblocks the exposure work, which is currently blocked precisely because it needs a
+      format module to ask.
+    </p>
+  </section>
+
+  <!-- ===================== CANDIDATE CARDS ===================== -->
+  <div class="pt-2">
+    <h2 class="text-xl font-bold mb-1">Candidates</h2>
+    <p class="text-sm text-slate-500 mb-5">Each card shows the shallow shape and the deepened shape side by side. The bar under each is the interface-to-implementation ratio — lower is deeper.</p>
+  </div>
+  <div id="cards" class="space-y-6"></div>
+
+  <!-- ===================== APPENDIX ===================== -->
+  <section class="card p-6" id="appendix">
+    <h2 class="text-lg font-bold mb-1">Appendix — findings not proposed as candidates</h2>
+    <p class="text-sm text-slate-500 mb-4">
+      Real, but either cheap, already-correct, or blocked on a candidate above. Tracked so a future
+      review does not re-derive them.
+    </p>
+    <div id="appendix-body" class="space-y-4 text-sm"></div>
+  </section>
+
+  <footer class="pt-4 pb-10 text-xs text-slate-400 mono">
+    aeyes architecture review · generated 2026-10-02 · main @ b979605 · no repo files modified
+  </footer>
+</main>
+
+<script>
+/* ------------------------------------------------------------------ */
+/* Data                                                                */
+/* ------------------------------------------------------------------ */
+const FINDINGS = [
+  {id:"F1", card:"A1", title:"Pixel-format converters: five shallow siblings over one kernel",
+   files:"lib.rs:2757–2884", evidence:"Read + line-by-line diff", strength:"strong"},
+  {id:"F2", card:"A1", title:"Fourcc knowledge scattered across 5+ sites, three orderings",
+   files:"lib.rs:200, 731, 791, 842, 872, 92/109/130", evidence:"grep, verified", strength:"strong"},
+  {id:"F3", card:"A2", title:"Exposure: pure functions tested, dispatch and state machine untested",
+   files:"lib.rs:723–767, 1167–1213", evidence:"Full call-site trace", strength:"strong"},
+  {id:"F4", card:"A3", title:"Luma histogram duplicated verbatim; 1-in-4 sampling stride unverified",
+   files:"lib.rs:2598–2700", evidence:"Diff + runtime probe", strength:"strong"},
+  {id:"F5", card:"A6", title:"CameraBackend is a hypothetical seam; OpenCamera is a real one",
+   files:"lib.rs:159–163 vs 213–216", evidence:"Read + impl census", strength:"worth"},
+  {id:"F6", card:"A5", title:"Chrome CDP in two modules; 4 copies of the transport loop; session race",
+   files:"chrome_capture.rs + lib.rs:327–475, 2268–2290", evidence:"Caller grep + lock scope", strength:"strong"},
+  {id:"F7", card:"A4", title:"Hand-rolled HTTP client re-implements reqwest, already a dependency",
+   files:"lib.rs:1600–1646", evidence:"Verified against chrome_cmd:1500", strength:"strong"},
+  {id:"F8", card:"A4", title:"Three error encodings on one wire format",
+   files:"lib.rs:2581, 2305/2346/2356/2364, 1628", evidence:"Call-site census", strength:"worth"},
+  {id:"F9", card:"A7", title:"OpenAPI document hand-maintained and already drifted",
+   files:"lib.rs:2384–2579 vs 1735–1745", evidence:"Route list compared", strength:"worth"},
+  {id:"F10", card:"A7", title:"Web UI interpolates untrusted id into HTML and a JS string literal",
+   files:"lib.rs:2003–2128", evidence:"Read", strength:"strong"},
+  {id:"F11", card:"A8", title:"Daemon lifecycle: two pid-file writers, no lock, unverified kill",
+   files:"lib.rs:1296–1495, 1666–1747", evidence:"Read + suite run", strength:"strong"},
+  {id:"F12", card:"A8", title:"Idle watchdog can kill a live stream; lock discipline is actually fine",
+   files:"lib.rs:1803…2376, 1713–1722", evidence:"Write-site census", strength:"worth"},
+  {id:"F13", card:"A9", title:"Test doubles live 2,000 lines from what they model; v4l2-ctl untestable",
+   files:"lib.rs:245, 968, 1216, 2896–2947", evidence:"Read + test inventory", strength:"spec"}
+];
+
+const BADGE = {strong:'<span class="badge b-strong">Strong</span>',
+               worth:'<span class="badge b-worth">Worth exploring</span>',
+               spec:'<span class="badge b-spec">Speculative</span>'};
+
+/* ------------------------------------------------------------------ */
+/* Summary table                                                       */
+/* ------------------------------------------------------------------ */
+document.getElementById('summary-tbody').innerHTML = FINDINGS.map(f => `
+  <tr>
+    <td class="mono text-slate-400">${f.id}</td>
+    <td>${f.card==="—"?"":`<a class="anchor" href="#${f.card.toLowerCase()}">${f.card}</a> · `}<span class="text-slate-800">${f.title}</span></td>
+    <td class="mono text-xs text-slate-500">${f.files}</td>
+    <td class="text-xs text-slate-500">${f.evidence}</td>
+    <td>${BADGE[f.strength]}</td>
+  </tr>`).join('');
+
+/* ------------------------------------------------------------------ */
+/* Depth diagram builder                                               */
+/* ------------------------------------------------------------------ */
+function diagram(before, after){
+  const side = (d, cls, label) => `
+    <div class="depthwrap ${cls}">
+      <div class="depthcap">${label}</div>
+      <div class="iface ${d.ifaceClass||'wide'}">
+        ${d.iface.map(r=>`<div class="row mono">${r}</div>`).join('')}
+      </div>
+      ${d.hideArrow===false?'':'<div class="arrowmark">▼ &nbsp;the caller must know all of this</div>'}
+      <div class="body ${d.bodyClass||'tall'}">
+        ${d.body.map(r=>`<div class="mono" style="opacity:.8">${r}</div>`).join('')}
+      </div>
+      <div class="ratio">
+        <span>interface : implementation</span>
+        <span class="ratiobar"><span style="width:${d.ratio}%"></span></span>
+        <span class="mono">${d.ratio}%</span>
+      </div>
+    </div>`;
+  return `<div class="grid md:grid-cols-2 gap-4">
+    ${side(before,'before','Before — shallow')}
+    ${side(after,'after','After — deep')}
+  </div>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Candidate cards                                                     */
+/* ------------------------------------------------------------------ */
+const CARDS = [
+{
+  id:"A1", n:"01", strength:"strong", fids:"F1 + F2",
+  title:"One pixel-format module: knowledge in one place, callers name no fourcc",
+  files:["src/lib.rs:200–213 <span class='text-slate-400'>parse_fourcc</span>",
+         "src/lib.rs:842–856 <span class='text-slate-400'>encodable_formats / is_encodable_format</span>",
+         "src/lib.rs:872–935 <span class='text-slate-400'>FIXED_CAPTURE_PRESETS</span>",
+         "src/lib.rs:2589 <span class='text-slate-400'>encode_rgb_to_jpeg</span>",
+         "src/lib.rs:2757–2884 <span class='text-slate-400'>the six *_to_jpeg functions</span>",
+         "src/lib.rs:791–806 <span class='text-slate-400'>capture_jpeg dispatch</span>"],
+  problem:`<p>The same seven fourccs are written down in at least <strong>five non-test places, in three
+  different orders</strong>. Adding one format means editing <code>parse_fourcc</code> (200),
+  <code>encodable_formats</code> (842), the preset table (872), the capture dispatch (791), the
+  exposure dispatch (731), six CLI help strings (92/109/130), and writing a seventh converter.</p>
+  <p>Worse, the six converters are not six modules — they are one kernel
+  (<code>push_yuv_pixel</code>, 2778: the BT.601 matrix) with a terminal
+  (<code>encode_rgb_to_jpeg</code>, 2589) wrapped in five copies of the same length-validation
+  preamble. <code>yuv420_to_jpeg</code> (2812–2824) and <code>nv12_to_jpeg</code> (2839–2851) are the
+  same loop with different chroma addressing — one is a bad extraction of the other, not a module.</p>`,
+  solution:`<p>A module that owns format knowledge end to end: it holds the format table and its
+  preference order, validates buffer lengths, exposes an <em>encode</em> entry point, and exposes an
+  <em>luma</em> entry point used by exposure. Every fourcc literal collapses into that one table.
+  Callers ask the module a question; they never name a format.</p>
+  <p>The six public <span class="mono">*_to_jpeg</span> functions stop being the interface and become
+  rows in a table — the classic "simple interface, deep module" shape.</p>`,
+  benefits:`<p><strong>Locality:</strong> one place answers "what formats does aeyes understand, and in
+  what order do we prefer them". Today that answer requires reading five sites and reconciling three
+  orderings. <strong>Leverage:</strong> adding a format drops from a 7-site edit to a table row — which
+  is precisely the tax commits <span class="mono">#27</span> and <span class="mono">#29</span> both
+  paid. <strong>Tests:</strong> the ~20 duplicated buffer-length tests collapse into table-driven cases,
+  and <em>every</em> existing format test gains a round-trip assertion it cannot have today.</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:92,
+      iface:['match self.format {','  b"MJPG" => …','  b"YUYV" => …','  b"YU12" => …','  b"YV12" => …','  b"NV12" => …','  b"RGB3" => …','  b"BGR3" => …','}'],
+      body:['with_context boilerplate per arm','separate fn per format','five copies of the same','validate-length preamble'] },
+    { ifaceClass:'narrow', ratio:14,
+      iface:['encode(buf, w, h) -> Result&lt;Vec&lt;u8&gt;&gt;','supports(fourcc) -> bool','order() -> &[Format]'],
+      body:['format table + preference order','buffer-length validation','plane geometry &amp; div_ceil','chroma addressing','BT.601 matrix (2778)','JPEG encoder (2589)'] }
+  )
+},
+{
+  id:"A2", n:"02", strength:"strong", fids:"F3",
+  title:"Deepen Exposure Adaptation so its behaviour is reachable by tests",
+  files:["src/lib.rs:723–767 <span class='text-slate-400'>observe_exposure_from_frame</span>",
+         "src/lib.rs:1167–1213 <span class='text-slate-400'>impl ExposureController</span>",
+         "src/lib.rs:235–241 <span class='text-slate-400'>struct ExposureController</span>",
+         "src/lib.rs:2598–2700 <span class='text-slate-400'>analyze_*_frame</span>"],
+  problem:`<p>This is the clearest instance of the failure mode worth hunting: <strong>pure functions
+  extracted for testability while the real logic sits at an untestable call site</strong>.
+  <code>recommend_exposure_value</code> has three tests; the function that decides <em>whether</em> to
+  act has none, because it needs an <span class="mono">RsCamera</span>.</p>
+  <p>Three real defects live there:</p>
+  <ul class="list-disc pl-5 mt-1 space-y-1">
+    <li><strong>The dispatch silently no-ops for 5 of 7 formats.</strong> At 731–739 the chain is
+    <code>MJPG</code>, else <code>YUYV</code>, else <code>return Ok(())</code>. YU12/YV12/NV12/RGB3/BGR3
+    get <em>no</em> exposure adaptation — and those are exactly the formats <span class="mono">#29</span>
+    added last month.</li>
+    <li><strong><code>record_applied</code> is skipped on failure.</strong> <code>set_control</code> is
+    <span class="mono">?</span>-propagated at 749 <em>before</em> <code>record_applied(next)</code> at
+    753. On a control error the controller's <code>current</code> stays stale, so the next sampled frame
+    recomputes the same value and fails again — an unbounded retry, warning, every 8 frames, forever.</li>
+    <li><strong>The cooldown is dead during warm-up.</strong> <code>should_sample</code> returns
+    <code>true</code> immediately when forced, so <code>warm_up_exposure</code> (702–721) bypasses the
+    entire two-counter state machine in the one phase it was designed to govern.</li>
+  </ul>`,
+  solution:`<p>Move the decision behind a seam: the module answers <em>"given this frame buffer and its
+  format, what exposure should I apply?"</em> and owns the format dispatch, the sampling state machine,
+  and the recommendation. What stays outside is two device operations — read a control's range, write a
+  control's value — which are already the only things that genuinely need <span class="mono">rscam</span>.</p>
+  <p>Note that <code>recommend_exposure_value</code> taking five positional arguments is itself a smell
+  that this wants to be a struct.</p>`,
+  benefits:`<p><strong>This is the locality payoff in its purest form.</strong> The three defects above are
+  all <em>interactions</em> between state and dispatch — exactly the class of bug that unit-testing the
+  extracted pure function cannot find, because the bug is in the glue. <strong>Leverage:</strong> the
+  behaviour of auto-exposure becomes assertable, so it can be changed at all. <strong>Tests:</strong>
+  the three defects above each become a five-line test today and none of them can be written today.
+  Blocked on A1 — the format dispatch needs a format module to ask.</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:78,
+      iface:['fn observe_exposure_from_frame(','   &amp;mut self, frame: &[u8],','   force: bool) -&gt; Result&lt;()&gt;'],
+      body:['needs RsCamera — untestable','format dispatch (2 of 7)','should_sample + cooldown','set_control side effect','record_applied ordering'] },
+    { ifaceClass:'narrow', ratio:16,
+      iface:['fn advise(&amp;mut self,','   frame: &amp;[u8], f: Format)','   -&gt; Option&lt;i32&gt;'],
+      body:['format dispatch (all 7)','luma histogram','sampling state machine','recommendation + quantize'] }
+  )
+},
+{
+  id:"A3", n:"03", strength:"strong", fids:"F4",
+  title:"One luma histogram instead of three analysers, two of them copy-paste",
+  files:["src/lib.rs:2598–2642 <span class='text-slate-400'>analyze_rgb_frame</span>",
+         "src/lib.rs:2645–2650 <span class='text-slate-400'>analyze_mjpeg_frame</span>",
+         "src/lib.rs:2653–2700 <span class='text-slate-400'>analyze_yuyv_frame</span>",
+         "src/lib.rs:63,65 <span class='text-slate-400'>HIGHLIGHT_CLIP_LUMA, SHADOW_LUMA_THRESHOLD</span>"],
+  problem:`<p>Lines 2621–2643 and 2678–2700 are <strong>verbatim identical</strong> apart from three
+  lines where a value is wrapped in <span class="mono">Ok(…)</span>. Twenty duplicated lines. The
+  genuinely different part is 12 lines each: how to get luma samples from RGB bytes vs from Y bytes.</p>
+  <p><code>analyze_mjpeg_frame</code> is a 6-line adapter over one decode call — its interface is
+  identical to <code>analyze_yuyv_frame</code>'s, so it hides almost nothing.</p>
+  <p class="quote">Sharpest detail: at 2605, <span class="mono">bytes.as_chunks::&lt;3&gt;().0.iter().step_by(4)</span>
+  samples <strong>one pixel in four</strong>, with no comment explaining it. A single blown-out pixel
+  among 400 is missed 75% of the time, yet <span class="mono">p95_luma</span> is computed over a quarter
+  of the image as if it were the whole. The test that "covers" it uses 8 pixels and
+  <strong>cannot distinguish striding from not striding</strong> — so the stride is entirely unverified.</p>
+  <p>The sharing already stopped one step short: the thresholds are shared constants (63, 65), but the
+  algorithm that consumes them is duplicated.</p>`,
+  solution:`<p>One luma-histogram module with an interface like "accumulate samples from any source;
+  produce stats". The three analysers become thin adapters that each only decide
+  <em>how to read a luma sample</em> — 12 lines each, or less. The stride becomes one named, documented,
+  testable decision instead of an inline literal.</p>`,
+  benefits:`<p><strong>Locality:</strong> the histogram algorithm sits in one place instead of two.
+  <strong>Leverage:</strong> A4, A2 and any future format adapter all consume this; today each new
+  source re-implements the histogram. <strong>Tests:</strong> the duplicated test bodies collapse into
+  one, and the stride gets a test that can actually fail — a two-image test where striding and not
+  striding give different <span class="mono">p95_luma</span> is a one-line addition once the sample
+  source is a parameter.</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:71,
+      iface:['analyze_rgb_frame(&amp;[u8]) -&gt; FrameLumaStats','analyze_mjpeg_frame(&amp;[u8]) -&gt; Result&lt;…&gt;','analyze_yuyv_frame(&amp;[u8]) -&gt; Result&lt;…&gt;'],
+      body:['histogram algorithm —','duplicated in full, twice','(20 identical lines)','+ inline step_by(4) stride','+ sample extraction, 12 lines ×2'] },
+    { ifaceClass:'narrow', ratio:18,
+      iface:['stats.add(sample)','stats.finish() -&gt; FrameLumaStats'],
+      body:['histogram + percentile','clip / shadow ratios','stride as a named,','documented constant'] }
+  )
+},
+{
+  id:"A4", n:"04", strength:"strong", fids:"F7 + F8",
+  title:"Delete the hand-rolled HTTP client; one error shape on the wire",
+  files:["src/lib.rs:1600–1607 <span class='text-slate-400'>http_get_bytes</span>",
+         "src/lib.rs:1609–1626 <span class='text-slate-400'>parse_http_response</span>",
+         "src/lib.rs:1628–1646 <span class='text-slate-400'>parse_error_response_body</span>",
+         "src/lib.rs:2581–2587 <span class='text-slate-400'>error_response</span>",
+         "Cargo.toml:reqwest <span class='text-slate-400'>already a dependency</span>"],
+  problem:`<p>The CLI writes HTTP by hand: <code>format!("GET {path} HTTP/1.1\\r\\nHost: …")</code> over a
+  raw <span class="mono">TcpStream</span>, then locates the body with
+  <span class="mono">buf.windows(4).position(…)</span> and sniffs the status with two
+  <span class="mono">starts_with</span> checks.</p>
+  <p><strong><span class="mono">reqwest</span> is already a direct dependency</strong>, used 100 lines
+  above in <code>chrome_cmd</code> (1500) and seven more times in the test module. The parser has no
+  notion of <span class="mono">Transfer-Encoding: chunked</span>, so it would return chunk-size framing
+  as body bytes — latent today only because the CLI happens to hit <span class="mono">Content-Length</span>
+  routes. But <code>stream_http</code> (1943) <em>is</em> chunked.</p>
+  <p><strong>Deletion test, unambiguous:</strong> delete both functions and their five tests, and
+  complexity <em>disappears</em> — replaced by one <span class="mono">reqwest</span> call. It does not
+  move. The five tests are all asserting quirks of a shallow adapter rather than a contract.</p>
+  <p>Related: three error encodings coexist. The Chrome handlers (2305, 2346, 2356, 2364) emit raw
+  <span class="mono">json!({"error": …})</span> with <strong>no <span class="mono">details</span> key</strong>,
+  and the client parser has to tolerate that with <span class="mono">unwrap_or_default()</span>. So camera
+  errors reach the user as <code>"err [d1 | d2]</code> and Chrome errors as a bare string — two
+  different error qualities on one wire format.</p>`,
+  solution:`<p>Delete the client and use <span class="mono">reqwest</span>. The CLI's daemon-facing module
+  keeps a real seam — <em>"fetch this route, give me bytes or a typed error"</em> — but that seam is now
+  <span class="mono">reqwest</span>, which is deeper for free. Give errors one constructor and one wire
+  shape, so a new handler cannot invent a fourth.</p>`,
+  benefits:`<p><strong>Leverage:</strong> the cheapest win on this list — it is a deletion, not a
+  refactor. <strong>Locality:</strong> chunked encoding, redirects, and status handling stop being this
+  codebase's problem. <strong>Tests:</strong> five tests of a hand-rolled parser become tests of a real
+  client, and the error-shape test currently missing becomes easy — with one constructor, the shape is
+  testable once.</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:88,
+      iface:['http_get_bytes(addr, path)','parse_http_response(&amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;&gt;'],
+      body:['hand-written request line','window(4) header/body split','starts_with status sniff','no chunked support','5 tests of its own quirks'] },
+    { ifaceClass:'narrow', ratio:6,
+      iface:['fetch(path) -&gt; Result&lt;Vec&lt;u8&gt;&gt;'],
+      body:['reqwest — already a dep','chunked, redirects, status','typed error from one constructor'] }
+  )
+},
+{
+  id:"A5", n:"05", strength:"strong", fids:"F6",
+  title:"One Chrome module: two implementations of the same transport, and a session race",
+  files:["src/chrome_capture.rs:86–100 <span class='text-slate-400'>cdp_send_raw</span>",
+         "src/chrome_capture.rs:121–176 <span class='text-slate-400'>capture_screenshot — dead</span>",
+         "src/lib.rs:327–475 <span class='text-slate-400'>ChromeSession, spawn_persistent_chrome_session</span>",
+         "src/lib.rs:2268–2290 <span class='text-slate-400'>get_or_create_chrome_session</span>",
+         "src/lib.rs:2292–2310 <span class='text-slate-400'>chrome_tabs_handler</span>"],
+  problem:`<p>CDP is implemented in <strong>two modules</strong>. The
+  "send JSON, read until the id matches, shape the error" loop appears <strong>four times</strong> —
+  once in <span class="mono">chrome_capture.rs</span>, three times inline in <span class="mono">lib.rs</span>.
+  Only the last is non-blocking-safe; the first three spin with <strong>no timeout</strong>.</p>
+  <p><code>capture_screenshot</code> (chrome_capture.rs:121) is <strong>dead code</strong> — its only
+  reference is its own doc example. So the file is 96 lines dead while <span class="mono">lib.rs</span>
+  reimplements the transport live.</p>
+  <p class="quote">The doc comment at 315–317 says the persistent session exists "so Chrome's
+  'Allow debugging' permission persists across requests" — but <code>chrome_tabs_handler</code> calls
+  <code>chrome_capture::list_targets()</code>, which opens a <strong>brand-new WebSocket</strong>.
+  Listing tabs is precisely the operation the persistent session was built to avoid.</p>
+  <p>The race at 2268–2290 is real: the fast path releases the lock at 2277, spawns with
+  <strong>no lock held</strong> (2279–2287), then re-acquires at 2288. Two concurrent screenshots both
+  see <span class="mono">None</span>, both connect, both attach to the same target; the second
+  overwrites the cache and <strong>orphans the first background thread</strong>, which has no
+  <span class="mono">Drop</span>. Worse, <code>spawn_persistent_chrome_session</code> is a
+  <em>synchronous</em> fn doing blocking <span class="mono">tungstenite</span> I/O, called from an
+  <span class="mono">async fn</span> — it blocks a tokio worker for the whole handshake.</p>`,
+  solution:`<p>One Chrome module whose interface is "list pages" / "screenshot this page", hiding
+  discovery, the attach handshake, id-matching, event-skipping, and thread lifecycle. Both
+  <span class="mono">chrome_capture.rs</span> and <span class="mono">lib.rs:327–475</span> live inside
+  it, so "which transport do I use" stops being a question anyone has to answer. Session creation
+  becomes an atomic get-or-insert.</p>`,
+  benefits:`<p><strong>Locality:</strong> the persistent-session premise is finally enforced by the code
+  instead of contradicted by one handler. <strong>Leverage:</strong> CDP protocol details stop leaking
+  into three call sites. <strong>Tests:</strong> the seam exists in the <em>data</em> already
+  (<code>AppState.chrome_session</code> is a field) but the <em>type</em> is concrete, so a test cannot
+  supply a fake — a proper module makes both Chrome handlers testable without launching Chrome.</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:84,
+      iface:['chrome_capture::list_targets()','get_or_create_chrome_session(&amp;state)','chrome_screenshot_handler()'],
+      body:['2 modules, 4 transport loops','3 with no timeout','lock released before spawn','blocking tungstenite in async','96 lines of dead code'] },
+    { ifaceClass:'narrow', ratio:10,
+      iface:['list_pages() -&gt; Result&lt;Vec&lt;Page&gt;&gt;','screenshot(Page) -&gt; Result&lt;Vec&lt;u8&gt;&gt;'],
+      body:['discovery + attach handshake','one id-matching loop, with timeout','event skipping','atomic get-or-insert','thread lifecycle'] }
+  )
+},
+{
+  id:"A6", n:"06", strength:"worth", fids:"F5",
+  title:"Keep the platform seam, drop the discovery seam",
+  files:["src/lib.rs:159–163 <span class='text-slate-400'>trait CameraBackend</span>",
+         "src/lib.rs:495–536 <span class='text-slate-400'>NativeBackend — the only impl</span>",
+         "src/lib.rs:213–216 <span class='text-slate-400'>trait OpenCamera</span>",
+         "src/lib.rs:543–598 <span class='text-slate-400'>NokhwaOpenCamera</span>",
+         "src/lib.rs:601–810 <span class='text-slate-400'>V4l2OpenCamera</span>",
+         "src/lib.rs:172–178 <span class='text-slate-400'>CameraOpenOptions</span>"],
+  problem:`<p>These two traits are not the same quality, and conflating them is the trap.</p>
+  <p><strong><code>OpenCamera</code> is a real seam.</strong> Two implementations that genuinely differ
+  in <em>work</em>: <code>V4l2OpenCamera</code> is 210 lines of preset enumeration, cross-product
+  search, multi-line error construction, and the whole exposure state machine;
+  <code>NokhwaOpenCamera</code> is 48 lines wrapping <span class="mono">nokhwa</span>. The interface is
+  2 methods with no configuration leaked. Keep it.</p>
+  <p><strong><code>CameraBackend</code> is a hypothetical one.</strong> Exactly one production
+  implementation, <code>NativeBackend</code> — a <em>unit struct with zero state</em>. The trait buys a
+  <span class="mono">Box&lt;dyn CameraBackend&gt;</span> that exists only so tests can substitute
+  <code>FakeBackend</code>. <code>list_cameras_with_backend</code> (1336) is a 2-line pass-through
+  with one call site and no test — pure move, not concentration.</p>
+  <p>The <span class="mono">cfg</span> split happens <em>inside</em> the trait methods (507/511,
+  526/530) instead of at the seam, so the platform conditional is duplicated rather than paid once.</p>
+  <p class="quote">A silent interface divergence: <code>CameraOpenOptions.format</code> means
+  <strong>"force this"</strong> on Linux and <strong>"no-op"</strong> elsewhere — admitted in a comment
+  at 555–557, invisible in the type. <code>resolution</code> silently defaults to 1920×1080 at 555.</p>`,
+  solution:`<p>The seam worth keeping is the <em>platform</em> one — a single place that knows how to turn
+  a device id and options into a running stream. It absorbs the <span class="mono">cfg</span> split and
+  the preset planning, and lets <code>CameraBackend</code> disappear. Make the
+  "honoured on Linux, ignored on nokhwa" fields say so in the type.</p>`,
+  benefits:`<p><strong>Leverage:</strong> 41 <span class="mono">target_os</span> gates stop leaking into
+  the middle of the file and concentrate at the seam. <strong>Locality:</strong> today a reader asking
+  "what does <code>format</code> mean" has to find a comment. <strong>Tests:</strong> keeping
+  <code>OpenCamera</code> preserves the existing <code>FakeOpenCamera</code> path that already makes
+  <code>camera_loop</code> testable — deleting <code>CameraBackend</code> costs nothing there.</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:81,
+      iface:['trait CameraBackend { name, list_cameras, open }','trait OpenCamera { set_auto_features, capture_jpeg }'],
+      body:['CameraBackend: 1 impl, 0 state','exists only for FakeBackend','list_cameras_with_backend:','  2-line pass-through','cfg split inside 2 of 3 methods'] },
+    { ifaceClass:'narrow', ratio:20,
+      iface:['trait OpenCamera {','   set_auto_features(&amp;mut self)','   capture_jpeg(&amp;mut self)','}'],
+      body:['one place owns the cfg split','preset planning + cross-product','multi-line error construction','honest options type','CameraBackend deleted'] }
+  )
+},
+{
+  id:"A7", n:"07", strength:"worth", fids:"F10 + F9",
+  title:"Web UI: escape once, own the page; derive the API doc instead of hand-maintaining it",
+  files:["src/lib.rs:2003–2128 <span class='text-slate-400'>web_ui_handler</span>",
+         "src/lib.rs:2384–2579 <span class='text-slate-400'>openapi_handler</span>",
+         "src/lib.rs:1735–1745 <span class='text-slate-400'>the router it describes</span>",
+         "src/lib.rs:270–277 <span class='text-slate-400'>camera_name from v4l2-ctl</span>"],
+  problem:`<p>126 lines, of which 2019–2122 is one giant <span class="mono">format!</span> string with
+  inline CSS. <code>{camera_name}</code> is interpolated raw into a <code>&lt;title&gt;</code>, a
+  <code>&lt;span&gt;</code>, and an <code>alt</code>; <code>{id}</code> — the raw, percent-decoded axum
+  path parameter — goes into an <code>&lt;img src&gt;</code> and into a
+  <strong>JavaScript single-quoted string literal</strong> at 2103:</p>
+  <p class="quote mono text-xs">img.src = '/cams/{id}/stream?t=' + Date.now();</p>
+  <p>No HTML escaping, no JS-string escaping anywhere. And <code>camera_name</code> is scraped from
+  <code>v4l2-ctl --info</code> "Card type" (270) — also untrusted, since it reflects whatever the
+  device or udev reports.</p>
+  <p>The brace-doubling required by <span class="mono">format!</span> makes the Rust and the CSS
+  unreadable together, which is why this stayed invisible.</p>
+  <p>Separately, <code>openapi_handler</code> is 195 lines of hand-maintained JSON describing
+  <strong>5 of the 10</strong> registered routes — <code>/cams/{id}/stream</code>, <code>/web/{id}</code>,
+  <code>/chrome/tabs</code> and <code>/chrome/screenshot</code> are missing. It has already drifted: it
+  declares an <code>ErrorResponse</code> shape that the Chrome handlers do not emit (see A4).</p>`,
+  solution:`<p>A module whose interface is "given a camera id and a display name, give me the page", which
+  owns escaping once. Template as a separate asset rather than a <span class="mono">format!</span>
+  string, so CSS stops being <span class="mono">{{</span>-escaped. Derive the API document from the
+  router it describes, or generate it — so it cannot drift.</p>`,
+  benefits:`<p><strong>Locality:</strong> escaping is owned once instead of being absent at six call
+  sites. <strong>Leverage:</strong> the page becomes editable without fighting brace-doubling, which
+  removes the practical barrier to styling changes. <strong>Tests:</strong> the handler is the one place
+  untrusted input reaches HTML and it is currently untested; with escaping owned by the module, the test
+  is "give it a hostile id, assert it comes back escaped".</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:86,
+      iface:['web_ui_handler(AxumPath(id)) -&gt; Response'],
+      body:['126-line format! string','CSS brace-doubled','unescaped into HTML ×3','unescaped into a JS string','no 404 on unknown camera'] },
+    { ifaceClass:'narrow', ratio:9,
+      iface:['page(id, name) -&gt; String'],
+      body:['template as a real asset','escaping owned once','HTML + JS context','consistent 404','API doc derived from router'] }
+  )
+},
+{
+  id:"A8", n:"08", strength:"worth", fids:"F11 + F12",
+  title:"Daemon lifecycle as a module: one writer, one lock, a verified kill",
+  files:["src/lib.rs:1296–1311 <span class='text-slate-400'>runtime_dir, pid_path, addr_path</span>",
+         "src/lib.rs:1367–1402 <span class='text-slate-400'>start_daemon</span>",
+         "src/lib.rs:1410–1440 <span class='text-slate-400'>stop_daemon</span>",
+         "src/lib.rs:1459–1495 <span class='text-slate-400'>ensure_daemon_running</span>",
+         "src/lib.rs:1713–1722 <span class='text-slate-400'>the idle watchdog</span>"],
+  problem:`<p><code>pid_path()</code> and <code>addr_path()</code> resolve to
+  <span class="mono">env::temp_dir().join("aeyes")</span> — <strong>/tmp/aeyes/daemon.{pid,addr}</strong>,
+  shared across every user on the box. Five concrete problems, all verified by reading:</p>
+  <ol class="list-decimal pl-5 space-y-1 mt-1">
+    <li><strong>Two writers.</strong> The parent writes both files at 1401–1402; the spawned child
+    writes them <em>again</em> at 1726–1727. Two processes, two unordered writes.</li>
+    <li><strong>Files written before the port exists.</strong> The child writes the addr file at 1726;
+    the listener does not bind until 1731. If bind fails — precisely what happens when two CLIs race —
+    it returns an error <strong>leaving stale pid/addr files</strong>.</li>
+    <li><strong>Concurrent <code>ensure_daemon_running</code> spawns two daemons.</strong>
+    Check-then-act with no lockfile. The loser's bind fails at 1731 <em>after</em> overwriting the pid
+    file at 1401, so <code>aeyes stop</code> kills nothing while the live daemon keeps running.</li>
+    <li><strong><code>stop_daemon</code> signals an unverified pid</strong> — no liveness check, no
+    process-identity check. Combined with PID reuse, this is a "signal an arbitrary pid" path.</li>
+    <li><strong>The test suite clobbers your live daemon.</strong> <code>run_daemon</code> writes
+    pid+addr unconditionally at 1726–1727 and seven tests call it. <code>#[serial]</code> orders the
+    tests among themselves; it does nothing about a real daemon outside the test binary.</li>
+  </ol>
+  <p class="quote">A related defect in the same family: <code>last_activity</code> is written
+  <strong>once at handler entry</strong> (nine sites: 1803, 1811, 1860, 1944, 2004, 2293, 2316, 2371,
+  2376) but the watchdog <span class="mono">process::exit(0)</span>s at 1720. <code>stream_http</code>
+  can hold a connection open indefinitely and <code>video_http</code> up to 60s — <strong>neither
+  refreshes activity while it works</strong>, so a long stream can be killed mid-flight.</p>
+  <p><strong>An honest negative:</strong> lock discipline is <em>fine</em>. No nested locks, no ordering
+  hazard anywhere; <code>AppState.streams</code> is never mutated after construction. The shallow piece
+  is <code>OptionChromeSession</code> (318) — a newtype with one derived method that every caller
+  reaches through <span class="mono">.0</span> anyway.</p>`,
+  solution:`<p>A lifecycle module with an interface of "give me the daemon address, starting it if needed"
+  and "stop it" — owning the files, the readiness poll, the spawn, the pid verification, and the lock.
+  Today that interface is spread across five functions with no owner. One writer for the state files;
+  a user-private directory; a lockfile around check-then-act; and activity refresh owned by the module
+  that consumes it, not copied into nine handlers.</p>`,
+  benefits:`<p><strong>Locality:</strong> process state has one owner instead of five functions guessing at
+  it. <strong>Leverage:</strong> this is the module that decides whether <code>aeyes</code> works
+  reliably under the one thing agents do constantly — invoke several CLI commands at once.
+  <strong>Tests:</strong> the lifecycle is the most valuable untestable thing in the codebase, because
+  testing it today means clobbering the developer's real daemon; behind a seam with a temp dir it
+  becomes a normal test.</p>`,
+  diagram:diagram(
+    { ifaceClass:'wide', ratio:90,
+      iface:['ensure_daemon_running(addr)','start_daemon() / stop_daemon()','daemon_addr() / daemon_responding()'],
+      body:['/tmp/aeyes — world-shared','2 writers, no lockfile','addr written before bind','kill with no pid verification','7 tests clobber live state','activity copied into 9 handlers'] },
+    { ifaceClass:'narrow', ratio:8,
+      iface:['addr() -&gt; Result&lt;SocketAddr&gt;','stop() -&gt; Result&lt;()&gt;'],
+      body:['user-private runtime dir','one writer for state files','lockfile around check-then-act','pid verified before kill','activity owned by consumer','testable via temp dir'] }
+  )
+}
+];
+
+/* render cards */
+document.getElementById('cards').innerHTML = CARDS.map(c => `
+<section class="card p-6" id="${c.id.toLowerCase()}">
+  <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
+    <div class="flex items-start gap-3">
+      <div class="mono text-2xl font-bold text-slate-300 leading-none pt-0.5">${c.n}</div>
+      <div>
+        <h3 class="text-xl font-bold leading-snug">${c.title}</h3>
+        <div class="text-xs text-slate-400 mt-1 mono">${c.fids} · findings</div>
+      </div>
+    </div>
+    ${BADGE[c.strength]}
+  </div>
+
+  <dl class="kv mb-5">
+    <dt>Files</dt>
+    <dd class="mono text-xs space-y-0.5">${c.files.join("<br>")}</dd>
+  </dl>
+
+  <div class="grid md:grid-cols-2 gap-5 text-sm">
+    <div>
+      <div class="depthcap mb-1" style="padding-left:0">Problem</div>
+      <div class="text-slate-600 leading-relaxed">${c.problem}</div>
+    </div>
+    <div class="space-y-4">
+      <div>
+        <div class="depthcap mb-1" style="padding-left:0">Solution</div>
+        <div class="text-slate-600 leading-relaxed">${c.solution}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mt-5 pt-4 border-t border-slate-100">
+    <div class="depthcap mb-1" style="padding-left:0">Benefits — in terms of locality and leverage</div>
+    <div class="text-sm text-slate-600 leading-relaxed">${c.benefits}</div>
+  </div>
+
+  <div class="mt-5">${c.diagram}</div>
+</section>`).join('');
+
+/* ------------------------------------------------------------------ */
+/* Appendix                                                            */
+/* ------------------------------------------------------------------ */
+document.getElementById('appendix-body').innerHTML = `
+<div class="border-l-2 border-slate-200 pl-4 py-1">
+  <div class="font-semibold text-slate-800">F13 — Test locality <span class="badge b-spec ml-1">Speculative</span></div>
+  <p class="text-slate-600 mt-1">The fakes that stand in for the camera seam —
+  <span class="mono">FakeBackend</span> (2896), <span class="mono">FakeOpenCamera</span> (2903) — sit at
+  the <em>bottom</em> of the file, roughly 2,000 lines below the production code they model. The seam
+  is real; only the proximity is wrong. Separately, everything that shells out to
+  <span class="mono">v4l2-ctl</span> (245, 968, 1216) has no seam at all and is untested —
+  <span class="mono">test_native_backend_list_cameras_works</span> (3332) discards its result with
+  <span class="mono">let _cams = …</span> and asserts nothing. A module that owns "what does this device
+  support" would give all of it a testable interface.</p>
+</div>
+<div class="border-l-2 border-slate-200 pl-4 py-1">
+  <div class="font-semibold text-slate-800">F12 (negative result) — lock discipline <span class="badge b-spec ml-1">Already correct</span></div>
+  <p class="text-slate-600 mt-1">Recorded because a review that only finds problems is less trustworthy.
+  There is <strong>no nested-lock or lock-ordering hazard</strong> in this codebase. Every handler takes
+  exactly one guard at a time and drops it at statement end. The state friction here is the shallow
+  <span class="mono">OptionChromeSession</span> newtype and the per-request full-JPEG clone under a
+  shared lock (1833, 1899, 1928) — which at <span class="mono">video_http</span>'s 60fps ceiling is 60
+  full-image memcpys per second.</p>
+</div>
+<div class="border-l-2 border-slate-200 pl-4 py-1">
+  <div class="font-semibold text-slate-800">Deep modules worth protecting</div>
+  <p class="text-slate-600 mt-1">Not every seam should move.
+  <span class="mono">push_yuv_pixel</span> (2778), <span class="mono">encode_rgb_to_jpeg</span> (2589),
+  the <span class="mono">OpenCamera</span> implementations (543, 601), the
+  <span class="mono">ExposureController</span> state machine (1167) and
+  <span class="mono">DaemonErrorState</span> (219) all pass the deletion test today — deleting them
+  moves complexity rather than concentrating it. A deepening pass should leave these alone.</p>
+</div>
+<div class="border-l-2 border-slate-200 pl-4 py-1">
+  <div class="font-semibold text-slate-800">A9 — No <span class="mono">CONTEXT.md</span></div>
+  <p class="text-slate-600 mt-1">There is no recorded domain model, so this review had to take its names
+  from the code. Writing that glossary down — Frame, Camera, Stream, Capture Preset, Exposure, Chrome
+  Session — would give the next reviewer, and the next agent, a shared vocabulary to reason in.</p>
+</div>`;
+
+/* ------------------------------------------------------------------ */
+mermaid.initialize({startOnLoad:true,theme:'neutral',securityLevel:'loose',
+  flowchart:{curve:'basis',htmlLabels:true}});
+</script>
+</body>
+</html>
