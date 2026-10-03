@@ -1596,9 +1596,22 @@ pub async fn video_cmd(
     Ok(())
 }
 
+/// How long to wait for the daemon's TCP accept.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a download may stall between chunks before it is treated as dead.
+///
+/// This is deliberately an *idle* timeout rather than a total request deadline:
+/// `video_cmd` asks for up to 60 seconds of footage, so the daemon can legitimately
+/// take a minute or more to answer in full. A total deadline would truncate those
+/// downloads. What we actually want to bound is a daemon that accepts the
+/// connection and then goes quiet forever, which is what stalled the CLI before.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn http_get_bytes(addr: SocketAddr, path: &str) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(IDLE_READ_TIMEOUT)
         .build()
         .context("failed to build HTTP client")?;
     let resp = client
