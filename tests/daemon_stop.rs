@@ -20,6 +20,7 @@ use std::process::Command;
 
 /// An ephemeral port that is free right now, so nothing the test does can collide
 /// with a daemon actually running on this machine.
+#[cfg(target_os = "linux")]
 fn free_port() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr")
