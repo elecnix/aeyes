@@ -23,8 +23,16 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-/// An ephemeral port that is free right now, so nothing the test does can collide
-/// with a daemon actually running on this machine.
+/// An ephemeral port in the kernel's ephemeral range, for tests that need a
+/// port *nobody is listening on*.
+///
+/// The listener is dropped before the port is handed out, so this is a
+/// momentary claim, not a reservation — another process could in principle take
+/// the port in the gap. That is the standard trade-off for this technique and it
+/// is acceptable here because the assertions do not depend on the port staying
+/// empty: a bystander that grabbed it would answer the identity probe as
+/// "not aeyes", which is exactly what these tests want to see. What this does
+/// guarantee is that the port is not the fixed 43210 a real daemon uses.
 #[cfg(target_os = "linux")]
 fn free_port() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -79,9 +87,24 @@ impl RecordingPeer {
                 let Ok(mut stream) = stream else { break };
                 let log = Arc::clone(&log);
                 std::thread::spawn(move || {
-                    let mut buf = [0u8; 1024];
-                    let read = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    // Read until the end of the request headers. A single `read` can
+                    // return a partial line, and stopping at the first `\r\n` would both
+                    // mis-parse a truncated request and leave the peer's write half
+                    // unfinished, which the client sees as a broken connection.
+                    let mut raw: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match std::io::Read::read(&mut stream, &mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&chunk[..n]);
+                                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&raw).to_string();
                     let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
                     let body: Option<Vec<u8>> = match path.as_str() {
                         "/health" => Some(b"ok".to_vec()),
@@ -254,11 +277,20 @@ fn stop_keeps_the_registry_when_the_pid_is_live_but_uninspectable() {
         .expect("spawn");
     let pid = child.id();
 
-    // Wait for the uninspectable state to be real, not a race we happened to win.
-    let uninspectable = (0..200).any(|_| {
-        Path::new(&format!("/proc/{pid}")).exists()
+    // Wait for the uninspectable state to be real rather than a race we happened
+    // to win. The sleep matters as much as the poll: the child may still be
+    // running on the first attempt, and an unslept loop burns all its attempts
+    // before the state it is waiting for exists.
+    let mut uninspectable = false;
+    for _ in 0..500 {
+        if Path::new(&format!("/proc/{pid}")).exists()
             && std::fs::read_link(format!("/proc/{pid}/exe")).is_err()
-    });
+        {
+            uninspectable = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(
         uninspectable,
         "PID {pid} never reached a state with a /proc entry but no readable exe"

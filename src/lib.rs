@@ -1599,11 +1599,12 @@ enum PidVerdict {
 ///   symlinked directory sits between them — which would turn the real daemon
 ///   into the very `Foreign` verdict this check exists to avoid.
 ///   An unreadable `/proc/<pid>/exe` — the process is alive but owned by another
-///   user, or `/proc` is mounted `hidepid` — reads as `Unreadable`, i.e.
+///   user — reads as `Unreadable`, i.e.
 ///   fail-closed *and* registry-preserving. Mapping it to `Absent` would be a
 ///   lie that costs the user their only handle on a daemon they cannot signal
 ///   anyway. A genuinely dead pid reads as `Absent`, which does clear the
-///   registry.
+///   registry. A `hidepid` mount defeats the distinction entirely; see
+///   `verdict_for_unreadable_exe` for that limit.
 /// * Other unix — `kill -0` proves a process exists but says nothing about which
 ///   executable it is, so the answer is `Alive`: identity is not checkable
 ///   without adding a dependency, and liveness is the best available proxy.
@@ -1664,6 +1665,17 @@ fn classify_daemon_pid(pid: u32) -> PidVerdict {
 /// process whose only handle is the pid file, and clearing that file is exactly
 /// the mistake this module exists to avoid.
 ///
+/// **Known limit:** on a `hidepid` mount the `/proc/<pid>` directory of another
+/// user's process is hidden as well, so `proc_entry_exists` is false and the
+/// verdict collapses back to `Absent` — the pre-`Unreadable` behaviour, registry
+/// cleared and all. Nothing inside this process can do better: `kill -0` is not a
+/// usable tiebreaker because a shell reports EPERM and ESRCH with the same exit
+/// code, so an invisible-but-live pid is indistinguishable from a dead one.
+/// `hidepid` is off by default, but on a host that enables it, cross-user
+/// `aeyes stop` falls back to the old behaviour. That is why the doc on
+/// `classify_daemon_pid` names `hidepid` as an additional trigger for
+/// `Unreadable` rather than promising it.
+///
 /// Split out so the mapping is testable — an unprivileged test binary cannot
 /// arrange for a process it may not inspect.
 #[cfg(target_os = "linux")]
@@ -1687,7 +1699,10 @@ fn verdict_for_unreadable_exe(proc_entry_exists: bool) -> PidVerdict {
 ///
 /// So compare device+inode when the kernel will tell us — that is exact and
 /// immune to path spelling — then fall back to canonical paths for the cases
-/// where `stat` is unavailable, and only then to a literal comparison.
+/// where `stat` is unavailable. The literal comparison is the *first* line, not
+/// a last resort: if neither `stat` nor `canonicalize` can say anything and the
+/// two strings already differed, there is no evidence left either way, and the
+/// answer is "not ours".
 ///
 /// Linux-only: this exists solely for the `/proc/<pid>/exe` check in
 /// `classify_daemon_pid`, and gating it keeps the other targets free of the
@@ -4488,9 +4503,24 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let mut buf = [0u8; 1024];
-                let read = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                // Read until the end of the request headers. A single `read` can
+                // return a partial line, and stopping at the first `\r\n` would both
+                // mis-parse a truncated request and leave the peer's write half
+                // unfinished, which the client sees as a broken connection.
+                let mut raw: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match std::io::Read::read(&mut stream, &mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            raw.extend_from_slice(&chunk[..n]);
+                            if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&raw).to_string();
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let response = match handler(&path) {
                     Some(body) => {
