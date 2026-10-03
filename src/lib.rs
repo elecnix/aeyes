@@ -1414,14 +1414,23 @@ pub async fn stop_daemon() -> Result<()> {
     // A daemon started outside `aeyes start` serves its port without ever
     // publishing the registry, and `stop` must still reach it instead of
     // announcing victory over a port it never touched.
+    //
+    // Both branches ask the peer *who it is* (`aeyes_responding`) before this
+    // function sends anything at it. Reachability is the wrong question here:
+    // the consequence of a wrong answer is a `GET /shutdown` delivered to an
+    // unrelated process.
     let registered = daemon_addr().await.ok();
     let mut unregistered = false;
     let target = match registered {
-        Some(addr) if daemon_responding(addr).await => Some(addr),
+        // Identity here too, and not only on the fallback branch: this function
+        // acts destructively on whatever `target` names — it sends `/shutdown`
+        // and reports success. The registry file was written by a daemon that
+        // has since died, and the OS is happy to hand its port to anyone, so a
+        // bare connect here would aim the same `/shutdown` at a stranger. If the
+        // identity check fails we fall through to the pid path below, which
+        // still stops a daemon of ours that has gone unresponsive.
+        Some(addr) if aeyes_responding(addr).await => Some(addr),
         _ => match fallback_probe_addr() {
-            // Identity, not mere reachability: this branch is about to send
-            // `/shutdown` at whatever answers and then report success, so a bare
-            // connect would aim that at any unrelated service holding the port.
             Some(addr) if aeyes_responding(addr).await => {
                 unregistered = true;
                 Some(addr)
@@ -1775,11 +1784,15 @@ pub async fn status_cmd() -> Result<()> {
 /// Can we open a TCP connection to `addr`?
 ///
 /// This is a *reachability* check and nothing more: it does not establish that
-/// the peer speaks HTTP, let alone that it is aeyes. That is enough for the
-/// address this process published in the registry — it wrote the file itself
-/// after its own successful bind — and for the polling loops around
-/// `ensure_daemon_running`. Anywhere a decision is made *about* the peer rather
-/// than about our own daemon, use [`aeyes_responding`].
+/// the peer speaks HTTP, let alone that it is aeyes. That is enough where we
+/// are asking about something this process owns or merely reporting on it — the
+/// address this process wrote into the registry after its own successful bind,
+/// and the readiness loops around `ensure_daemon_running`.
+///
+/// It is not enough where we act on the peer. `stop_daemon` sends
+/// `GET /shutdown`, so both of its target-selection branches use
+/// [`aeyes_responding`] instead: a daemon can die between writing the registry
+/// and being stopped, and the OS will hand its port to anything.
 async fn daemon_responding(addr: SocketAddr) -> bool {
     TcpStream::connect(addr).await.is_ok()
 }

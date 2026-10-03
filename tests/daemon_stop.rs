@@ -317,6 +317,38 @@ fn stop_keeps_the_registry_when_the_pid_is_live_but_uninspectable() {
     );
 }
 
+/// The same identity check has to cover the *registered* address, not only the
+/// fallback.
+///
+/// `daemon.addr` was written by a daemon that has since died; the OS is free to
+/// hand that port to anything. If `stop` trusted the file and used a bare
+/// connect, it would deliver `GET /shutdown` to that stranger — the same harm
+/// as the fallback case, reached without the probe.
+///
+/// Pre-fix this fails: the registered branch used `daemon_responding`, which is
+/// a bare connect.
+#[test]
+fn stop_does_not_shut_down_a_foreign_service_at_the_registered_address() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = dir.path().join("aeyes");
+    std::fs::create_dir_all(&registry).expect("create registry dir");
+
+    let peer = RecordingPeer::start(false);
+    std::fs::write(registry.join("daemon.addr"), peer.addr.to_string()).expect("write addr file");
+
+    // Probe a port nobody is on, so the registered address is the only candidate.
+    let quiet = RecordingPeer::start(false);
+    let out = aeyes(dir.path(), quiet.addr, &["stop"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !peer.await_request("/shutdown"),
+        "aeyes stop sent /shutdown to a foreign service at the registered address {} (requests: {:?}); stdout: {stdout}",
+        peer.addr,
+        peer.paths()
+    );
+}
+
 /// The fallback probe must establish that the peer is *aeyes* before `stop`
 /// points a `GET /shutdown` at it.
 ///
