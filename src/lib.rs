@@ -1639,7 +1639,10 @@ fn action_for_verdict(verdict: PidVerdict) -> PidAction {
 /// proves a process exists without naming its executable, and Windows offers no
 /// probe worth the name here. The three cases stay distinct because only one of
 /// them permits `Absent`, and `Absent` is the verdict that clears the registry.
+// Windows constructs only `Unprobed` and Linux constructs none of them, so both
+// ends silence the variants they never build.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(windows, allow(dead_code))]
 enum PidLiveness {
     /// A probe ran and said a process is there.
     Alive,

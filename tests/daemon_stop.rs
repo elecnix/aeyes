@@ -26,17 +26,39 @@ use std::sync::{Arc, Mutex};
 /// An ephemeral port in the kernel's ephemeral range, for tests that need a
 /// port *nobody is listening on*.
 ///
-/// The listener is dropped before the port is handed out, so this is a
-/// momentary claim, not a reservation — another process could in principle take
-/// the port in the gap. That is the standard trade-off for this technique and it
-/// is acceptable here because the assertions do not depend on the port staying
-/// empty: a bystander that grabbed it would answer the identity probe as
-/// "not aeyes", which is exactly what these tests want to see. What this does
-/// guarantee is that the port is not the fixed 43210 a real daemon uses.
+/// Binding port 0 and reading the number back is only a momentary claim: the
+/// listener is closed before the caller ever sees the port, and from that
+/// instant anyone may take it — another test binary in the same CI run, or a
+/// real daemon on the machine. So the port is re-bound before it is handed
+/// out: if that second bind fails, something already owns the port and we try
+/// another one. That is what makes `free_port` never *return* a port that is
+/// bound.
+///
+/// It does not make the port safe, and the doc says so rather than pretending
+/// otherwise. The confirming listener is dropped again before this function
+/// returns, leaving a window a few microseconds wide in which the caller can
+/// still lose the race — which cannot be closed while the interface is a port
+/// *number*, since the caller has to bind it itself. What the assertions in
+/// this file tolerate is a stranger taking the port: it answers the identity
+/// probe as "not aeyes", which is the outcome most of these tests assert
+/// anyway. The check removes the wide, common case (a port that was already
+/// claimed before the test even started looking) and leaves the narrow one.
 #[cfg(target_os = "linux")]
 fn free_port() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr")
+    for _ in 0..16 {
+        let addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            listener.local_addr().expect("local addr")
+        };
+        // Nothing is holding `addr` yet as far as we know; re-binding is the
+        // only evidence obtainable, and its failure is the only evidence that
+        // matters.
+        match TcpListener::bind(addr) {
+            Ok(_) => return addr,
+            Err(_) => continue,
+        }
+    }
+    panic!("no unclaimed ephemeral port in 16 attempts; the ephemeral range is exhausted");
 }
 
 /// Run the real `aeyes` binary with the registry and the fallback probe pointed
