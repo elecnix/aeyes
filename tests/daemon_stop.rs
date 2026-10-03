@@ -229,6 +229,62 @@ fn refusal_to_signal_keeps_the_runtime_registry() {
     );
 }
 
+/// A live pid whose executable cannot be read must not be treated as a pid that
+/// is not there.
+///
+/// `fs::read_link("/proc/<pid>/exe")` fails both when the pid is gone and when
+/// the process is not ours to inspect — another user owns it, `/proc` is
+/// mounted `hidepid`. Collapsing the two into `Absent` meant `stop` deleted the
+/// registry while a live process held the port. A zombie reproduces the exact
+/// shape (`/proc/<pid>` present, `exe` unreadable) and is the only version of it
+/// an unprivileged test binary can arrange.
+///
+/// Only Linux: `/proc` is the whole mechanism.
+#[cfg(target_os = "linux")]
+#[test]
+fn stop_keeps_the_registry_when_the_pid_is_live_but_uninspectable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // A child that exits but is never waited on stays in the process table.
+    let mut child = Command::new("true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+
+    // Wait for the uninspectable state to be real, not a race we happened to win.
+    let uninspectable = (0..200).any(|_| {
+        Path::new(&format!("/proc/{pid}")).exists()
+            && std::fs::read_link(format!("/proc/{pid}/exe")).is_err()
+    });
+    assert!(
+        uninspectable,
+        "PID {pid} never reached a state with a /proc entry but no readable exe"
+    );
+
+    let registry = dir.path().join("aeyes");
+    std::fs::create_dir_all(&registry).expect("create registry dir");
+    let pid_file = registry.join("daemon.pid");
+    std::fs::write(&pid_file, pid.to_string()).expect("write pid file");
+
+    let out = aeyes(dir.path(), free_port(), &["stop"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let _ = child.wait();
+
+    assert!(
+        stdout.contains("Did NOT stop"),
+        "stop signalled a pid it could not confirm was its own; stdout: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pid_file).ok(),
+        Some(pid.to_string()),
+        "stop deleted the runtime registry for a live-but-uninspectable pid; stdout: {stdout}"
+    );
+}
+
 /// The fallback probe must establish that the peer is *aeyes* before `stop`
 /// points a `GET /shutdown` at it.
 ///

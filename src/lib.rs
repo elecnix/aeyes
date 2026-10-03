@@ -1492,6 +1492,18 @@ pub async fn stop_daemon() -> Result<()> {
                     );
                     refused = Some(pid);
                 }
+                PidVerdict::Unreadable => {
+                    // Alive, but `/proc/<pid>/exe` could not be read — another
+                    // user owns it, `/proc` is mounted `hidepid`, or our own
+                    // `current_exe` failed. We cannot prove it is ours and we
+                    // cannot prove it is not, so we refuse exactly as for
+                    // `Foreign` and, for the same reason, keep the registry.
+                    warn!(
+                        pid,
+                        "pid file names a live process whose executable could not be read; refusing to signal it"
+                    );
+                    refused = Some(pid);
+                }
             }
         }
     }
@@ -1502,7 +1514,7 @@ pub async fn stop_daemon() -> Result<()> {
         // the next `stop` would find no registry at all and fall back to
         // probing the bind address.
         println!(
-            "Did NOT stop PID {pid}: it is alive but is running a different executable, so signalling it could kill an unrelated process. The runtime registry has been left in place; stop that process yourself if it really is an aeyes daemon."
+            "Did NOT stop PID {pid}: it is alive but running a process aeyes cannot confirm is its own daemon, so signalling it could kill an unrelated process. The runtime registry has been left in place; stop that process yourself if it really is an aeyes daemon."
         );
         return Ok(());
     }
@@ -1551,7 +1563,7 @@ fn publish_runtime_registry(bind: SocketAddr) -> Result<()> {
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum PidVerdict {
-    /// No such process, or one whose `/proc` entry we may not read.
+    /// No such process.
     Absent,
     /// The process is running this very executable.
     Ours,
@@ -1559,6 +1571,9 @@ enum PidVerdict {
     Alive,
     /// The process is alive and is provably running a *different* executable.
     Foreign,
+    /// The process is alive but its executable could not be read, so there is
+    /// no way to tell ours from a stranger's.
+    Unreadable,
 }
 
 /// Classify the pid named by the runtime registry.
@@ -1582,9 +1597,13 @@ enum PidVerdict {
 ///   because `read_link` returns a kernel-resolved path while `current_exe` is
 ///   derived from `/proc/self/exe` and the two spellings diverge as soon as a
 ///   symlinked directory sits between them — which would turn the real daemon
-///   into the very `Foreign` verdict this check exists to avoid. An unreadable
-///   `/proc/<pid>/exe` — no such process, or one owned by another user — reads
-///   as `Absent`, i.e. fail-closed.
+///   into the very `Foreign` verdict this check exists to avoid.
+///   An unreadable `/proc/<pid>/exe` — the process is alive but owned by another
+///   user, or `/proc` is mounted `hidepid` — reads as `Unreadable`, i.e.
+///   fail-closed *and* registry-preserving. Mapping it to `Absent` would be a
+///   lie that costs the user their only handle on a daemon they cannot signal
+///   anyway. A genuinely dead pid reads as `Absent`, which does clear the
+///   registry.
 /// * Other unix — `kill -0` proves a process exists but says nothing about which
 ///   executable it is, so the answer is `Alive`: identity is not checkable
 ///   without adding a dependency, and liveness is the best available proxy.
@@ -1601,12 +1620,15 @@ enum PidVerdict {
 fn classify_daemon_pid(pid: u32) -> PidVerdict {
     #[cfg(target_os = "linux")]
     {
-        // An unresolvable /proc/<pid>/exe means there is no process we may touch.
+        // An unresolvable /proc/<pid>/exe means either the pid is gone or the
+        // process is not ours to inspect. Those are not the same answer and
+        // must not get the same treatment: the first leaves nothing running,
+        // the second leaves a live process whose only handle is the pid file.
         let Ok(theirs) = fs::read_link(format!("/proc/{pid}/exe")) else {
-            return PidVerdict::Absent;
+            return verdict_for_unreadable_exe(Path::new(&format!("/proc/{pid}")).exists());
         };
         let Ok(ours) = env::current_exe() else {
-            return PidVerdict::Foreign;
+            return PidVerdict::Unreadable;
         };
         if same_executable(&ours, &theirs) {
             PidVerdict::Ours
@@ -1631,6 +1653,25 @@ fn classify_daemon_pid(pid: u32) -> PidVerdict {
     {
         let _ = pid;
         PidVerdict::Alive
+    }
+}
+
+/// What an unreadable `/proc/<pid>/exe` means.
+///
+/// `read_link` fails both when the pid is gone and when the process belongs to
+/// another user (or `/proc` is mounted `hidepid`). Those must not collapse into
+/// one verdict: the first leaves nothing running, the second leaves a live
+/// process whose only handle is the pid file, and clearing that file is exactly
+/// the mistake this module exists to avoid.
+///
+/// Split out so the mapping is testable — an unprivileged test binary cannot
+/// arrange for a process it may not inspect.
+#[cfg(target_os = "linux")]
+fn verdict_for_unreadable_exe(proc_entry_exists: bool) -> PidVerdict {
+    if proc_entry_exists {
+        PidVerdict::Unreadable
+    } else {
+        PidVerdict::Absent
     }
 }
 
@@ -4631,6 +4672,34 @@ mod tests {
         assert!(
             matches!(classify_daemon_pid(std::process::id()), PidVerdict::Ours),
             "the running aeyes executable was not recognised as our own"
+        );
+    }
+
+    /// A pid that is definitely gone must read as `Absent`, which is the only
+    /// verdict that lets `stop` clear the registry.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn classify_daemon_pid_reports_a_dead_pid_as_absent() {
+        // `u32::MAX` as a pid is well past `pid_max` on any sane kernel.
+        assert!(
+            matches!(classify_daemon_pid(u32::MAX), PidVerdict::Absent),
+            "a pid with no /proc entry was not classified Absent"
+        );
+    }
+
+    /// An unreadable `/proc/<pid>/exe` must not be confused with a pid that is
+    /// not there. The first is a live process we refuse to signal and keep a
+    /// handle on; the second is nothing, and the registry may be cleared.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unreadable_exe_is_not_the_same_as_no_such_process() {
+        assert!(
+            matches!(verdict_for_unreadable_exe(true), PidVerdict::Unreadable),
+            "a live process with an unreadable exe was classified as if nothing were running"
+        );
+        assert!(
+            matches!(verdict_for_unreadable_exe(false), PidVerdict::Absent),
+            "a pid with no /proc entry was not classified Absent"
         );
     }
 }
