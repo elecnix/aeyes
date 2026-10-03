@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
@@ -39,7 +39,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{broadcast, Mutex, RwLock},
     time::sleep,
@@ -1598,25 +1597,23 @@ pub async fn video_cmd(
 }
 
 async fn http_get_bytes(addr: SocketAddr, path: &str) -> Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(addr).await?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    parse_http_response(&buf)
-}
-
-pub fn parse_http_response(buf: &[u8]) -> Result<Vec<u8>> {
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .ok_or_else(|| anyhow!("invalid HTTP response"))?;
-    let headers = String::from_utf8_lossy(&buf[..split]);
-    let status_line = headers.lines().next().unwrap_or("HTTP error").to_string();
-    let body = &buf[split..];
-    if !(headers.starts_with("HTTP/1.1 200") || headers.starts_with("HTTP/1.0 200")) {
-        let detailed = parse_error_response_body(body).unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client")?;
+    let resp = client
+        .get(format!("http://{addr}{path}"))
+        .send()
+        .await
+        .with_context(|| format!("failed to GET {path}"))?;
+    let status = resp.status();
+    let body = resp
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read response body for {path}"))?;
+    if !status.is_success() {
+        let status_line = status.to_string();
+        let detailed = parse_error_response_body(&body).unwrap_or_default();
         if detailed.is_empty() {
             bail!(status_line);
         }
@@ -3042,33 +3039,60 @@ mod tests {
         assert_eq!(camera_index_to_id(&CameraIndex::Index(42)), "42");
     }
 
-    #[test]
-    fn test_parse_http_response_http10() {
-        let body = parse_http_response(b"HTTP/1.0 200 OK\r\n\r\nabc").unwrap();
+    /// Serve one raw HTTP response on an ephemeral port and return the address.
+    async fn spawn_raw_http_server(response: &'static [u8]) -> SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while sock.read(&mut byte).await.unwrap_or(0) == 1 {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sock.write_all(response).await.unwrap();
+        });
+        addr
+    }
+
+    /// The caller contract is bytes-in / bytes-out; a chunked reply must reach
+    /// the caller decoded, not as chunk-size framing.
+    #[tokio::test]
+    async fn test_http_get_bytes_decodes_chunked_response() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: video/x-msvideo\r\nTransfer-Encoding: chunked\r\n\r\n15\r\nABCDEFGHIJKLMNOPQRSTU\r\na\r\n0123456789\r\n0\r\n\r\n";
+        let addr = spawn_raw_http_server(response).await;
+        let body = http_get_bytes(addr, "/cams/default/video").await.unwrap();
+        assert_eq!(body, b"ABCDEFGHIJKLMNOPQRSTU0123456789");
+    }
+
+    #[tokio::test]
+    async fn test_http_get_bytes_returns_body_for_content_length() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+        let addr = spawn_raw_http_server(response).await;
+        let body = http_get_bytes(addr, "/cams/default/frame").await.unwrap();
         assert_eq!(body, b"abc");
     }
 
-    #[test]
-    fn test_parse_http_response_no_boundary() {
-        let err = parse_http_response(b"HTTP/1.1 200 OK\r\nabc")
+    /// Error messages keep the daemon's `{error, details}` shape: the status,
+    /// the error, and details joined with " | ".
+    #[tokio::test]
+    async fn test_http_get_bytes_surfaces_error_details() {
+        let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 74\r\n\r\n{\"error\":\"failed to capture\",\"details\":[\"camera id: cam-a\",\"device busy\"]}";
+        let addr = spawn_raw_http_server(response).await;
+        let err = http_get_bytes(addr, "/cams/cam-a/frame")
+            .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("invalid HTTP response"));
-    }
-
-    #[test]
-    fn test_parse_http_response_extracts_body() {
-        let body = parse_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").unwrap();
-        assert_eq!(body, b"abc");
-    }
-
-    #[test]
-    fn test_parse_http_response_rejects_non_200_with_details() {
-        let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\r\n{\"error\":\"failed to capture\",\"details\":[\"camera id: cam-a\",\"device busy\"]}";
-        let err = parse_http_response(response).unwrap_err().to_string();
-        assert!(err.contains("503"));
-        assert!(err.contains("failed to capture"));
-        assert!(err.contains("device busy"));
+        assert!(err.contains("503"), "{err}");
+        assert!(err.contains("failed to capture"), "{err}");
+        assert!(
+            err.contains("failed to capture [camera id: cam-a | device busy]"),
+            "{err}"
+        );
     }
 
     #[test]
