@@ -33,7 +33,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     env, fs,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -1410,7 +1410,24 @@ pub async fn start_daemon(
 }
 
 pub async fn stop_daemon() -> Result<()> {
-    if let Ok(addr) = daemon_addr().await {
+    // Prefer the registered address, but fall back to probing the bind address.
+    // A daemon started outside `aeyes start` serves its port without ever
+    // publishing the registry, and `stop` must still reach it instead of
+    // announcing victory over a port it never touched.
+    let registered = daemon_addr().await.ok();
+    let mut unregistered = false;
+    let target = match registered {
+        Some(addr) if daemon_responding(addr).await => Some(addr),
+        _ => match fallback_probe_addr() {
+            Some(addr) if daemon_responding(addr).await => {
+                unregistered = true;
+                Some(addr)
+            }
+            _ => None,
+        },
+    };
+
+    if let Some(addr) = target {
         let _ = http_get_bytes(addr, "/shutdown").await;
         for _ in 0..20 {
             if !daemon_responding(addr).await {
@@ -1418,35 +1435,72 @@ pub async fn stop_daemon() -> Result<()> {
             }
             sleep(Duration::from_millis(100)).await;
         }
+        if unregistered {
+            // There is no registry entry for this daemon, so there is no pid we
+            // can attribute to it; signalling anything here would be a guess.
+            let _ = fs::remove_file(pid_path());
+            let _ = fs::remove_file(addr_path());
+            println!(
+                "Daemon stopped at http://{addr} (found by probing the bind address; it had no runtime registry entry, so it was not started by `aeyes start`)."
+            );
+            return Ok(());
+        }
     }
 
+    // `refused` records a daemon we deliberately declined to signal. Reporting
+    // success for a kill that never happened is worse than reporting nothing: it
+    // tells the user the daemon is gone while it is still serving.
+    let mut refused: Option<u32> = None;
     if let Ok(pid_str) = fs::read_to_string(pid_path()) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            if !daemon_process_alive(pid) {
-                // Stale or recycled pid: signalling it would hit an unrelated
-                // process. Clearing the registry below is still correct.
-                warn!(pid, "pid file names no live aeyes daemon; skipping kill");
-            } else {
-                #[cfg(unix)]
-                {
-                    let _ = tokio::process::Command::new("kill")
-                        .arg(pid.to_string())
-                        .status()
-                        .await;
+            match classify_daemon_pid(pid) {
+                PidVerdict::Absent => {
+                    // Stale or recycled pid: nothing is running there to signal,
+                    // and clearing the registry below is still correct.
+                    warn!(pid, "pid file names no live process; skipping kill");
                 }
-                #[cfg(windows)]
-                {
-                    let _ = tokio::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/F"])
-                        .status()
-                        .await;
+                PidVerdict::Ours | PidVerdict::Alive => {
+                    #[cfg(unix)]
+                    {
+                        let _ = tokio::process::Command::new("kill")
+                            .arg(pid.to_string())
+                            .status()
+                            .await;
+                    }
+                    #[cfg(windows)]
+                    {
+                        let _ = tokio::process::Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/F"])
+                            .status()
+                            .await;
+                    }
+                }
+                PidVerdict::Foreign => {
+                    // A live process, but provably not this executable: a daemon
+                    // from another install prefix, a `cargo run` build, a copied
+                    // or renamed binary. Signalling it would be a guess, so we
+                    // refuse — and we say so, because this branch used to print
+                    // "Daemon stopped." while leaving the daemon running.
+                    warn!(
+                        pid,
+                        "pid file names a different executable; refusing to signal it"
+                    );
+                    refused = Some(pid);
                 }
             }
         }
     }
     let _ = fs::remove_file(pid_path());
     let _ = fs::remove_file(addr_path());
-    println!("Daemon stopped.");
+    match refused {
+        Some(pid) => println!(
+            "Did NOT stop PID {pid}: it is alive but is running a different executable, so signalling it could kill an unrelated process. The stale runtime registry has been cleared; stop that process yourself if it really is an aeyes daemon."
+        ),
+        // Either we signalled the pid, or `PidVerdict::Absent` proved nothing is
+        // running there. Both satisfy the command's contract: no daemon of ours
+        // is left serving.
+        None => println!("Daemon stopped."),
+    }
     Ok(())
 }
 
@@ -1462,6 +1516,13 @@ pub async fn stop_daemon() -> Result<()> {
 /// must not touch the registry — notably the test suite, which binds throwaway
 /// ports and would otherwise clobber the pid/addr files of a daemon actually
 /// running on this machine.
+///
+/// The flip side is that a daemon started any other way — `run_daemon_from_env`
+/// invoked directly, or under a supervisor — binds its port but registers
+/// nothing. That is intended: an unregistered process must not be able to point
+/// `status` and `stop` at a pid we never verified. `status` and `stop` cover the
+/// gap by probing the fallback bind address (`fallback_probe_addr`) and saying
+/// plainly that the daemon they found has no registry entry.
 fn publish_runtime_registry(bind: SocketAddr) -> Result<()> {
     if env::var("AEYES_DAEMON").ok().as_deref() != Some("1") {
         return Ok(());
@@ -1472,52 +1533,130 @@ fn publish_runtime_registry(bind: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-/// Whether `pid` is a process we may safely signal on behalf of `stop_daemon`.
+/// What `stop_daemon` could establish about the pid named in the registry.
+///
+/// Each platform only ever produces some of these — see `classify_daemon_pid` —
+/// so the unused ones are silenced per target rather than crate-wide.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum PidVerdict {
+    /// No such process, or one whose `/proc` entry we may not read.
+    Absent,
+    /// The process is running this very executable.
+    Ours,
+    /// The process is alive but its identity is not checkable on this platform.
+    Alive,
+    /// The process is alive and is provably running a *different* executable.
+    Foreign,
+}
+
+/// Classify the pid named by the runtime registry.
 ///
 /// The registry goes stale whenever a daemon dies, fails to bind, or loses a
-/// start-up race, and the OS recycles stale pids. Signalling a recycled pid would
-/// take down an unrelated process, so `stop_daemon` checks first. This deliberately
-/// errs towards "do not kill": the HTTP `/shutdown` path runs first and handles the
-/// normal case, so a missed force-kill is far cheaper than killing a bystander.
+/// start-up race, and the OS recycles stale pids. Signalling a recycled pid
+/// would take down an unrelated process, so `stop_daemon` asks this first. It
+/// deliberately errs towards "do not kill": the HTTP `/shutdown` path runs
+/// beforehand and handles the normal case, so a declined force-kill is far
+/// cheaper than killing a bystander.
 ///
-/// The strength of the check is platform-dependent, because a dependency-free
-/// identity check only exists on Linux:
+/// The strength of the answer is platform-dependent, because a dependency-free
+/// identity check only exists on Linux. **This function does not always answer
+/// the identity question**, and the asymmetry is deliberate:
 ///
-/// * Linux — identity. `/proc/<pid>/exe` must resolve to the very executable we
-///   are running, so a shell, an editor, or a build whose *path* happens to
-///   contain "aeyes" is correctly rejected.
-/// * Other unix — liveness only, via `kill -0`. Identity is not available without
-///   pulling in a dependency.
-/// * Windows — no cheap check, so the previous unconditional behaviour is kept.
-fn daemon_process_alive(pid: u32) -> bool {
+/// * Linux — a real identity check. `/proc/<pid>/exe` must resolve to the very
+///   executable we are running, so a shell running `aeyes stop`, an editor with
+///   the checkout open, or a build under a directory that merely contains
+///   "aeyes" all resolve elsewhere and are rejected as `Foreign`. An
+///   unreadable `/proc/<pid>/exe` — no such process, or one owned by another
+///   user — reads as `Absent`, i.e. fail-closed.
+/// * Other unix — `kill -0` proves a process exists but says nothing about which
+///   executable it is, so the answer is `Alive`: identity is not checkable
+///   without adding a dependency, and liveness is the best available proxy.
+///   Fail-open, deliberately.
+/// * Windows — no check at all: this returns `Alive` for **every** pid, live,
+///   dead or recycled. `stop_daemon` therefore signals whatever the pid file
+///   names and relies on `taskkill` failing for a pid that no longer exists.
+///   That is the pre-existing behaviour, kept because refusing every kill on
+///   Windows would remove the only stop path that works when `/shutdown` is
+///   unreachable. The cost is real: on Windows a stale or recycled pid can be
+///   signalled, so treat `aeyes stop` there as best-effort. Closing this needs
+///   a genuine mechanism — a pid/creation-time pair published at bind time, or
+///   a Win32 process-query dependency — not a better doc comment.
+fn classify_daemon_pid(pid: u32) -> PidVerdict {
     #[cfg(target_os = "linux")]
     {
-        // An unresolvable /proc/<pid>/exe means there is no such process.
+        // An unresolvable /proc/<pid>/exe means there is no process we may touch.
         let Ok(theirs) = fs::read_link(format!("/proc/{pid}/exe")) else {
-            return false;
+            return PidVerdict::Absent;
         };
-        env::current_exe().is_ok_and(|ours| ours == theirs)
+        match env::current_exe() {
+            Ok(ours) if ours == theirs => PidVerdict::Ours,
+            _ => PidVerdict::Foreign,
+        }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        std::process::Command::new("kill")
+        let alive = std::process::Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
             .status()
-            .is_ok_and(|status| status.success())
+            .is_ok_and(|status| status.success());
+        if alive {
+            PidVerdict::Alive
+        } else {
+            PidVerdict::Absent
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
-        true
+        PidVerdict::Alive
     }
 }
 
-pub async fn status_cmd() -> Result<()> {
-    match daemon_addr().await {
-        Ok(addr) if daemon_responding(addr).await => println!("Daemon running at http://{addr}"),
-        _ => println!("Daemon not running."),
+/// The address to probe when the runtime registry names nothing usable.
+///
+/// Probing it lets `status` and `stop` see a daemon that never published the
+/// registry, because the registry alone cannot distinguish "nothing is running"
+/// from "something is running that we have no record of". It honours `AEYES_BIND`
+/// — the same variable `run_daemon_from_env` and `ensure_daemon_running` read —
+/// so a daemon a supervisor started on a non-default port is still reachable.
+/// An unspecified bind address is normalised to loopback, since connecting to
+/// `0.0.0.0` is not portable.
+fn fallback_probe_addr() -> Option<SocketAddr> {
+    let addr: SocketAddr = env::var("AEYES_BIND")
+        .unwrap_or_else(|_| DEFAULT_BIND.to_string())
+        .parse()
+        .ok()?;
+    if addr.ip().is_unspecified() {
+        return Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            addr.port(),
+        ));
     }
+    Some(addr)
+}
+
+pub async fn status_cmd() -> Result<()> {
+    if let Ok(addr) = daemon_addr().await {
+        if daemon_responding(addr).await {
+            println!("Daemon running at http://{addr}");
+            return Ok(());
+        }
+    }
+    // No registry, or the registered address is dead. A daemon started outside
+    // `aeyes start` never publishes the registry, so probe the address it would
+    // have bound before reporting that nothing is running — "not running" for a
+    // port that is listening is a false negative the user cannot act on.
+    if let Some(addr) = fallback_probe_addr() {
+        if daemon_responding(addr).await {
+            println!(
+                "Daemon running at http://{addr} (not in the runtime registry — it was not started by `aeyes start`)"
+            );
+            return Ok(());
+        }
+    }
+    println!("Daemon not running.");
     Ok(())
 }
 
