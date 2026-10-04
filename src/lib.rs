@@ -4286,8 +4286,8 @@ mod tests {
 
         // Uniform blue frame; nothing is red until visualize_motion runs.
         let mut frame = vec![0u8; WIDTH * HEIGHT * 3];
-        for px in frame.chunks_exact_mut(3) {
-            px[2] = 200; // B
+        for i in 0..(WIDTH * HEIGHT) {
+            frame[i * 3 + 2] = 200; // B
         }
 
         // Motion at pixel (x=3, y=1) -> pixel index 1 * 4 + 3 = 7 -> byte 21.
@@ -4296,11 +4296,9 @@ mod tests {
 
         assert_eq!(vis.len(), frame.len());
 
-        let red_offsets: Vec<usize> = vis
-            .chunks_exact(3)
-            .enumerate()
-            .filter(|(_, px)| px[0] == 255 && px[1] == 0 && px[2] == 0)
-            .map(|(i, _)| i * 3)
+        let red_offsets: Vec<usize> = (0..(WIDTH * HEIGHT))
+            .filter(|&i| vis[i * 3] == 255 && vis[i * 3 + 1] == 0 && vis[i * 3 + 2] == 0)
+            .map(|i| i * 3)
             .collect();
         assert_eq!(
             red_offsets,
