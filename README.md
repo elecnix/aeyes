@@ -161,7 +161,7 @@ Together these are designed to ignore gradual global brightness changes, local s
 ### Known limitations
 
 - **No pre/post-roll buffer.** Sampling starts when the command is invoked, so there is no recording of the seconds *before* motion was detected and no automatic capture of the seconds after.
-- **The detector is not wired to the frame endpoint yet.** `LightingInvariantDetector::detect` expects raw RGB24 at the configured resolution, but `/cams/{id}/frame` serves a JPEG, so the buffer length never matches and the detector returns no detections. In practice `--wait` will run until `--timeout` and then fail. Related work is tracked in [the motion redesign issue](https://github.com/elecnix/aeyes/issues).
+- **The detector is not wired to the frame endpoint yet.** `LightingInvariantDetector::detect` expects raw RGB24 at the configured resolution, but `/cams/{id}/frame` serves a JPEG, so the buffer length never matches and the detector returns no detections. In practice `--wait` will run until `--timeout` and then fail. Related work is tracked in [issue #54](https://github.com/elecnix/aeyes/issues/54).
 - **Resolution is assumed.** The detector is currently constructed for 640x480 regardless of the camera's real resolution.
 
 ## Video Format
