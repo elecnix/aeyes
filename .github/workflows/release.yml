@@ -13,10 +13,12 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable (v1)
+        with:
+          toolchain: stable
       - name: Install Linux deps
         run: sudo apt-get update && sudo apt-get install -y libv4l-dev libclang-dev pkg-config v4l-utils
       - name: Publish to crates.io
