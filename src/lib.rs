@@ -1674,7 +1674,7 @@ pub async fn motion_cmd(
                 if detections.len() >= min_area {
                     println!("Motion detected! {} pixels", detections.len());
                     if let Some(ref out) = output {
-                        if let Some(vis) = visualize_motion(&frame, &detections) {
+                        if let Some(vis) = visualize_motion(&frame, &detections, detector.width()) {
                             fs::write(out, vis)?;
                             println!("Motion visualization saved to {}", out.display());
                         }
@@ -1703,14 +1703,23 @@ pub async fn motion_cmd(
 }
 
 /// Create a visualization of motion by highlighting moving pixels in red
-fn visualize_motion(frame: &[u8], motion_pixels: &[(usize, usize)]) -> Option<Vec<u8>> {
-    if frame.is_empty() {
+///
+/// `width` is the frame's real row stride in pixels. It cannot be inferred
+/// from `frame.len()`: `sqrt(pixel_count)` only names the width of a *square*
+/// frame, and every camera frame is wider than it is tall, so a heuristic here
+/// scatters the highlights over unrelated pixels. The caller passes the width
+/// the detector was configured with, which is the same width `detect()` used
+/// to decode and scan this frame.
+fn visualize_motion(
+    frame: &[u8],
+    motion_pixels: &[(usize, usize)],
+    width: usize,
+) -> Option<Vec<u8>> {
+    if frame.is_empty() || width == 0 {
         return None;
     }
 
     let mut vis = frame.to_vec();
-    let pixels = frame.len() / 3;
-    let width = (pixels as f64).sqrt().round() as usize;
 
     for (x, y) in motion_pixels {
         let idx = y * width + x;
@@ -4263,5 +4272,40 @@ mod tests {
         let summary = summarize_supported(&supported);
         assert!(summary.contains("YUYV"));
         assert!(summary.contains("320x320"));
+    }
+
+    /// A non-square frame must be indexed with its real width.
+    ///
+    /// `sqrt(pixel_count)` only names the width of a *square* frame, so a
+    /// 4x2 frame (8 px) used to be indexed as if it were 3 px wide and every
+    /// highlight landed on the wrong pixel.
+    #[test]
+    fn visualize_motion_uses_true_width_for_non_square_frames() {
+        const WIDTH: usize = 4;
+        const HEIGHT: usize = 2;
+
+        // Uniform blue frame; nothing is red until visualize_motion runs.
+        let mut frame = vec![0u8; WIDTH * HEIGHT * 3];
+        for px in frame.chunks_exact_mut(3) {
+            px[2] = 200; // B
+        }
+
+        // Motion at pixel (x=3, y=1) -> pixel index 1 * 4 + 3 = 7 -> byte 21.
+        let vis = visualize_motion(&frame, &[(3, 1)], WIDTH)
+            .expect("non-empty frame must produce a visualization");
+
+        assert_eq!(vis.len(), frame.len());
+
+        let red_offsets: Vec<usize> = vis
+            .chunks_exact(3)
+            .enumerate()
+            .filter(|(_, px)| px[0] == 255 && px[1] == 0 && px[2] == 0)
+            .map(|(i, _)| i * 3)
+            .collect();
+        assert_eq!(
+            red_offsets,
+            vec![21],
+            "exactly the (3, 1) pixel must be highlighted, at byte offset 21"
+        );
     }
 }

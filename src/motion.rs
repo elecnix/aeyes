@@ -407,6 +407,20 @@ impl AdaptiveThreshold {
         }
     }
 
+    /// Mean gain across all regions, or `None` when there are no regions.
+    ///
+    /// The per-region gains are the detector's real sensitivity state, so
+    /// there is no mean to report for a zero-sized frame: a `0.0` here would
+    /// be indistinguishable from a fully damped detector, and inventing a
+    /// number would misreport it. Callers that need a value must choose what
+    /// "no regions" means for them.
+    pub fn mean_sensitivity(&self) -> Option<f32> {
+        if self.sensitivities.is_empty() {
+            return None;
+        }
+        Some(self.sensitivities.iter().sum::<f32>() / self.sensitivities.len() as f32)
+    }
+
     /// Apply decay to all regions
     ///
     /// Same floor as `register_detection`: the decay pulls each gain back up
@@ -469,6 +483,15 @@ impl LightingInvariantDetector {
     #[inline]
     fn rgb_to_lum(r: u8, g: u8, b: u8) -> u8 {
         (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8
+    }
+
+    /// Row stride of the frames this detector accepts, in pixels.
+    ///
+    /// `detect` returns no detections unless the frame is exactly
+    /// `width * height * 3` bytes, so this is the width of every frame whose
+    /// detection coordinates can be used to index that frame.
+    pub fn width(&self) -> usize {
+        self.width
     }
 
     /// Detect motion in RGB frame
@@ -570,7 +593,13 @@ impl LightingInvariantDetector {
 
     pub fn metrics(&self) -> DecayMetrics {
         DecayMetrics {
-            sensitivity: 1.0, // Could be per-region, but simplified
+            // The real sensitivity state is the mean of the per-region gains.
+            // A zero-sized frame has no regions and therefore no mean; it
+            // falls back to the unadapted base gain of 1.0, which is also the
+            // value every region holds before any adaptation has run, so a
+            // caller reading `metrics()` on a degenerate detector sees the
+            // documented starting point rather than an invented number.
+            sensitivity: self.adaptive_threshold.mean_sensitivity().unwrap_or(1.0),
             current_threshold: self.config.edge_threshold,
             edge_count: self.frame_count,
             detection_count: self.detection_count,
@@ -757,6 +786,66 @@ mod tests {
         // DecayMetrics uses edge_count to store frame_count
         assert_eq!(metrics.edge_count, 0);
         assert_eq!(metrics.detection_count, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Bug: `metrics()` hardcoded `sensitivity: 1.0`, so it kept claiming the
+    // unadapted base gain long after the per-region adaptation loop had
+    // damped every region's gain.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_metrics_sensitivity_starts_at_base_gain() {
+        let detector = LightingInvariantDetector::new(64, 64, LightingInvariantConfig::default());
+
+        // No frame seen yet: every region still sits at the unadapted gain.
+        assert_eq!(detector.metrics().sensitivity, 1.0);
+    }
+
+    #[test]
+    fn test_metrics_sensitivity_reports_adapted_gain() {
+        let mut detector =
+            LightingInvariantDetector::new(100, 100, LightingInvariantConfig::default());
+
+        // Warm up, then move an object so at least one detection registers and
+        // damps + decays its region's gain below 1.0.
+        detector.detect(&vec![100u8; 100 * 100 * 3]);
+        let mut frame2 = vec![150u8; 100 * 100 * 3];
+        for y in 45..65 {
+            for x in 45..65 {
+                let idx = (y * 100 + x) * 3;
+                frame2[idx] = 50;
+                frame2[idx + 1] = 50;
+                frame2[idx + 2] = 50;
+            }
+        }
+        let detections = detector.detect(&frame2);
+        assert!(!detections.is_empty(), "fixture must drive detections");
+
+        let gains = &detector.adaptive_threshold.sensitivities;
+        assert!(
+            gains.iter().any(|g| *g < 1.0),
+            "fixture must adapt at least one region away from the base gain"
+        );
+        let expected: f32 = gains.iter().sum::<f32>() / gains.len() as f32;
+
+        let reported = detector.metrics().sensitivity;
+        assert_ne!(
+            reported, 1.0,
+            "metrics() must not keep reporting a hardcoded 1.0"
+        );
+        assert!(
+            (reported - expected).abs() < 1e-6,
+            "metrics() must report the mean region gain: expected {expected}, got {reported}"
+        );
+    }
+
+    #[test]
+    fn test_mean_sensitivity_is_none_without_regions() {
+        // A zero-sized frame yields no regions at all, so there is no gain to
+        // average; the mean is genuinely undefined rather than zero.
+        let adaptive = AdaptiveThreshold::new(0, 0, 32, 0.96, 0.3);
+        assert_eq!(adaptive.mean_sensitivity(), None);
     }
 
     // ---------------------------------------------------------------------
