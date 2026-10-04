@@ -27,6 +27,7 @@ This installs the skill for popular AI coding agents (Pi, Claude Code, Cursor, C
 - Multiple clients can stream from the same camera simultaneously.
 - Multiple webcams can stream in parallel.
 - Adaptive Linux exposure control to keep bright screens readable in dark rooms.
+- **Motion detection**: `aeyes motion` watches the stream with a lighting-invariant detector.
 - HTTP API for frame, video, and stream capture.
 - Linux V4L2 backend. macOS support via nokhwa/AVFoundation.
 
@@ -119,6 +120,49 @@ aeyes chrome --quality 95 -o img.jpg  # High quality capture
 **Requirements**: Chrome must be running with remote debugging enabled:
 - **Linux**: Open `chrome://inspect/#remote-debugging` and toggle the switch
 - **macOS**: Enabled by default when Chrome is launched via terminal
+
+## Motion detection
+
+`aeyes motion` watches the camera and reports when something changes. The CLI auto-starts the daemon if it is not running, then polls the selected camera's latest frame and runs the detector on every frame it receives.
+
+```bash
+aeyes motion                                  # One detection pass, fail if nothing moved
+aeyes motion --wait --timeout 60              # Keep sampling for up to 60s
+aeyes motion --wait --min-area 200 -o m.jpg   # Require 200 changed pixels, save a visualisation
+aeyes motion --threshold 60                   # Less sensitive (higher edge threshold)
+aeyes motion --no-lbp                         # Skip the Local Binary Pattern stage
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-o`, `--output <PATH>` | *(none)* | Write a visualisation of the detection to `PATH`. Detected pixels are painted red over the frame. The file is only written when motion is actually detected. |
+| `--threshold <0-255>` | `25` | Edge-detection threshold. Higher values mean only strong edges count as motion. |
+| `--wait` | off | Keep sampling frames until motion is detected, instead of doing a single pass. |
+| `--timeout <SECS>` | `30` | Maximum time to spend waiting when `--wait` is given. Without `--wait` the flag is ignored. |
+| `--min-area <PIXELS>` | `10` | Minimum number of detected pixels required before the command reports motion. |
+| `--no-sobel` | off (Sobel is on) | Disable the Sobel gradient-magnitude stage. |
+| `--no-lbp` | off (LBP is on) | Disable the Local Binary Pattern stage. Faster, less robust to lighting. |
+
+Exit behaviour:
+
+- **Without `--wait`**: one frame is captured and analysed. If at least `--min-area` pixels are detected, the count is printed and the visualisation is written (if `--output` was given), and the command exits `0`. Otherwise the command exits non-zero. A failed frame fetch also exits non-zero.
+- **With `--wait`**: the capture/analyse cycle repeats every 100 ms until either `--min-area` pixels are detected (exit `0`) or `--timeout` seconds elapse (exit non-zero, `motion detection timeout after N seconds`).
+
+### How detection works
+
+`src/motion.rs` converts each frame to luminance and then combines three signals:
+
+1. **Temporal edge movement** (Sobel). A pixel is motion if its edge map changed by more than the minimum edge movement since the previous frame *and* its edge magnitude is above the threshold. Edges survive brightness changes, so this stays quiet under changing light.
+2. **Local pattern change** (Local Binary Pattern). A pixel is motion if the Hamming distance between its current and previous local binary pattern exceeds the contrast threshold. This catches texture moving through the frame, which matters for scrolling screens.
+3. **Adaptive per-region threshold.** The frame is split into 32x32-pixel regions, each with its own sensitivity multiplier that is damped and then decayed after every frame, floored at a minimum sensitivity. A region that keeps triggering therefore gets progressively less sensitive instead of firing forever.
+
+Together these are designed to ignore gradual global brightness changes, local shadows, camera exposure changes and flickering lights, while still reporting objects entering or leaving the scene, people or animals moving, and on-screen content changing.
+
+### Known limitations
+
+- **No pre/post-roll buffer.** Sampling starts when the command is invoked, so there is no recording of the seconds *before* motion was detected and no automatic capture of the seconds after.
+- **The detector is not wired to the frame endpoint yet.** `LightingInvariantDetector::detect` expects raw RGB24 at the configured resolution, but `/cams/{id}/frame` serves a JPEG, so the buffer length never matches and the detector returns no detections. In practice `--wait` will run until `--timeout` and then fail. Related work is tracked in [the motion redesign issue](https://github.com/elecnix/aeyes/issues).
+- **Resolution is assumed.** The detector is currently constructed for 640x480 regardless of the camera's real resolution.
 
 ## Video Format
 

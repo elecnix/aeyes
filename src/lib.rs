@@ -1646,64 +1646,56 @@ pub async fn motion_cmd(
 
     let client = reqwest::Client::new();
 
-    if wait {
-        let timeout_dur = Duration::from_secs(timeout_secs);
-        let start = Instant::now();
+    // Motion detection always runs. `--wait` only decides whether we keep
+    // sampling until something moves (bounded by `--timeout`) or do a single
+    // detection pass over one frame.
+    let timeout_dur = Duration::from_secs(timeout_secs);
+    let start = Instant::now();
 
-        loop {
-            if start.elapsed() > timeout_dur {
-                anyhow::bail!("motion detection timeout after {} seconds", timeout_secs);
-            }
-
-            match client
-                .get(format!("http://{addr}/cams/default/frame"))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    let bytes = resp.bytes().await?;
-                    let frame = bytes.to_vec();
-
-                    let detections = detector.detect(&frame);
-
-                    if detections.len() >= min_area {
-                        println!("Motion detected! {} pixels", detections.len());
-                        if let Some(ref out) = output {
-                            if let Some(vis) = visualize_motion(&frame, &detections) {
-                                fs::write(out, vis)?;
-                                println!("Motion visualization saved to {}", out.display());
-                            }
-                        }
-                        return Ok(());
-                    }
-                }
-                _ => {
-                    warn!("failed to capture frame, retrying...");
-                }
-            }
-
-            sleep(Duration::from_millis(100)).await;
+    loop {
+        if wait && start.elapsed() > timeout_dur {
+            anyhow::bail!("motion detection timeout after {} seconds", timeout_secs);
         }
-    } else {
-        // Single frame capture (for compatibility)
-        let resp = client
+
+        match client
             .get(format!("http://{addr}/cams/default/frame"))
             .send()
             .await
-            .context("failed to capture frame")?;
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let bytes = resp.bytes().await?;
+                let frame = bytes.to_vec();
 
-        if !resp.status().is_success() {
-            anyhow::bail!("failed to capture frame from daemon");
+                let detections = detector.detect(&frame);
+
+                if detections.len() >= min_area {
+                    println!("Motion detected! {} pixels", detections.len());
+                    if let Some(ref out) = output {
+                        if let Some(vis) = visualize_motion(&frame, &detections) {
+                            fs::write(out, vis)?;
+                            println!("Motion visualization saved to {}", out.display());
+                        }
+                    }
+                    return Ok(());
+                }
+
+                if !wait {
+                    anyhow::bail!(
+                        "no motion detected: {} pixels changed, below --min-area {}",
+                        detections.len(),
+                        min_area
+                    );
+                }
+            }
+            _ => {
+                warn!("failed to capture frame, retrying...");
+                if !wait {
+                    anyhow::bail!("failed to capture frame from daemon");
+                }
+            }
         }
 
-        let bytes = resp.bytes().await?;
-        let frame = bytes.to_vec();
-        match &output {
-            Some(out) => fs::write(out, &frame)?,
-            None => fs::write("motion.jpg", &frame)?,
-        }
-        println!("Frame saved ({} bytes)", frame.len());
-        Ok(())
+        sleep(Duration::from_millis(100)).await;
     }
 }
 

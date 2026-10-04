@@ -11,3 +11,4 @@ coverage/
 *.avi
 
 tarpaulin-report.*
+autoresearch.jsonl
