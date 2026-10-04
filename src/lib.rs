@@ -1635,7 +1635,10 @@ pub async fn motion_cmd(
     let config = motion::LightingInvariantConfig {
         edge_threshold: threshold,
         min_edge_movement: 2,
-        contrast_threshold: 20,
+        // Hamming distance over an 8-bit pattern, so the reachable range is
+        // 0..=8. Must stay in step with `LightingInvariantConfig::default()`;
+        // at 20 the LBP stage could never fire on the CLI path.
+        contrast_threshold: 4,
         decay_rate: 0.96,
         min_sensitivity: 0.3,
         use_temporal_edges: true,
