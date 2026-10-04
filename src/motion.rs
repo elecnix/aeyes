@@ -19,6 +19,12 @@
 /// - Screen changes (pixel-level motion)
 use std::cmp;
 
+/// Smallest frame dimension that still has an interior pixel whose full 3x3
+/// neighbourhood lies inside the image. Both the Sobel and the LBP stage scan
+/// `1..(dim - 1)`, which underflows on a zero dimension, and there is nothing
+/// to scan below this size anyway.
+const MIN_SCAN_DIMENSION: usize = 3;
+
 #[derive(Clone, Debug)]
 pub struct LightingInvariantConfig {
     /// Edge detection threshold (0-255)
@@ -29,14 +35,29 @@ pub struct LightingInvariantConfig {
     /// Prevents noise from triggering detections
     pub min_edge_movement: u8,
 
-    /// Local contrast threshold (0-255)
-    /// Changes in local pattern indicate motion
+    /// Local contrast threshold, in **Hamming-distance units over the 8-bit
+    /// LBP pattern**, i.e. the valid range is `0..=LocalBinaryPattern::PATTERN_BITS`
+    /// (0..=8).
+    ///
+    /// A pixel counts as texture motion when the Hamming distance between its
+    /// current and previous local binary pattern is *greater* than this value.
+    /// Because the distance can never exceed the pattern width, a threshold
+    /// above `PATTERN_BITS` makes the whole LBP stage unreachable.
     pub contrast_threshold: u8,
 
     /// Decay rate for edge maps (same as luminance)
     pub decay_rate: f32,
 
-    /// Sensitivity floor
+    /// Floor on each region's adaptive gain, in `0.0..=1.0`.
+    ///
+    /// The gain multiplies into the detection bar as
+    /// `effective_threshold = edge_threshold / gain`: a gain of `1.0` is the
+    /// unadapted base threshold, and a gain *below* `1.0` makes the region
+    /// progressively **less** sensitive, which is what stops a busy region
+    /// from firing forever. Raising this floor therefore makes the detector
+    /// **more** sensitive, and lowering it lets a region quiet down further —
+    /// it only ever bounds how far adaptation may move the threshold away
+    /// from the base threshold.
     pub min_sensitivity: f32,
 
     /// Enable temporal edge tracking
@@ -54,7 +75,7 @@ impl Default for LightingInvariantConfig {
         Self {
             edge_threshold: 25,
             min_edge_movement: 2,
-            contrast_threshold: 20,
+            contrast_threshold: 4,
             decay_rate: 0.96,
             min_sensitivity: 0.3,
             use_temporal_edges: true,
@@ -138,6 +159,13 @@ impl SobelEdgeDetector {
 
         self.prev_edges.copy_from_slice(&self.edges);
 
+        // Degenerate frames have no interior pixel whose 3x3 neighbourhood is
+        // fully inside the image; bail out before the loop bounds below would
+        // underflow on a zero width or height.
+        if self.width < MIN_SCAN_DIMENSION || self.height < MIN_SCAN_DIMENSION {
+            return &self.edges;
+        }
+
         // Process interior pixels (skip borders)
         for y in 1..(self.height - 1) {
             for x in 1..(self.width - 1) {
@@ -184,6 +212,11 @@ pub struct LocalBinaryPattern {
 }
 
 impl LocalBinaryPattern {
+    /// Width of a single LBP code, in bits. This is the largest value
+    /// [`LocalBinaryPattern::hamming_distance`] can ever return, and therefore
+    /// the largest meaningful value for `LightingInvariantConfig::contrast_threshold`.
+    pub const PATTERN_BITS: u8 = 8;
+
     pub fn new(width: usize, height: usize) -> Self {
         let size = width * height;
         Self {
@@ -228,6 +261,13 @@ impl LocalBinaryPattern {
 
         self.prev_patterns.copy_from_slice(&self.patterns);
 
+        // Degenerate frames have no interior pixel whose 3x3 neighbourhood is
+        // fully inside the image; bail out before the loop bounds below would
+        // underflow on a zero width or height.
+        if self.width < MIN_SCAN_DIMENSION || self.height < MIN_SCAN_DIMENSION {
+            return;
+        }
+
         // Process interior pixels
         for y in 1..(self.height - 1) {
             for x in 1..(self.width - 1) {
@@ -271,8 +311,16 @@ impl LocalBinaryPattern {
     }
 
     /// Hamming distance between two patterns (how different)
+    ///
+    /// Bounded by [`LocalBinaryPattern::PATTERN_BITS`] because a pattern is a
+    /// single byte: at most 8 bits can differ.
     #[inline]
     fn hamming_distance(p1: u8, p2: u8) -> u8 {
+        debug_assert!(
+            (p1 ^ p2).count_ones() <= u32::from(Self::PATTERN_BITS),
+            "LBP patterns are {PATTERN_BITS}-bit codes",
+            PATTERN_BITS = Self::PATTERN_BITS
+        );
         (p1 ^ p2).count_ones() as u8
     }
 }
@@ -307,7 +355,16 @@ impl AdaptiveThreshold {
         }
     }
 
-    /// Get threshold for pixel location
+    /// Get threshold for pixel location.
+    ///
+    /// `sensitivities[region]` is a *gain*, not a threshold ratio:
+    /// `effective_threshold = base_threshold / gain`. A gain of `1.0` is the
+    /// unadapted base threshold; damping (`register_detection`) and decay
+    /// (`apply_decay`) push the gain below `1.0`, which raises the bar and
+    /// makes a repeatedly-firing region progressively *less* sensitive.
+    /// `min_sensitivity` is the floor on that gain, so it bounds how far
+    /// adaptation may move the threshold up from the base threshold - it can
+    /// never push the threshold below the base value.
     pub fn threshold_at(&self, x: usize, y: usize, base_threshold: u8) -> u8 {
         let region_x = x / self.region_size;
         let region_y = y / self.region_size;
@@ -315,12 +372,28 @@ impl AdaptiveThreshold {
         let regions_x = self.width.div_ceil(self.region_size);
         let idx = region_y * regions_x + region_x;
 
-        let sensitivity = self.sensitivities.get(idx).copied().unwrap_or(1.0);
-        let adjusted = (base_threshold as f32 * sensitivity) as u8;
-        adjusted.max((base_threshold as f32 * self.min_sensitivity) as u8)
+        // Keep the floor inside `0.0..=1.0` so an out-of-range config value can
+        // neither divide by zero nor invert the gain into a multiplier that
+        // would *lower* the bar below the base threshold.
+        let floor = self.min_sensitivity.clamp(f32::EPSILON, 1.0);
+        let sensitivity = self
+            .sensitivities
+            .get(idx)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(floor, 1.0);
+
+        let adjusted = (base_threshold as f32 / sensitivity) as u8;
+        adjusted.max(base_threshold)
     }
 
     /// Register detection in region
+    ///
+    /// Damping pushes the region's gain below `1.0`, which raises its
+    /// effective threshold and makes it less sensitive, so a region that keeps
+    /// firing stops firing forever. `min_sensitivity` floors the gain: it is an
+    /// `f32`-to-`f32` comparison on the same scale the gain lives in, so the
+    /// gain can never fall below it.
     pub fn register_detection(&mut self, x: usize, y: usize) {
         let region_x = x / self.region_size;
         let region_y = y / self.region_size;
@@ -329,15 +402,18 @@ impl AdaptiveThreshold {
         let idx = region_y * regions_x + region_x;
 
         if let Some(threshold) = self.sensitivities.get_mut(idx) {
-            *threshold *= 0.85; // Damping
+            *threshold *= 0.85; // Damping: less sensitive after a detection
             *threshold = threshold.max(self.min_sensitivity);
         }
     }
 
     /// Apply decay to all regions
+    ///
+    /// Same floor as `register_detection`: the decay pulls each gain back up
+    /// towards `min_sensitivity` so adaptation never becomes unbounded.
     pub fn apply_decay(&mut self) {
         for threshold in self.sensitivities.iter_mut() {
-            *threshold *= self.decay_rate;
+            *threshold *= self.decay_rate; // Gain relaxes back towards 1.0
             *threshold = threshold.max(self.min_sensitivity);
         }
     }
@@ -398,6 +474,13 @@ impl LightingInvariantDetector {
     /// Detect motion in RGB frame
     #[allow(clippy::cast_possible_truncation)]
     pub fn detect(&mut self, frame_rgb: &[u8]) -> Vec<(usize, usize)> {
+        // A zero-sized frame is trivially "no motion": there is nothing to scan
+        // and the interior loop bounds below would underflow. Guard it before
+        // anything else so a degenerate frame is inert rather than a panic.
+        if self.width < MIN_SCAN_DIMENSION || self.height < MIN_SCAN_DIMENSION {
+            return Vec::new();
+        }
+
         if frame_rgb.len() != self.width * self.height * 3 {
             return Vec::new();
         }
@@ -445,7 +528,10 @@ impl LightingInvariantDetector {
                     }
                 }
 
-                // METHOD 2: Local pattern change (texture movement)
+                // METHOD 2: Local pattern change (texture movement).
+                // `hamming_distance` is bounded by `PATTERN_BITS`, so a
+                // configured `contrast_threshold` above that bound can never
+                // be exceeded and this stage is inert.
                 if self.config.use_lbp && !is_motion {
                     let curr_pattern = self.lbp.pattern(x, y);
                     let prev_pattern = self.lbp.prev_pattern(x, y);
@@ -671,5 +757,197 @@ mod tests {
         // DecayMetrics uses edge_count to store frame_count
         assert_eq!(metrics.edge_count, 0);
         assert_eq!(metrics.detection_count, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Bug 1: the LBP branch can never fire because `contrast_threshold`
+    // defaults to a value outside the range `hamming_distance` can return.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_default_contrast_threshold_is_within_lbp_hamming_range() {
+        let config = LightingInvariantConfig::default();
+
+        // An LBP pattern is `LocalBinaryPattern::PATTERN_BITS` bits wide, so the
+        // Hamming distance between two patterns can only ever be
+        // 0..=PATTERN_BITS. A `contrast_threshold` above that makes
+        // `pattern_distance > contrast_threshold` permanently false, which
+        // silently turns the whole LBP stage into dead code.
+        assert!(
+            config.contrast_threshold <= LocalBinaryPattern::PATTERN_BITS,
+            "default contrast_threshold {} is outside the range hamming_distance can \
+             return (0..={}); the LBP stage can never fire",
+            config.contrast_threshold,
+            LocalBinaryPattern::PATTERN_BITS
+        );
+    }
+
+    #[test]
+    fn test_lbp_stage_alone_detects_moving_texture() {
+        // Temporal edges are disabled so that the ONLY way a pixel can be
+        // flagged is the LBP branch. With an unreachable `contrast_threshold`
+        // this returns an empty list, proving the stage is dead.
+        let config = LightingInvariantConfig {
+            edge_threshold: 10,
+            use_temporal_edges: false,
+            ..LightingInvariantConfig::default()
+        };
+        let mut detector = LightingInvariantDetector::new(64, 64, config);
+
+        // 2x2 block checkerboard: strong Sobel gradients at every block edge
+        // and an 8-bit LBP pattern that changes for most pixels when the
+        // texture shifts by one pixel.
+        let texture = |x: usize, y: usize| -> u8 {
+            if ((x / 2) + (y / 2)).is_multiple_of(2) {
+                255
+            } else {
+                0
+            }
+        };
+        let frame1: Vec<u8> = (0..64 * 64)
+            .flat_map(|i| {
+                let (x, y) = (i % 64, i / 64);
+                [texture(x, y); 3]
+            })
+            .collect();
+        let frame2: Vec<u8> = (0..64 * 64)
+            .flat_map(|i| {
+                let (x, y) = (i % 64, i / 64);
+                [texture(x + 1, y); 3]
+            })
+            .collect();
+
+        detector.detect(&frame1);
+        let detections = detector.detect(&frame2);
+
+        assert!(
+            !detections.is_empty(),
+            "shifting a high-contrast texture by one pixel must be caught by the LBP stage"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Bug 2: the adaptive-threshold floor is applied to the threshold scale
+    // instead of bounding the sensitivity multiplier, and nothing stops an
+    // out-of-range `min_sensitivity` from pushing the effective threshold
+    // ABOVE the base threshold.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_effective_threshold_never_falls_below_base_threshold() {
+        const BASE: u8 = 25;
+
+        for min_sensitivity in [0.0f32, 0.1, 0.3, 0.5, 1.0, 1.5, 2.0, -1.0] {
+            let adaptive = AdaptiveThreshold::new(64, 64, 32, 0.96, min_sensitivity);
+            let effective = adaptive.threshold_at(5, 5, BASE);
+            assert!(
+                effective >= BASE,
+                "min_sensitivity {min_sensitivity} produced threshold {effective}, which is \
+                 below the base threshold {BASE}; adaptation must only ever raise the bar, \
+                 never lower it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_effective_threshold_is_bounded_by_the_sensitivity_floor() {
+        const BASE: u8 = 25;
+
+        // A damped region sits at the floor, so its effective threshold is the
+        // furthest the adaptation is allowed to move: base / floor. The cast
+        // to u8 saturates, so an extreme floor must not wrap or panic.
+        for (min_sensitivity, expected_cap) in [(0.3f32, 83u32), (0.5, 50), (1.0, 25)] {
+            let mut adaptive = AdaptiveThreshold::new(64, 64, 32, 0.96, min_sensitivity);
+            for _ in 0..10 {
+                adaptive.register_detection(5, 5);
+            }
+            let effective = u32::from(adaptive.threshold_at(5, 5, BASE));
+            assert!(
+                effective <= expected_cap,
+                "min_sensitivity {min_sensitivity} produced threshold {effective}, above the \
+                 cap {expected_cap} implied by base / floor"
+            );
+            assert!(effective >= u32::from(BASE));
+        }
+
+        let mut high = AdaptiveThreshold::new(64, 64, 32, 0.96, 0.9);
+        for _ in 0..10 {
+            high.register_detection(5, 5);
+        }
+        let high_bar = high.threshold_at(5, 5, BASE);
+
+        // With no floor at all, adaptation is allowed to push the bar all the
+        // way towards u8::MAX. The float->u8 cast saturates, so this must not
+        // wrap around to a tiny threshold.
+        let mut unfloored = AdaptiveThreshold::new(64, 64, 32, 0.96, 0.0);
+        for _ in 0..10 {
+            unfloored.register_detection(5, 5);
+        }
+        let unfloored_bar = unfloored.threshold_at(5, 5, BASE);
+        assert!(
+            unfloored_bar >= BASE,
+            "an unfloored sensitivity must never drop below BASE, got {unfloored_bar}"
+        );
+        assert!(
+            unfloored_bar > high_bar,
+            "removing the sensitivity floor must let the region quiet down further: \
+             {unfloored_bar} vs {high_bar}"
+        );
+    }
+
+    #[test]
+    fn test_higher_sensitivity_floor_never_raises_the_detection_bar() {
+        const BASE: u8 = 25;
+
+        // A region that keeps triggering gets damped, so its stored gain sits
+        // at the floor. Asking for MORE sensitivity (a higher floor) must never
+        // produce a HIGHER effective threshold.
+        let mut low = AdaptiveThreshold::new(64, 64, 32, 0.96, 0.3);
+        for _ in 0..10 {
+            low.register_detection(5, 5);
+        }
+
+        let mut high = AdaptiveThreshold::new(64, 64, 32, 0.96, 0.9);
+        for _ in 0..10 {
+            high.register_detection(5, 5);
+        }
+
+        let low_sensitivity_bar = low.threshold_at(5, 5, BASE);
+        let high_sensitivity_bar = high.threshold_at(5, 5, BASE);
+
+        assert!(
+            high_sensitivity_bar < low_sensitivity_bar,
+            "raising the sensitivity floor from 0.3 to 0.9 changed the effective threshold \
+             from {low_sensitivity_bar} to {high_sensitivity_bar}; more sensitivity must mean \
+             a lower detection bar"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Bug 3: `self.height - 1` / `self.width - 1` underflow at zero.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_zero_sized_frames_return_no_detections() {
+        for (width, height) in [(0usize, 0usize), (0, 5), (5, 0), (1, 1), (2, 2)] {
+            let mut detector =
+                LightingInvariantDetector::new(width, height, LightingInvariantConfig::default());
+            let frame = vec![0u8; width * height * 3];
+            assert!(
+                detector.detect(&frame).is_empty(),
+                "{width}x{height} frame must produce no detections"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_sized_frames_do_not_panic_in_stage_types() {
+        for (width, height) in [(0usize, 0usize), (0, 5), (5, 0)] {
+            let mut sobel = SobelEdgeDetector::new(width, height);
+            assert_eq!(sobel.detect(&[]).len(), width * height);
+
+            let mut lbp = LocalBinaryPattern::new(width, height);
+            lbp.compute(&[]);
+        }
     }
 }

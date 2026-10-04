@@ -153,8 +153,8 @@ Exit behaviour:
 `src/motion.rs` converts each frame to luminance and then combines three signals:
 
 1. **Temporal edge movement** (Sobel). A pixel is motion if its edge map changed by more than the minimum edge movement since the previous frame *and* its edge magnitude is above the threshold. Edges survive brightness changes, so this stays quiet under changing light.
-2. **Local pattern change** (Local Binary Pattern). A pixel is motion if the Hamming distance between its current and previous local binary pattern exceeds the contrast threshold. This catches texture moving through the frame, which matters for scrolling screens.
-3. **Adaptive per-region threshold.** The frame is split into 32x32-pixel regions, each with its own sensitivity multiplier that is damped and then decayed after every frame, floored at a minimum sensitivity. A region that keeps triggering therefore gets progressively less sensitive instead of firing forever.
+2. **Local pattern change** (Local Binary Pattern). A pixel is motion if the Hamming distance between its current and previous local binary pattern exceeds the contrast threshold. The threshold is measured in that same distance, which is bounded by the width of the pattern (0-8, default `4`), so more than about half the neighbouring bits must flip before texture movement counts. This catches texture moving through the frame, which matters for scrolling screens.
+3. **Adaptive per-region threshold.** The frame is split into 32x32-pixel regions, each with its own gain that is damped after every detection and decayed after every frame. The gain is floored at `min_sensitivity` and never exceeds `1.0`, so the effective threshold is `edge_threshold / gain` and can only ever rise above the base threshold, never fall below it. A region that keeps triggering therefore gets progressively less sensitive instead of firing forever.
 
 Together these are designed to ignore gradual global brightness changes, local shadows, camera exposure changes and flickering lights, while still reporting objects entering or leaving the scene, people or animals moving, and on-screen content changing.
 
