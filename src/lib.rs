@@ -20,7 +20,10 @@ use nokhwa::{
     },
     Buffer, Camera,
 };
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 #[cfg(target_os = "linux")]
 use rscam::{
@@ -76,6 +79,19 @@ pub const MAX_MOTION_WIDTH: u32 = 4096;
 /// Edge threshold handed to the detector. Same default as
 /// `motion::LightingInvariantConfig::default()`.
 pub const DEFAULT_MOTION_THRESHOLD: u8 = 25;
+/// How long `aeyes motion` watches for a trigger before reporting no motion.
+pub const DEFAULT_MOTION_TIMEOUT_SECS: f64 = 30.0;
+/// Pre-roll `aeyes motion` keeps, client-side, before a detected change.
+pub const DEFAULT_MOTION_PRE_SECS: f64 = 2.0;
+/// How long `aeyes motion` keeps recording after a detected change.
+pub const DEFAULT_MOTION_POST_SECS: f64 = 2.0;
+/// Absolute cap on the client-side pre-roll ring, in frames (8s at 30fps).
+const MOTION_RING_MAX_FRAMES: usize = 240;
+/// Byte cap on the same ring: a 4K camera produces four times the bytes at
+/// twice the rate, so a frame count alone does not bound the memory.
+const MOTION_RING_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Thickness of the motion-bounds outline drawn on a saved still.
+const MOTION_OUTLINE_THICKNESS: i64 = 2;
 #[cfg(target_os = "linux")]
 const EXPOSURE_SAMPLE_INTERVAL: u32 = 8;
 #[cfg(target_os = "linux")]
@@ -186,6 +202,43 @@ pub enum Commands {
         /// List available Chrome tabs
         #[arg(long)]
         list_tabs: bool,
+    },
+    /// Watch the daemon's motion stream and capture what moved
+    Motion {
+        /// Camera stable ID or name; defaults to the daemon-selected camera.
+        #[arg(long)]
+        camera: Option<String>,
+        /// Treat a verdict as motion when at least this many analysis pixels changed.
+        /// This is a client-side filter over the measurement the daemon publishes
+        #[arg(long, default_value_t = 1)]
+        min_area: usize,
+        /// Keep watching until motion passes --min-area, or --timeout expires
+        #[arg(long)]
+        wait: bool,
+        /// Seconds to watch for motion
+        #[arg(long, default_value_t = DEFAULT_MOTION_TIMEOUT_SECS)]
+        timeout: f64,
+        /// Save a still of the frame motion was detected in, with the motion bounds outlined
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Record an AVI MJPEG clip around the detected change
+        #[arg(long)]
+        clip: Option<PathBuf>,
+        /// Write one JPEG per frame around the detected change into this directory
+        #[arg(long)]
+        frames: Option<PathBuf>,
+        /// Seconds of pre-roll kept before the detected change
+        #[arg(long, default_value_t = DEFAULT_MOTION_PRE_SECS)]
+        pre: f64,
+        /// Seconds recorded after the detected change
+        #[arg(long, default_value_t = DEFAULT_MOTION_POST_SECS)]
+        post: f64,
+        /// Force capture resolution (e.g. "320x320"); applied when the daemon is started/auto-started
+        #[arg(long)]
+        resolution: Option<String>,
+        /// Force capture format (MJPG/YUYV/YU12/YV12/NV12/RGB3/BGR3); applied when the daemon is started/auto-started
+        #[arg(long)]
+        format: Option<String>,
     },
 }
 
@@ -1471,6 +1524,42 @@ pub async fn run_cli() -> Result<()> {
             output,
             list_tabs,
         }) => chrome_cmd(quality, &output, list_tabs).await,
+        Some(Commands::Motion {
+            camera,
+            min_area,
+            wait,
+            timeout,
+            output,
+            clip,
+            frames,
+            pre,
+            post,
+            resolution,
+            format,
+        }) => {
+            let args = MotionArgs {
+                camera,
+                min_area,
+                wait,
+                timeout: Duration::from_secs_f64(timeout.max(0.0)),
+                output,
+                clip,
+                frames,
+                pre: Duration::from_secs_f64(pre.max(0.0)),
+                post: Duration::from_secs_f64(post.max(0.0)),
+            };
+            let outcome = motion_cmd(args, cli_open_options(resolution, format)?).await;
+            if let Err(err) = &outcome {
+                eprintln!("aeyes motion: {err:#}");
+            }
+            // `aeyes motion` is the one command whose exit code carries the
+            // answer, so it needs a path that `anyhow`->1 cannot express.
+            let code = motion_exit_code(&outcome);
+            if code != MOTION_EXIT_FOUND {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         None => print_help(),
     }
 }
@@ -1853,6 +1942,670 @@ fn parse_error_response_body(body: &[u8]) -> Option<String> {
         Some(error)
     } else {
         Some(format!("{error} [{details}]"))
+    }
+}
+
+/// Arguments of one `aeyes motion` run.
+#[derive(Clone, Debug)]
+pub struct MotionArgs {
+    /// Camera stable ID or name; `None` means the daemon-selected camera.
+    pub camera: Option<String>,
+    /// Client-side filter over the published `changed_pixels`, in analysis pixels.
+    pub min_area: usize,
+    /// Keep watching until motion passes the filter, instead of one measurement.
+    pub wait: bool,
+    /// Watch budget, for every mode that waits for a trigger.
+    pub timeout: Duration,
+    /// Where to write a still of the frame motion was detected in.
+    pub output: Option<PathBuf>,
+    /// Where to write an AVI MJPEG clip around the detected change.
+    pub clip: Option<PathBuf>,
+    /// Where to write one JPEG per frame around the detected change.
+    pub frames: Option<PathBuf>,
+    /// How much pre-roll the client-side ring keeps before the change.
+    pub pre: Duration,
+    /// How long to keep recording after the change.
+    pub post: Duration,
+}
+
+/// What one `aeyes motion` run observed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MotionOutcome {
+    /// A verdict passed the client's filter.
+    Detected(Box<MotionVerdict>),
+    /// The budget expired with every verdict below the filter.
+    NoMotion { observed: u64 },
+}
+
+/// Exit codes of `aeyes motion`.
+///
+/// Three outcomes that used to collapse into one `anyhow` exit 1 are
+/// distinguishable to a script: motion found, nothing moved within the budget,
+/// and the command failed (daemon unreachable, stream died, file unwritable).
+/// "Nothing moved" is a fulfilled contract for a timed watch, but it is still
+/// not success, so `aeyes motion --wait && handle_motion` keeps working.
+pub const MOTION_EXIT_FOUND: i32 = 0;
+pub const MOTION_EXIT_NO_MOTION: i32 = 1;
+pub const MOTION_EXIT_FAILED: i32 = 2;
+
+/// The exit code for a finished run. Real failures are >= 2.
+pub fn motion_exit_code(outcome: &Result<MotionOutcome>) -> i32 {
+    match outcome {
+        Ok(MotionOutcome::Detected(_)) => MOTION_EXIT_FOUND,
+        Ok(MotionOutcome::NoMotion { .. }) => MOTION_EXIT_NO_MOTION,
+        Err(_) => MOTION_EXIT_FAILED,
+    }
+}
+
+/// Whether a verdict counts as motion for this client.
+fn motion_passes(verdict: &MotionVerdict, min_area: usize) -> bool {
+    // The client filters the daemon's published measurement; it does not
+    // re-measure, so two clients with different `--min-area` values are both
+    // right about the one stream they share.
+    verdict.status == MotionStatus::Ok && verdict.changed_pixels >= min_area
+}
+
+/// Route to one of a camera's motion endpoints, accepting `default` exactly as
+/// `/frame`, `/video` and `/stream` do.
+fn cam_route(camera: Option<&str>, suffix: &str) -> String {
+    match camera {
+        Some(camera) => format!("/cams/{camera}/{suffix}"),
+        None => format!("/cams/default/{suffix}"),
+    }
+}
+
+/// Run `aeyes motion` against the daemon, starting it if needed.
+pub async fn motion_cmd(args: MotionArgs, options: CameraOpenOptions) -> Result<MotionOutcome> {
+    let addr = ensure_daemon_running(args.camera.as_deref(), &options).await?;
+    motion_watch(addr, &args).await
+}
+
+/// Run `aeyes motion` against a daemon that is already running.
+pub async fn motion_watch(addr: SocketAddr, args: &MotionArgs) -> Result<MotionOutcome> {
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // A single measurement needs no watching and no pixels: it is one read of
+    // the daemon's latest verdict.
+    if !args.wait && args.output.is_none() && args.clip.is_none() && args.frames.is_none() {
+        return motion_once(&client, &base, args).await;
+    }
+
+    motion_stream(&client, &base, args).await
+}
+
+/// One measurement: `GET /cams/{id}/motion`, filtered locally.
+async fn motion_once(
+    client: &reqwest::Client,
+    base: &str,
+    args: &MotionArgs,
+) -> Result<MotionOutcome> {
+    let resp = client
+        .get(format!(
+            "{base}{}",
+            cam_route(args.camera.as_deref(), "motion")
+        ))
+        .send()
+        .await
+        .context("failed to reach the daemon")?;
+    let verdict = motion_verdict_response(resp).await?;
+
+    if motion_passes(&verdict, args.min_area) {
+        println!(
+            "Motion detected: {} analysis pixels changed (sequence {})",
+            verdict.changed_pixels, verdict.sequence
+        );
+        Ok(MotionOutcome::Detected(Box::new(verdict)))
+    } else {
+        eprintln!(
+            "No motion: {} analysis pixels changed, below --min-area {} (sequence {})",
+            verdict.changed_pixels, args.min_area, verdict.sequence
+        );
+        Ok(MotionOutcome::NoMotion { observed: 1 })
+    }
+}
+
+/// Read a `MotionVerdict` from a response, reporting the daemon's own error
+/// text when it refused, so a failure is diagnosable rather than "HTTP 503".
+async fn motion_verdict_response(resp: reqwest::Response) -> Result<MotionVerdict> {
+    let status = resp.status();
+    let bytes = resp.bytes().await.context("failed to read the response")?;
+    if !status.is_success() {
+        let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        if detail.is_empty() {
+            bail!("the daemon returned {status}");
+        }
+        bail!("the daemon returned {status}: {detail}");
+    }
+    serde_json::from_slice(&bytes).context("failed to parse the motion verdict")
+}
+
+/// Watch the daemon's verdict stream until a verdict passes the filter, then
+/// capture whatever was asked for.
+async fn motion_stream(
+    client: &reqwest::Client,
+    base: &str,
+    args: &MotionArgs,
+) -> Result<MotionOutcome> {
+    let needs_frames = args.clip.is_some() || args.frames.is_some();
+
+    // `min_area=0` asks for every verdict, including the quiet ones: the client
+    // filters on its own, and it needs the quiet verdicts to tell "no new
+    // verdict" (a stalled detector) from "no motion" (a still scene). Passing
+    // the client's `--min-area` here would let the daemon hide exactly that.
+    let events_resp = client
+        .get(format!(
+            "{base}{}?min_area=0",
+            cam_route(args.camera.as_deref(), "events")
+        ))
+        .send()
+        .await
+        .context("failed to open the motion event stream")?;
+    if !events_resp.status().is_success() {
+        return Err(motion_verdict_response(events_resp).await.unwrap_err());
+    }
+
+    // Both connections are pumped by their own task into a channel, so the wait
+    // loop selects over two simple receivers and a trigger is never delayed by
+    // a frame read. The channels stay open after their pump ends (the keepalive
+    // senders below), so an ended stream is reported once rather than looking
+    // like silence or spinning the loop.
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<StreamMessage<String>>(64);
+    let _line_keepalive = line_tx.clone();
+    tokio::spawn(pump_ndjson_lines(events_resp, line_tx));
+
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<StreamMessage<Vec<u8>>>(64);
+    let _frame_keepalive = frame_tx.clone();
+    let mut frames_ended = true;
+    if needs_frames {
+        let resp = client
+            .get(format!(
+                "{base}{}",
+                cam_route(args.camera.as_deref(), "stream")
+            ))
+            .send()
+            .await
+            .context("failed to open the video stream")?;
+        if !resp.status().is_success() {
+            bail!("the daemon refused the video stream: {}", resp.status());
+        }
+        frames_ended = false;
+        tokio::spawn(pump_mjpeg_frames(resp, frame_tx));
+    }
+
+    let hard_deadline = Instant::now() + args.timeout;
+    let mut events_ended = false;
+    let mut ring = MotionRing::new();
+    let mut observed = 0u64;
+    let mut trigger: Option<(MotionVerdict, Instant)> = None;
+
+    loop {
+        // Before a trigger the budget is the caller's watch timeout; after one
+        // it is the post-roll, which must not be cut short by that timeout.
+        let wait_until = match &trigger {
+            Some((_, triggered_at)) => *triggered_at + args.post,
+            None => hard_deadline,
+        };
+
+        tokio::select! {
+            message = line_rx.recv() => match message {
+                Some(StreamMessage::Item(line)) => {
+                    let verdict: MotionVerdict = serde_json::from_str(&line)
+                        .context("failed to parse a motion verdict from the event stream")?;
+                    observed += 1;
+                    if trigger.is_none() && motion_passes(&verdict, args.min_area) {
+                        trigger = Some((verdict, Instant::now()));
+                    }
+                }
+                Some(StreamMessage::Ended) | None => events_ended = true,
+                Some(StreamMessage::Failed(problem)) => bail!("{problem}"),
+            },
+            message = frame_rx.recv() => match message {
+                Some(StreamMessage::Item(frame)) => ring.push(frame, args.pre, trigger.is_some()),
+                Some(StreamMessage::Ended) | None => frames_ended = true,
+                Some(StreamMessage::Failed(problem)) => bail!("{problem}"),
+            },
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_until)) => break,
+        }
+
+        // A daemon that closed the verdict stream while nothing had been
+        // detected is a failure, not "nothing moved": the caller asked to be
+        // told about motion, and no observation was possible.
+        if events_ended && trigger.is_none() {
+            bail!("the daemon closed the motion event stream before any motion was detected");
+        }
+        if events_ended && frames_ended {
+            break;
+        }
+    }
+
+    let Some((verdict, _)) = trigger else {
+        eprintln!(
+            "No motion passed --min-area {} within {}s ({} verdict{} watched)",
+            args.min_area,
+            args.timeout.as_secs_f64(),
+            observed,
+            if observed == 1 { "" } else { "s" }
+        );
+        return Ok(MotionOutcome::NoMotion { observed });
+    };
+
+    println!(
+        "Motion detected: {} analysis pixels changed (sequence {})",
+        verdict.changed_pixels, verdict.sequence
+    );
+
+    // The still comes from the frame ring when there is one, so the clip and
+    // the still describe the same moment; otherwise the daemon's latest frame
+    // is fetched, which is the frame closest to the trigger.
+    let still_frame = match ring.last() {
+        Some(frame) => Some(frame),
+        None if args.output.is_some() => Some(
+            client
+                .get(format!(
+                    "{base}{}",
+                    cam_route(args.camera.as_deref(), "frame")
+                ))
+                .send()
+                .await
+                .context("failed to fetch the still frame")?
+                .bytes()
+                .await
+                .context("failed to read the still frame")?
+                .to_vec(),
+        ),
+        None => None,
+    };
+
+    if let Some(path) = &args.output {
+        let frame = still_frame.context("no frame was available to save as a still")?;
+        let outlined = outline_motion(&frame, &verdict)
+            .with_context(|| format!("failed to outline motion on {}", path.display()))?;
+        write_motion_file(path, &outlined)?;
+        println!(
+            "Still with motion bounds saved to {} ({} bytes)",
+            path.display(),
+            outlined.len()
+        );
+    }
+
+    // The recording is read out of the ring once and serves every writer, so
+    // asking for both a clip and a frame dump does not leave the second one
+    // empty. Both the duration and the frames are read before the ring empties.
+    let recorded_for = ring.duration();
+    let recorded = ring.take();
+    let fps = frames_per_second(recorded.len(), recorded_for);
+
+    if let Some(path) = &args.clip {
+        if recorded.is_empty() {
+            bail!("no frames were recorded; --clip needs the video stream to be flowing");
+        }
+        let avi = create_avi_mjpeg(&recorded, fps).context("failed to encode the clip")?;
+        write_motion_file(path, &avi)?;
+        println!(
+            "Clip saved to {} ({} frames at {fps} fps, {} bytes)",
+            path.display(),
+            recorded.len(),
+            avi.len()
+        );
+    }
+
+    if let Some(dir) = &args.frames {
+        if recorded.is_empty() {
+            bail!("no frames were recorded; --frames needs the video stream to be flowing");
+        }
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        for (index, frame) in recorded.iter().enumerate() {
+            let path = dir.join(format!("frame-{:04}.jpg", index + 1));
+            write_motion_file(&path, frame)?;
+        }
+        println!("{} frames saved to {}", recorded.len(), dir.display());
+    }
+
+    Ok(MotionOutcome::Detected(Box::new(verdict)))
+}
+
+/// What one connection produced for the wait loop.
+enum StreamMessage<T> {
+    Item(T),
+    /// The stream ended cleanly.
+    Ended,
+    /// The stream failed, with the reason.
+    Failed(String),
+}
+
+async fn pump_ndjson_lines(
+    resp: reqwest::Response,
+    tx: tokio::sync::mpsc::Sender<StreamMessage<String>>,
+) {
+    let mut lines = NdjsonLines::new(resp.bytes_stream());
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if tx.send(StreamMessage::Item(line)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(StreamMessage::Ended).await;
+                return;
+            }
+            Err(err) => {
+                let _ = tx.send(StreamMessage::Failed(format!("{err:#}"))).await;
+                return;
+            }
+        }
+    }
+}
+
+async fn pump_mjpeg_frames(
+    resp: reqwest::Response,
+    tx: tokio::sync::mpsc::Sender<StreamMessage<Vec<u8>>>,
+) {
+    let mut frames = MjpegFrames::new(resp.bytes_stream());
+    loop {
+        match frames.next_frame().await {
+            Ok(Some(frame)) => {
+                if tx.send(StreamMessage::Item(frame)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(StreamMessage::Ended).await;
+                return;
+            }
+            Err(err) => {
+                let _ = tx.send(StreamMessage::Failed(format!("{err:#}"))).await;
+                return;
+            }
+        }
+    }
+}
+
+fn write_motion_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Split one `\n`-terminated line out of the buffer.
+fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
+    let newline = buffer.iter().position(|byte| *byte == b'\n')?;
+    let mut line: Vec<u8> = buffer.drain(..=newline).collect();
+    line.pop();
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    // Lossy rather than `None`: a line that arrived but cannot be read must
+    // surface as a parse failure, not as a missing line.
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// Incremental NDJSON reader: response bytes in, one line at a time.
+struct NdjsonLines<S> {
+    stream: S,
+    buffer: Vec<u8>,
+}
+
+impl<S> NdjsonLines<S>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            buffer: Vec::new(),
+        }
+    }
+
+    async fn next_line(&mut self) -> Result<Option<String>> {
+        use futures_util::StreamExt;
+
+        loop {
+            if let Some(line) = take_line(&mut self.buffer) {
+                return Ok(Some(line));
+            }
+            match self.stream.next().await {
+                Some(Ok(chunk)) => self.buffer.extend_from_slice(&chunk),
+                Some(Err(err)) => return Err(anyhow!(err).context("the event stream failed")),
+                // A trailing partial line is discarded: every verdict the
+                // daemon writes ends with a newline.
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Split one multipart part out of the buffer using the `Content-Length` the
+/// daemon sends with each part. `None` while the part is incomplete.
+fn take_mjpeg_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let header_end = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)?;
+    let content_length = content_length_of(&buffer[..header_end])?;
+    if buffer.len() < header_end + content_length {
+        return None;
+    }
+    let frame = buffer[header_end..header_end + content_length].to_vec();
+    buffer.drain(..header_end + content_length);
+    Some(frame)
+}
+
+/// The `Content-Length` of a multipart part's header block.
+fn content_length_of(header_block: &[u8]) -> Option<usize> {
+    String::from_utf8_lossy(header_block)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.trim().eq_ignore_ascii_case("content-length") {
+                return None;
+            }
+            value.trim().parse().ok()
+        })
+}
+
+/// Largest buffer the multipart reader will accumulate before deciding the
+/// stream is not MJPEG multipart at all.
+const MJPEG_MAX_BUFFER: usize = 32 * 1024 * 1024;
+
+/// Incremental MJPEG multipart reader: the `/stream` body in, one JPEG at a
+/// time.
+struct MjpegFrames<S> {
+    stream: S,
+    buffer: Vec<u8>,
+}
+
+impl<S> MjpegFrames<S>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            buffer: Vec::new(),
+        }
+    }
+
+    async fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        use futures_util::StreamExt;
+
+        loop {
+            if let Some(frame) = take_mjpeg_frame(&mut self.buffer) {
+                return Ok(Some(frame));
+            }
+            if self.buffer.len() > MJPEG_MAX_BUFFER {
+                bail!("the video stream does not look like MJPEG multipart data");
+            }
+            match self.stream.next().await {
+                Some(Ok(chunk)) => self.buffer.extend_from_slice(&chunk),
+                Some(Err(err)) => return Err(anyhow!(err).context("the video stream failed")),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// The client-side pre-roll: recent frames, bounded by a frame cap and a byte
+/// cap so a high-resolution or high-frame-rate camera cannot grow the process.
+///
+/// The ring lives in the client, not the daemon: the daemon's decision was that
+/// *detection* becomes a shared service, and a per-camera frame ring would cost
+/// permanent memory whether or not anything is watching.
+struct MotionRing {
+    frames: VecDeque<(Instant, Vec<u8>)>,
+    bytes: usize,
+    max_frames: usize,
+    max_bytes: usize,
+}
+
+impl MotionRing {
+    fn new() -> Self {
+        Self::with_caps(MOTION_RING_MAX_FRAMES, MOTION_RING_MAX_BYTES)
+    }
+
+    fn with_caps(max_frames: usize, max_bytes: usize) -> Self {
+        Self {
+            frames: VecDeque::new(),
+            bytes: 0,
+            max_frames,
+            max_bytes,
+        }
+    }
+
+    /// Keep a frame. Until a trigger, anything older than `pre` is dropped;
+    /// after one (`held`), frames are kept regardless of age so the pre-roll
+    /// survives the post-roll, and the caps still bound the result.
+    fn push(&mut self, frame: Vec<u8>, pre: Duration, held: bool) {
+        self.bytes += frame.len();
+        self.frames.push_back((Instant::now(), frame));
+
+        if !held {
+            let now = Instant::now();
+            while let Some((at, _)) = self.frames.front() {
+                match now.checked_sub(pre) {
+                    Some(cutoff) if *at < cutoff => {
+                        if let Some((_, frame)) = self.frames.pop_front() {
+                            self.bytes -= frame.len();
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        while self.frames.len() > self.max_frames || self.bytes > self.max_bytes {
+            match self.frames.pop_front() {
+                Some((_, frame)) => self.bytes -= frame.len(),
+                None => break,
+            }
+        }
+    }
+
+    fn last(&self) -> Option<Vec<u8>> {
+        self.frames.back().map(|(_, frame)| frame.clone())
+    }
+
+    /// The wall-clock span the ring covers, used to report the real frame rate.
+    fn duration(&self) -> Duration {
+        match (self.frames.front(), self.frames.back()) {
+            (Some((first, _)), Some((last, _))) => last.duration_since(*first),
+            _ => Duration::ZERO,
+        }
+    }
+
+    fn take(&mut self) -> Vec<Vec<u8>> {
+        self.bytes = 0;
+        self.frames
+            .drain(..)
+            .map(|(_, frame)| frame)
+            .collect::<Vec<_>>()
+    }
+}
+
+/// Frames per second implied by a capture, clamped to what `create_avi_mjpeg`
+/// and every player accept.
+fn frames_per_second(count: usize, elapsed: Duration) -> u32 {
+    let seconds = elapsed.as_secs_f64();
+    if count == 0 || seconds <= 0.0 {
+        return DEFAULT_VIDEO_FPS;
+    }
+    (count as f64 / seconds).round().clamp(1.0, 60.0) as u32
+}
+
+/// Outline a verdict's motion bounds on a frame.
+///
+/// The bounds are in analysis pixels and the frame is in camera pixels, so the
+/// box is scaled by the ratio of the two geometries. The output frame's width
+/// is the decoded image's own width - never inferred from the buffer length,
+/// which only names a square frame's width and scatters the outline over
+/// unrelated pixels on every real, wider frame.
+fn outline_motion(jpeg: &[u8], verdict: &MotionVerdict) -> Result<Vec<u8>> {
+    let Some(bbox) = verdict.bbox else {
+        // Nothing moved in this verdict: the frame is saved as it stands.
+        return Ok(jpeg.to_vec());
+    };
+    if verdict.detector_width == 0 || verdict.detector_height == 0 {
+        return Ok(jpeg.to_vec());
+    }
+
+    let mut frame = load_from_memory(jpeg)
+        .context("failed to decode the frame for outlining")?
+        .to_rgb8();
+    let (width, height) = frame.dimensions();
+
+    let scale_x = f64::from(width) / verdict.detector_width as f64;
+    let scale_y = f64::from(height) / verdict.detector_height as f64;
+    let left = (bbox.x as f64 * scale_x).floor() as i64;
+    let top = (bbox.y as f64 * scale_y).floor() as i64;
+    let right = (((bbox.x + bbox.width) as f64) * scale_x).ceil() as i64 - 1;
+    let bottom = (((bbox.y + bbox.height) as f64) * scale_y).ceil() as i64 - 1;
+
+    draw_rect_outline(
+        &mut frame,
+        left,
+        top,
+        right,
+        bottom,
+        MOTION_OUTLINE_THICKNESS,
+    );
+    encode_rgb_to_jpeg(width, height, frame.into_raw())
+}
+
+/// Draw a red rectangle outline, clipped to the image.
+fn draw_rect_outline(
+    frame: &mut RgbImage,
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+    thickness: i64,
+) {
+    let width = i64::from(frame.width());
+    let height = i64::from(frame.height());
+    if width == 0 || height == 0 || right < left || bottom < top {
+        return;
+    }
+
+    for y in top.max(0)..=bottom.min(height - 1) {
+        for x in left.max(0)..=right.min(width - 1) {
+            let vertical = x < left + thickness || x > right - thickness;
+            let horizontal = y < top + thickness || y > bottom - thickness;
+            if vertical || horizontal {
+                frame.put_pixel(x as u32, y as u32, image::Rgb([255, 0, 0]));
+            }
+        }
     }
 }
 
@@ -2569,7 +3322,11 @@ struct EventsQuery {
     /// and publishes the same number either way, so two clients filtering
     /// differently on one camera do not disagree about anything. It exists so a
     /// watcher waiting on a threshold does not have to receive every quiet
-    /// frame; omitting it emits every verdict.
+    /// frame, and `0` (the default) emits every verdict.
+    ///
+    /// A client that wants to distinguish "no new verdict" from "no motion"
+    /// must ask for everything: filtered-out verdicts are also gaps in
+    /// `sequence`, which is the signal that the detector is still running.
     #[serde(default)]
     min_area: usize,
 }
@@ -5582,5 +6339,508 @@ mod tests {
             detector_config.min_sensitivity,
             motion::LightingInvariantConfig::default().min_sensitivity
         );
+    }
+
+    // =====================================================================
+    // `aeyes motion`: the client half. Exit-code contract, the streaming
+    // parsers, the client-side pre-roll ring, the still outline, and the
+    // end-to-end path against a real daemon on a fake camera.
+    // =====================================================================
+
+    fn motion_verdict(sequence: u64, changed_pixels: usize) -> MotionVerdict {
+        MotionVerdict {
+            camera: "cam-a".to_string(),
+            sequence,
+            detected: changed_pixels > 0,
+            changed_pixels,
+            bbox: None,
+            frame_width: 64,
+            frame_height: 64,
+            detector_width: 64,
+            detector_height: 64,
+            timestamp_ms: 1_700_000_000_000,
+            status: MotionStatus::Ok,
+        }
+    }
+
+    fn motion_args(timeout: Duration, post: Duration) -> MotionArgs {
+        MotionArgs {
+            camera: None,
+            min_area: 1,
+            wait: true,
+            timeout,
+            output: None,
+            clip: None,
+            frames: None,
+            pre: Duration::from_secs(2),
+            post,
+        }
+    }
+
+    #[test]
+    fn motion_exit_codes_distinguish_found_from_nothing_from_failure() {
+        assert_eq!(
+            (MOTION_EXIT_FOUND, MOTION_EXIT_NO_MOTION, MOTION_EXIT_FAILED),
+            (0, 1, 2),
+            "the documented contract is 0 = motion, 1 = no motion, >= 2 = failure"
+        );
+
+        let found = Ok(MotionOutcome::Detected(Box::new(motion_verdict(1, 5))));
+        assert_eq!(motion_exit_code(&found), 0);
+        assert_eq!(
+            motion_exit_code(&Ok(MotionOutcome::NoMotion { observed: 7 })),
+            1
+        );
+        // A real failure must not be reported as "nothing moved": that is the
+        // whole point of having a path that `anyhow` -> exit 1 cannot express.
+        assert_eq!(motion_exit_code(&Err(anyhow!("daemon is dead"))), 2);
+    }
+
+    #[test]
+    fn motion_flags_parse_and_detector_flags_stay_on_the_daemon() {
+        let cli = Cli::parse_from([
+            "aeyes",
+            "motion",
+            "--wait",
+            "--timeout",
+            "7",
+            "--min-area",
+            "20",
+            "-o",
+            "still.jpg",
+            "--clip",
+            "event.avi",
+            "--frames",
+            "frames-dir",
+            "--pre",
+            "3",
+            "--post",
+            "4",
+        ]);
+        let Some(Commands::Motion {
+            camera,
+            min_area,
+            wait,
+            timeout,
+            output,
+            clip,
+            frames,
+            pre,
+            post,
+            ..
+        }) = cli.command
+        else {
+            panic!("motion flags must parse into Commands::Motion");
+        };
+        assert_eq!(camera, None);
+        assert_eq!(min_area, 20);
+        assert!(wait);
+        assert_eq!(timeout, 7.0);
+        assert_eq!(output.as_deref(), Some(Path::new("still.jpg")));
+        assert_eq!(clip.as_deref(), Some(Path::new("event.avi")));
+        assert_eq!(frames.as_deref(), Some(Path::new("frames-dir")));
+        assert_eq!(pre, 3.0);
+        assert_eq!(post, 4.0);
+
+        // Defaults.
+        let cli = Cli::parse_from(["aeyes", "motion"]);
+        let Some(Commands::Motion {
+            min_area,
+            wait,
+            timeout,
+            pre,
+            post,
+            ..
+        }) = cli.command
+        else {
+            panic!("a bare motion command must parse");
+        };
+        assert_eq!(min_area, 1);
+        assert!(!wait);
+        assert_eq!(timeout, DEFAULT_MOTION_TIMEOUT_SECS);
+        assert_eq!(pre, DEFAULT_MOTION_PRE_SECS);
+        assert_eq!(post, DEFAULT_MOTION_POST_SECS);
+
+        // The detector-shaping flags live on the daemon now; the client must
+        // not accept them and silently ignore what it cannot change.
+        for flag in ["--threshold", "--no-sobel", "--no-lbp"] {
+            assert!(
+                Cli::try_parse_from(["aeyes", "motion", flag, "1"]).is_err()
+                    || Cli::try_parse_from(["aeyes", "motion", flag]).is_err(),
+                "{flag} must no longer exist on the client"
+            );
+        }
+    }
+
+    #[test]
+    fn motion_passes_filters_the_published_measurement() {
+        let quiet = motion_verdict(1, 4);
+        assert!(motion_passes(&quiet, 4));
+        assert!(!motion_passes(&quiet, 5));
+
+        // A verdict nobody could measure is not motion, whatever its count.
+        let failed = MotionVerdict {
+            changed_pixels: 4,
+            status: MotionStatus::DecodeError,
+            ..quiet.clone()
+        };
+        assert!(!motion_passes(&failed, 1));
+    }
+
+    #[test]
+    fn cam_route_accepts_default_and_named_cameras() {
+        assert_eq!(cam_route(None, "events"), "/cams/default/events");
+        assert_eq!(cam_route(Some("cam-a"), "motion"), "/cams/cam-a/motion");
+        assert_eq!(cam_route(Some("default"), "stream"), "/cams/default/stream");
+    }
+
+    #[test]
+    fn take_line_splits_ndjson_lines() {
+        let mut buffer = Vec::new();
+        // Nothing complete yet.
+        buffer.extend_from_slice(br#"{"sequence":1}"#);
+        assert_eq!(take_line(&mut buffer), None);
+
+        buffer.extend_from_slice(b"\n{\"sequence\":2}");
+        assert_eq!(take_line(&mut buffer).as_deref(), Some(r#"{"sequence":1}"#));
+        assert_eq!(take_line(&mut buffer), None, "the second line is partial");
+
+        // A CRLF line ending is tolerated and stripped.
+        buffer.extend_from_slice(b"\r\n");
+        assert_eq!(take_line(&mut buffer).as_deref(), Some(r#"{"sequence":2}"#));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn take_mjpeg_frame_reads_parts_by_content_length() {
+        // Exactly what `/stream` writes: a boundary, a part header and the JPEG.
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(b"--frame\r\n");
+        buffer.extend_from_slice(b"Content-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n");
+        buffer.extend_from_slice(&[0xff, 0xd8]);
+        // Only half the frame so far: no part yet, and nothing consumed.
+        assert_eq!(take_mjpeg_frame(&mut buffer), None);
+        assert!(buffer.starts_with(b"--frame\r\n"));
+
+        buffer.extend_from_slice(&[0x00, 0xd9]);
+        buffer.extend_from_slice(
+            b"\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 2\r\n\r\n\xff\xd8",
+        );
+        let first = take_mjpeg_frame(&mut buffer).expect("the first part is complete");
+        assert_eq!(first, vec![0xff, 0xd8, 0x00, 0xd9]);
+
+        // The second part is already buffered and complete.
+        let second = take_mjpeg_frame(&mut buffer).expect("the second part is complete");
+        assert_eq!(second, vec![0xff, 0xd8]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn content_length_of_reads_the_header_block() {
+        assert_eq!(
+            content_length_of(
+                b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 1234\r\n\r\n"
+            ),
+            Some(1234)
+        );
+        // Header names are case-insensitive on the wire.
+        assert_eq!(content_length_of(b"content-length: 7\r\n\r\n"), Some(7));
+        assert_eq!(
+            content_length_of(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"),
+            None
+        );
+        assert_eq!(
+            content_length_of(b"Content-Length: not-a-number\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn frames_per_second_reports_the_measured_rate_within_bounds() {
+        assert_eq!(frames_per_second(30, Duration::from_secs(1)), 30);
+        assert_eq!(frames_per_second(60, Duration::from_secs(2)), 30);
+        // Unmeasurable captures fall back to the documented default.
+        assert_eq!(
+            frames_per_second(0, Duration::from_secs(1)),
+            DEFAULT_VIDEO_FPS
+        );
+        assert_eq!(frames_per_second(10, Duration::ZERO), DEFAULT_VIDEO_FPS);
+        // A burst cannot produce a rate no player accepts.
+        assert_eq!(frames_per_second(1000, Duration::from_millis(1)), 60);
+        assert_eq!(frames_per_second(1, Duration::from_secs(10)), 1);
+    }
+
+    #[test]
+    fn motion_ring_expires_frames_before_a_trigger_and_holds_them_after() {
+        let frame = |size: usize| vec![0u8; size];
+        let pre = Duration::from_millis(50);
+
+        let mut ring = MotionRing::with_caps(240, 1024);
+        ring.push(frame(10), pre, false);
+        ring.push(frame(10), pre, false);
+        assert_eq!(ring.take().len(), 2);
+
+        // Age out everything older than the pre-roll window.
+        let mut ring = MotionRing::with_caps(240, 1024);
+        ring.push(frame(10), pre, false);
+        sleep_blocking(Duration::from_millis(80));
+        ring.push(frame(10), pre, false);
+        assert_eq!(
+            ring.take().len(),
+            1,
+            "only frames inside the pre-roll window survive"
+        );
+
+        // After a trigger nothing is expired by age, so the pre-roll is still
+        // there when the post-roll ends.
+        let mut ring = MotionRing::with_caps(240, 1024);
+        ring.push(frame(10), pre, false);
+        sleep_blocking(Duration::from_millis(80));
+        ring.push(frame(10), pre, true);
+        assert_eq!(
+            ring.take().len(),
+            2,
+            "a held ring keeps the pre-roll across the post-roll"
+        );
+    }
+
+    #[test]
+    fn motion_ring_is_bounded_by_frames_and_by_bytes() {
+        let frame = vec![0u8; 100];
+
+        let mut by_frames = MotionRing::with_caps(3, 1_000_000);
+        for _ in 0..10 {
+            by_frames.push(frame.clone(), Duration::from_secs(60), false);
+        }
+        assert_eq!(by_frames.take().len(), 3);
+
+        let mut by_bytes = MotionRing::with_caps(240, 250);
+        for _ in 0..10 {
+            by_bytes.push(frame.clone(), Duration::from_secs(60), false);
+        }
+        let kept = by_bytes.take();
+        assert_eq!(kept.len(), 2, "the byte cap must bound the ring as well");
+        assert!(kept.iter().all(|frame| frame.len() == 100));
+    }
+
+    #[test]
+    fn motion_ring_reports_the_span_it_covers() {
+        let mut ring = MotionRing::with_caps(240, 1_000_000);
+        assert_eq!(ring.duration(), Duration::ZERO);
+        ring.push(vec![1, 2, 3], Duration::from_secs(60), false);
+        ring.push(vec![1, 2, 3], Duration::from_secs(60), false);
+        sleep_blocking(Duration::from_millis(30));
+        ring.push(vec![1, 2, 3], Duration::from_secs(60), false);
+
+        // Measured from the first to the last frame, not guessed.
+        assert!(ring.duration() >= Duration::from_millis(25));
+        assert_eq!(ring.last(), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn outline_motion_scales_the_bounds_from_analysis_to_frame_pixels() {
+        // 64x64 analysis, 256x256 frame: the box must land at 4x its
+        // coordinates, near the middle of the frame and not scattered by a
+        // sqrt-of-buffer-length width.
+        let frame = uniform_jpeg(256, 256);
+        let verdict = MotionVerdict {
+            bbox: Some(motion::MotionBox {
+                x: 16,
+                y: 16,
+                width: 8,
+                height: 8,
+            }),
+            detector_width: 64,
+            detector_height: 64,
+            frame_width: 256,
+            frame_height: 256,
+            ..motion_verdict(1, 64)
+        };
+
+        let outlined = outline_motion(&frame, &verdict).unwrap();
+        let image = image::load_from_memory(&outlined).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (256, 256));
+
+        let red = |x: u32, y: u32| {
+            let pixel = image.get_pixel(x, y).0;
+            pixel[0] > 170 && pixel[1] < 90 && pixel[2] < 90
+        };
+        // 16 analysis pixels * 4 = 64 frame pixels: the outline runs along
+        // x=64 and y=64.
+        assert!(
+            red(64, 90),
+            "the outline must be drawn at the scaled position"
+        );
+        assert!(
+            red(90, 64),
+            "the outline must be drawn at the scaled position"
+        );
+        assert!(
+            !red(10, 10),
+            "nothing may be drawn where the analysis geometry says nothing moved"
+        );
+        assert!(
+            !red(200, 200),
+            "nothing may be drawn where the analysis geometry says nothing moved"
+        );
+    }
+
+    #[test]
+    fn outline_motion_leaves_a_frameless_verdict_alone() {
+        let frame = uniform_jpeg(64, 64);
+        let verdict = motion_verdict(1, 0);
+        assert_eq!(verdict.bbox, None);
+        assert_eq!(outline_motion(&frame, &verdict).unwrap(), frame);
+    }
+
+    /// `MotionRing` uses real instants, so its expiry test needs real sleep.
+    fn sleep_blocking(duration: Duration) {
+        std::thread::sleep(duration);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn motion_command_detects_saves_a_still_a_clip_and_frames() {
+        let bind: SocketAddr = "127.0.0.1:43232".parse().unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame: vec![],
+            frames: vec![block_jpeg(64, 64, 8, 8), block_jpeg(64, 64, 20, 20)],
+            fail_open: None,
+            fail_capture: None,
+        };
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            test_motion_config(),
+            Box::new(backend),
+        ));
+        wait_for_daemon(bind).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let still = dir.path().join("still.jpg");
+        let clip = dir.path().join("event.avi");
+        let frames_dir = dir.path().join("frames");
+        let args = MotionArgs {
+            output: Some(still.clone()),
+            clip: Some(clip.clone()),
+            frames: Some(frames_dir.clone()),
+            wait: true,
+            timeout: Duration::from_secs(10),
+            pre: Duration::from_secs(1),
+            post: Duration::from_millis(300),
+            ..motion_args(Duration::from_secs(10), Duration::from_millis(300))
+        };
+
+        let outcome = motion_watch(bind, &args).await.unwrap();
+        let MotionOutcome::Detected(verdict) = &outcome else {
+            panic!("the moving block must be detected, got {outcome:?}");
+        };
+        assert!(verdict.changed_pixels >= 1);
+        assert_eq!(motion_exit_code(&Ok(outcome)), 0);
+
+        // The still is a real JPEG of the frame, with the bounds drawn on it.
+        let still_bytes = std::fs::read(&still).unwrap();
+        let image = image::load_from_memory(&still_bytes).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (64, 64));
+        assert!(
+            image
+                .pixels()
+                .any(|pixel| pixel.0[0] > 170 && pixel.0[1] < 90 && pixel.0[2] < 90),
+            "the still must show the motion bounds"
+        );
+
+        // The clip is a real AVI MJPEG with the pre-roll and the post-roll.
+        let avi = std::fs::read(&clip).unwrap();
+        assert!(avi.starts_with(b"RIFF"));
+        assert_eq!(&avi[8..12], b"AVI ");
+        assert!(avi.windows(4).any(|window| window == b"MJPG"));
+        let frame_count = avi.windows(4).filter(|window| *window == b"00db").count();
+        assert!(
+            frame_count >= 2,
+            "a clip must contain more than one frame, got {frame_count}"
+        );
+
+        // One JPEG per frame, numbered.
+        let mut written: Vec<_> = std::fs::read_dir(&frames_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        written.sort();
+        assert!(!written.is_empty());
+        assert_eq!(written[0], "frame-0001.jpg");
+        assert!(written.len() == frame_count);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn motion_command_reports_no_motion_within_the_budget() {
+        let bind: SocketAddr = "127.0.0.1:43233".parse().unwrap();
+        // A never-changing frame: the detector runs, sees nothing, and the
+        // command must report that rather than hang or fail.
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame: uniform_jpeg(64, 64),
+            frames: Vec::new(),
+            fail_open: None,
+            fail_capture: None,
+        };
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            test_motion_config(),
+            Box::new(backend),
+        ));
+        wait_for_daemon(bind).await;
+
+        let args = motion_args(Duration::from_millis(400), Duration::ZERO);
+        let outcome = motion_watch(bind, &args).await.unwrap();
+
+        let MotionOutcome::NoMotion { observed } = outcome else {
+            panic!("a static scene must not be reported as motion");
+        };
+        assert!(
+            observed > 0,
+            "the daemon must have been watched, not merely timed out"
+        );
+        assert_eq!(
+            motion_exit_code(&Ok(MotionOutcome::NoMotion { observed })),
+            1,
+            "no motion is exit 1, not a failure"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn motion_command_fails_with_a_real_exit_code_when_the_daemon_is_dead() {
+        // Nothing listens here, so this is a genuine failure, not "nothing
+        // moved": the distinction the exit code exists to make.
+        let dead: SocketAddr = "127.0.0.1:43234".parse().unwrap();
+        let args = motion_args(Duration::from_millis(200), Duration::ZERO);
+
+        let outcome = motion_watch(dead, &args).await;
+        assert!(outcome.is_err());
+        assert_eq!(motion_exit_code(&outcome), 2);
+    }
+
+    /// Wait until the daemon answers `/health`.
+    async fn wait_for_daemon(bind: SocketAddr) {
+        let client = reqwest::Client::new();
+        for _ in 0..50 {
+            if let Ok(resp) = client.get(format!("http://{bind}/health")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("daemon did not become ready in time");
     }
 }
