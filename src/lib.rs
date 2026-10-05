@@ -6772,8 +6772,8 @@ mod tests {
             wait: true,
             timeout: Duration::from_secs(10),
             pre: Duration::from_secs(1),
-            post: Duration::from_millis(300),
-            ..motion_args(Duration::from_secs(10), Duration::from_millis(300))
+            post: Duration::from_secs(1),
+            ..motion_args(Duration::from_secs(10), Duration::from_secs(1))
         };
 
         let outcome = motion_watch(bind, &args).await.unwrap();
@@ -6794,12 +6794,15 @@ mod tests {
             "the still must show the motion bounds"
         );
 
-        // The clip is a real AVI MJPEG with the pre-roll and the post-roll.
+        // The clip is a real AVI MJPEG with the pre-roll and the post-roll. The
+        // frame count is read from the AVI header's `dwTotalFrames` instead of
+        // being counted by scanning for the `00db` chunk id, which the JPEG
+        // payload could contain by chance.
         let avi = std::fs::read(&clip).unwrap();
         assert!(avi.starts_with(b"RIFF"));
         assert_eq!(&avi[8..12], b"AVI ");
         assert!(avi.windows(4).any(|window| window == b"MJPG"));
-        let frame_count = avi.windows(4).filter(|window| *window == b"00db").count();
+        let frame_count = u32::from_le_bytes([avi[48], avi[49], avi[50], avi[51]]);
         assert!(
             frame_count >= 2,
             "a clip must contain more than one frame, got {frame_count}"
@@ -6813,7 +6816,11 @@ mod tests {
         written.sort();
         assert!(!written.is_empty());
         assert_eq!(written[0], "frame-0001.jpg");
-        assert!(written.len() == frame_count);
+        assert_eq!(
+            written.len() as u32,
+            frame_count,
+            "the clip and the frame dump must be the same recording"
+        );
 
         handle.abort();
         let _ = handle.await;
