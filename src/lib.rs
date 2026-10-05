@@ -115,6 +115,23 @@ pub enum Commands {
         /// Force capture format (MJPG/YUYV/YU12/YV12/NV12/RGB3/BGR3) instead of the device native/default mode
         #[arg(long)]
         format: Option<String>,
+        /// Motion detection: verdicts per second (1-60). The full-resolution JPEG decode, not the
+        /// analysis, is what this throttles
+        #[arg(long, default_value_t = DEFAULT_MOTION_HZ)]
+        motion_hz: u32,
+        /// Motion detection: width of the analysis frame in pixels (16-4096). Frames are downscaled
+        /// to this width, preserving aspect ratio, and are never upscaled
+        #[arg(long, default_value_t = DEFAULT_MOTION_WIDTH)]
+        motion_width: u32,
+        /// Motion detection: edge threshold (0-255); higher means only stronger edges count as motion
+        #[arg(long, default_value_t = DEFAULT_MOTION_THRESHOLD)]
+        motion_threshold: u8,
+        /// Motion detection: disable the Sobel (edge magnitude) stage
+        #[arg(long)]
+        motion_no_sobel: bool,
+        /// Motion detection: disable the LBP (local texture) stage
+        #[arg(long)]
+        motion_no_lbp: bool,
     },
     /// List available cameras
     Cams,
@@ -1408,7 +1425,21 @@ pub async fn run_cli() -> Result<()> {
             bind,
             resolution,
             format,
-        }) => start_daemon(camera, bind, cli_open_options(resolution, format)?).await,
+            motion_hz,
+            motion_width,
+            motion_threshold,
+            motion_no_sobel,
+            motion_no_lbp,
+        }) => {
+            let motion = MotionConfig {
+                hz: motion_hz,
+                width: motion_width,
+                threshold: motion_threshold,
+                use_sobel: !motion_no_sobel,
+                use_lbp: !motion_no_lbp,
+            };
+            start_daemon(camera, bind, cli_open_options(resolution, format)?, motion).await
+        }
         Some(Commands::Cams) => list_cameras_cmd(),
         Some(Commands::Frame {
             camera,
@@ -1530,6 +1561,7 @@ pub async fn start_daemon(
     requested_camera: Option<String>,
     bind: String,
     options: CameraOpenOptions,
+    motion: MotionConfig,
 ) -> Result<()> {
     let bind = parse_bind_address(&bind)?;
     fs::create_dir_all(runtime_dir())?;
@@ -1558,6 +1590,15 @@ pub async fn start_daemon(
     if let Some(format) = options.format {
         cmd.env("AEYES_FORMAT", String::from_utf8_lossy(&format).to_string());
     }
+    // Motion settings change what the detector measures, so they belong to the
+    // daemon rather than to a request: one camera, one detector, one set of
+    // thresholds, however many clients subscribe.
+    let motion = motion.clamped();
+    cmd.env("AEYES_MOTION_HZ", motion.hz.to_string())
+        .env("AEYES_MOTION_WIDTH", motion.width.to_string())
+        .env("AEYES_MOTION_THRESHOLD", motion.threshold.to_string())
+        .env("AEYES_MOTION_SOBEL", u8::from(motion.use_sobel).to_string())
+        .env("AEYES_MOTION_LBP", u8::from(motion.use_lbp).to_string());
     let child = cmd.spawn().context("failed to spawn daemon")?;
     let pid = child.id().context("missing daemon pid")?;
     fs::write(pid_path(), pid.to_string())?;
@@ -1638,9 +1679,17 @@ async fn ensure_daemon_running(
             .or_else(|_| cams.first().cloned().context("no cameras available"))?
     };
     let bind_str = env::var("AEYES_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    start_daemon(Some(chosen.id.clone()), bind_str, options.clone())
-        .await
-        .context("failed to auto-start daemon")?;
+    // Carry the caller's `AEYES_MOTION_*` settings into the auto-started
+    // daemon, so `AEYES_MOTION_HZ=30 aeyes frame` configures the detector it
+    // implicitly starts.
+    start_daemon(
+        Some(chosen.id.clone()),
+        bind_str,
+        options.clone(),
+        motion_config_from_env(),
+    )
+    .await
+    .context("failed to auto-start daemon")?;
 
     // Wait for daemon to be ready
     for _ in 0..100 {
@@ -1838,17 +1887,25 @@ pub async fn run_daemon_from_env() -> Result<()> {
 /// Invalid values fall back to the default rather than failing the daemon,
 /// matching `AEYES_IDLE_TIMEOUT_SECS`.
 fn motion_config_from_env() -> MotionConfig {
+    motion_config_from_lookup(|name| env::var(name).ok())
+}
+
+/// The environment-variable half of the daemon's motion configuration.
+///
+/// Split from the `env::var` call so the fallbacks, the boolean spellings and
+/// the clamping are all testable without mutating this process's environment.
+fn motion_config_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> MotionConfig {
     let env_u32 = |name: &str, default: u32| {
-        env::var(name)
-            .ok()
+        lookup(name)
             .and_then(|value| value.trim().parse().ok())
             .unwrap_or(default)
     };
-    let env_flag = |name: &str, default: bool| {
-        env::var(name)
-            .ok()
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(default)
+    let env_flag = |name: &str, default: bool| match lookup(name).as_deref().map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        // An unrecognized value keeps the default: silently reading it as
+        // "off" would change what is detected.
+        _ => default,
     };
     MotionConfig {
         hz: env_u32("AEYES_MOTION_HZ", DEFAULT_MOTION_HZ),
@@ -5363,5 +5420,167 @@ mod tests {
 
         handle.abort();
         let _ = handle.await;
+    }
+
+    // =====================================================================
+    // Daemon motion configuration: defaults, `AEYES_MOTION_*` fallbacks and
+    // the ranges the daemon enforces on whatever it is handed.
+    // =====================================================================
+
+    #[test]
+    fn motion_config_defaults_to_the_documented_values() {
+        let config = motion_config_from_lookup(|_| None);
+        assert_eq!(config.hz, DEFAULT_MOTION_HZ);
+        assert_eq!(config.width, DEFAULT_MOTION_WIDTH);
+        assert_eq!(config.threshold, DEFAULT_MOTION_THRESHOLD);
+        assert!(config.use_sobel);
+        assert!(config.use_lbp);
+    }
+
+    #[test]
+    fn motion_config_reads_the_environment_variables() {
+        let config = motion_config_from_lookup(|name| match name {
+            "AEYES_MOTION_HZ" => Some("30".to_string()),
+            "AEYES_MOTION_WIDTH" => Some("160".to_string()),
+            "AEYES_MOTION_THRESHOLD" => Some("40".to_string()),
+            "AEYES_MOTION_SOBEL" => Some("0".to_string()),
+            "AEYES_MOTION_LBP" => Some("false".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.hz, 30);
+        assert_eq!(config.width, 160);
+        assert_eq!(config.threshold, 40);
+        assert!(!config.use_sobel);
+        assert!(!config.use_lbp);
+
+        // Every documented spelling of "yes" is accepted.
+        for value in ["1", "true", "yes", "on"] {
+            let config = motion_config_from_lookup(|_| Some(value.to_string()));
+            assert!(config.use_sobel, "'{value}' must mean yes");
+        }
+    }
+
+    #[test]
+    fn motion_config_keeps_defaults_for_unparseable_and_out_of_range_values() {
+        // Unparseable numbers fall back to the default rather than failing the
+        // daemon, matching AEYES_IDLE_TIMEOUT_SECS.
+        let config = motion_config_from_lookup(|name| match name {
+            "AEYES_MOTION_HZ" => Some("fast".to_string()),
+            "AEYES_MOTION_WIDTH" => Some(String::new()),
+            "AEYES_MOTION_SOBEL" => Some("maybe".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.hz, DEFAULT_MOTION_HZ);
+        assert_eq!(config.width, DEFAULT_MOTION_WIDTH);
+        assert!(
+            config.use_sobel,
+            "an unrecognized flag value must keep the default"
+        );
+
+        // Out-of-range numbers are clamped into the documented range instead of
+        // producing a loop that spins or a detector that never scans.
+        let config = motion_config_from_lookup(|name| match name {
+            "AEYES_MOTION_HZ" => Some("0".to_string()),
+            "AEYES_MOTION_WIDTH" => Some("4".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.hz, 1);
+        assert_eq!(config.width, MIN_MOTION_WIDTH);
+    }
+
+    #[test]
+    fn motion_config_clamps_values_that_did_not_come_from_the_environment() {
+        let config = MotionConfig {
+            hz: 1000,
+            width: 1,
+            threshold: 200,
+            use_sobel: false,
+            use_lbp: false,
+        }
+        .clamped();
+        assert_eq!(config.hz, MAX_MOTION_HZ);
+        assert_eq!(config.width, MIN_MOTION_WIDTH);
+        // The threshold is a u8; its range is the type's range.
+        assert_eq!(config.threshold, 200);
+        assert!(!config.use_sobel);
+        assert!(!config.use_lbp);
+    }
+
+    #[test]
+    fn start_flags_parse_into_the_motion_configuration() {
+        let cli = Cli::parse_from([
+            "aeyes",
+            "start",
+            "--motion-hz",
+            "30",
+            "--motion-width",
+            "160",
+            "--motion-threshold",
+            "9",
+            "--motion-no-sobel",
+        ]);
+        let Some(Commands::Start {
+            motion_hz,
+            motion_width,
+            motion_threshold,
+            motion_no_sobel,
+            motion_no_lbp,
+            ..
+        }) = cli.command
+        else {
+            panic!("start flags must parse into Commands::Start");
+        };
+
+        assert_eq!(motion_hz, 30);
+        assert_eq!(motion_width, 160);
+        assert_eq!(motion_threshold, 9);
+        assert!(
+            motion_no_sobel,
+            "--motion-no-sobel must disable the Sobel stage"
+        );
+        assert!(
+            !motion_no_lbp,
+            "the LBP stage stays on unless --motion-no-lbp is given"
+        );
+
+        // Omitted flags fall back to the documented defaults.
+        let cli = Cli::parse_from(["aeyes", "start"]);
+        let Some(Commands::Start {
+            motion_hz,
+            motion_width,
+            motion_threshold,
+            motion_no_sobel,
+            motion_no_lbp,
+            ..
+        }) = cli.command
+        else {
+            panic!("a bare start must parse into Commands::Start");
+        };
+        assert_eq!(motion_hz, DEFAULT_MOTION_HZ);
+        assert_eq!(motion_width, DEFAULT_MOTION_WIDTH);
+        assert_eq!(motion_threshold, DEFAULT_MOTION_THRESHOLD);
+        assert!(!motion_no_sobel && !motion_no_lbp);
+    }
+
+    #[test]
+    fn motion_config_reaches_the_detector() {
+        let config = motion_config_from_lookup(|name| match name {
+            "AEYES_MOTION_THRESHOLD" => Some("7".to_string()),
+            "AEYES_MOTION_SOBEL" => Some("0".to_string()),
+            _ => None,
+        });
+        let detector_config = config.detector_config();
+        assert_eq!(detector_config.edge_threshold, 7);
+        assert!(!detector_config.use_sobel);
+        assert!(detector_config.use_lbp);
+        // The five preserved fixes keep their defaults.
+        assert_eq!(
+            detector_config.contrast_threshold,
+            motion::LightingInvariantConfig::default().contrast_threshold
+        );
+        assert_eq!(
+            detector_config.min_sensitivity,
+            motion::LightingInvariantConfig::default().min_sensitivity
+        );
     }
 }
