@@ -1548,7 +1548,12 @@ pub async fn run_cli() -> Result<()> {
                 pre: Duration::from_secs_f64(pre.max(0.0)),
                 post: Duration::from_secs_f64(post.max(0.0)),
             };
-            let outcome = motion_cmd(args, cli_open_options(resolution, format)?).await;
+            // A flag that cannot be parsed is a failure, not "no motion": it
+            // must not reach the caller as exit 1.
+            let outcome = match cli_open_options(resolution, format) {
+                Ok(options) => motion_cmd(args, options).await,
+                Err(err) => Err(err),
+            };
             if let Err(err) = &outcome {
                 eprintln!("aeyes motion: {err:#}");
             }
@@ -2934,9 +2939,10 @@ fn analyze_motion_frame(
         return MotionAnalysis::unanalysed(
             MotionStatus::GeometryMismatch,
             format!(
-                "motion: decoded {frame_width}x{frame_height} frame yields a 
-                 {detector_width}x{detector_height} analysis frame, which is smaller than the 
-                 {}x{} the detector needs",
+                "motion: decoded {frame_width}x{frame_height} frame yields a {}x{} analysis frame, \
+                 which is smaller than the {}x{} the detector needs",
+                detector_width,
+                detector_height,
                 motion::MIN_SCAN_DIMENSION,
                 motion::MIN_SCAN_DIMENSION
             ),
