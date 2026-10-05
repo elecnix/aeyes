@@ -36,8 +36,11 @@ use std::{
     env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -54,6 +57,25 @@ const DEFAULT_VIDEO_MAX_LENGTH_SECS: f64 = 5.0;
 const DEFAULT_VIDEO_FPS: u32 = 15;
 const FRAME_WAIT_RETRIES: usize = 50;
 const FRAME_WAIT_MS: u64 = 100;
+/// How many verdicts a motion subscriber may fall behind before the broadcaster
+/// starts dropping them. Same shape as the frame channel.
+const MOTION_CHANNEL_CAPACITY: usize = 60;
+/// Verdicts per second. The expensive part of a verdict is the full-resolution
+/// JPEG decode, not the detector, so this throttles the decode rate.
+pub const DEFAULT_MOTION_HZ: u32 = 10;
+/// Maximum verdicts per second the daemon will run.
+pub const MAX_MOTION_HZ: u32 = 60;
+/// Width of the analysis frame. The decoded frame is downscaled to this width
+/// (never upscaled), preserving aspect ratio, so detector cost is independent
+/// of camera resolution.
+pub const DEFAULT_MOTION_WIDTH: u32 = 320;
+/// Narrowest analysis frame the daemon accepts (a narrower one is clamped up).
+pub const MIN_MOTION_WIDTH: u32 = 16;
+/// Widest analysis frame the daemon accepts (a wider one is clamped down).
+pub const MAX_MOTION_WIDTH: u32 = 4096;
+/// Edge threshold handed to the detector. Same default as
+/// `motion::LightingInvariantConfig::default()`.
+pub const DEFAULT_MOTION_THRESHOLD: u8 = 25;
 #[cfg(target_os = "linux")]
 const EXPOSURE_SAMPLE_INTERVAL: u32 = 8;
 #[cfg(target_os = "linux")]
@@ -479,6 +501,145 @@ struct CameraStreamState {
     latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
     last_error: Arc<RwLock<Option<DaemonErrorState>>>,
     frame_tx: broadcast::Sender<Vec<u8>>,
+    /// Most recent motion verdict, read by `GET /cams/{id}/motion`.
+    latest_motion: Arc<RwLock<Option<MotionVerdict>>>,
+    /// Verdict broadcast, subscribed to by `GET /cams/{id}/events`.
+    motion_tx: broadcast::Sender<MotionVerdict>,
+    /// Number of clients currently subscribed to this camera's verdicts.
+    /// Detection runs only while this is non-zero, so an idle daemon does not
+    /// decode full-resolution frames for nobody.
+    motion_watchers: Arc<AtomicUsize>,
+}
+
+/// How a motion verdict was produced.
+///
+/// `detected: false` alone cannot distinguish "the scene was still" from "the
+/// frame could not be analysed", which is exactly how the old JPEG/RGB length
+/// mismatch stayed invisible. A verdict always states which of the two
+/// happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionStatus {
+    /// The frame was decoded, downscaled and scanned.
+    Ok,
+    /// The published JPEG could not be decoded.
+    DecodeError,
+    /// The frame decoded but does not match the geometry the detector scanned.
+    GeometryMismatch,
+}
+
+/// One frame's motion measurement, as published by the daemon.
+///
+/// This is the daemon's raw measurement: `changed_pixels` and `bbox` are in
+/// **analysis** pixels (see [`MotionConfig::width`]), while `frame_width`/
+/// `frame_height` are the camera's real decoded resolution. Clients apply their
+/// own policy (for example `--min-area`) to the published number instead of
+/// re-running a detector, so two clients can filter one stream differently
+/// without either changing what the other measures.
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
+pub struct MotionVerdict {
+    /// Camera the verdict belongs to.
+    pub camera: String,
+    /// Monotonic per-camera verdict counter, so a client can tell "no new
+    /// verdict" from "no motion".
+    pub sequence: u64,
+    /// True when the frame was analysed and at least one pixel changed.
+    pub detected: bool,
+    /// Number of pixels flagged as motion, in analysis pixels.
+    pub changed_pixels: usize,
+    /// Bounds of the flagged pixels, in analysis pixels; `None` when nothing
+    /// moved (or the frame could not be analysed).
+    pub bbox: Option<motion::MotionBox>,
+    /// Real decoded frame dimensions, in camera pixels.
+    pub frame_width: u32,
+    pub frame_height: u32,
+    /// Dimensions of the analysis frame the detector ran on. Stated rather
+    /// than assumed: the detector geometry is the camera's real resolution
+    /// downscaled, never a hardcoded 640x480.
+    pub detector_width: usize,
+    pub detector_height: usize,
+    /// Wall-clock time the verdict was published, in milliseconds since the
+    /// Unix epoch. The detector itself has no clock; the daemon's loop owns it.
+    pub timestamp_ms: u64,
+    /// How the verdict was produced.
+    pub status: MotionStatus,
+}
+
+/// Daemon-side motion detection settings.
+///
+/// These change what the measurement *is*, so they are daemon configuration
+/// rather than per-request parameters: a client asking for a different
+/// threshold would silently get every other client's detector instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MotionConfig {
+    /// Verdicts per second, clamped to `1..=MAX_MOTION_HZ`.
+    pub hz: u32,
+    /// Analysis frame width, clamped to `MIN_MOTION_WIDTH..=MAX_MOTION_WIDTH`.
+    /// The decoded frame is downscaled to this width preserving aspect ratio
+    /// and is never upscaled.
+    pub width: u32,
+    /// Detector edge threshold.
+    pub threshold: u8,
+    /// Run the Sobel stage.
+    pub use_sobel: bool,
+    /// Run the LBP stage.
+    pub use_lbp: bool,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self {
+            hz: DEFAULT_MOTION_HZ,
+            width: DEFAULT_MOTION_WIDTH,
+            threshold: DEFAULT_MOTION_THRESHOLD,
+            use_sobel: true,
+            use_lbp: true,
+        }
+    }
+}
+
+impl MotionConfig {
+    /// The config with every value forced into its documented range, so an
+    /// out-of-range flag or environment variable cannot produce a detector
+    /// that never fires or a loop that spins.
+    pub fn clamped(self) -> Self {
+        Self {
+            hz: self.hz.clamp(1, MAX_MOTION_HZ),
+            width: self.width.clamp(MIN_MOTION_WIDTH, MAX_MOTION_WIDTH),
+            ..self
+        }
+    }
+
+    /// Detector tuning derived from the daemon settings.
+    fn detector_config(self) -> motion::LightingInvariantConfig {
+        motion::LightingInvariantConfig {
+            edge_threshold: self.threshold,
+            use_sobel: self.use_sobel,
+            use_lbp: self.use_lbp,
+            ..motion::LightingInvariantConfig::default()
+        }
+    }
+}
+
+/// Keeps a camera's watcher count raised for as long as it is alive.
+///
+/// Held by a streaming response for the life of its body, so the count is
+/// decremented on drop even when the client disconnects mid-stream.
+struct MotionWatcher {
+    watchers: Arc<AtomicUsize>,
+}
+
+impl MotionWatcher {
+    fn register(watchers: Arc<AtomicUsize>) -> Self {
+        watchers.fetch_add(1, Ordering::SeqCst);
+        Self { watchers }
+    }
+}
+
+impl Drop for MotionWatcher {
+    fn drop(&mut self) {
+        self.watchers.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1661,13 +1822,52 @@ pub async fn run_daemon_from_env() -> Result<()> {
             .ok()
             .and_then(|v| parse_fourcc(&v).ok()),
     };
-    run_daemon(bind, selected_camera, options, Box::new(NativeBackend)).await
+    run_daemon(
+        bind,
+        selected_camera,
+        options,
+        motion_config_from_env(),
+        Box::new(NativeBackend),
+    )
+    .await
+}
+
+/// Daemon motion settings: `AEYES_MOTION_*` environment variables, falling
+/// back to the documented defaults.
+///
+/// Invalid values fall back to the default rather than failing the daemon,
+/// matching `AEYES_IDLE_TIMEOUT_SECS`.
+fn motion_config_from_env() -> MotionConfig {
+    let env_u32 = |name: &str, default: u32| {
+        env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    let env_flag = |name: &str, default: bool| {
+        env::var(name)
+            .ok()
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(default)
+    };
+    MotionConfig {
+        hz: env_u32("AEYES_MOTION_HZ", DEFAULT_MOTION_HZ),
+        width: env_u32("AEYES_MOTION_WIDTH", DEFAULT_MOTION_WIDTH),
+        threshold: env_u32(
+            "AEYES_MOTION_THRESHOLD",
+            u32::from(DEFAULT_MOTION_THRESHOLD),
+        ) as u8,
+        use_sobel: env_flag("AEYES_MOTION_SOBEL", true),
+        use_lbp: env_flag("AEYES_MOTION_LBP", true),
+    }
+    .clamped()
 }
 
 pub async fn run_daemon(
     bind: SocketAddr,
     selected_camera: String,
     options: CameraOpenOptions,
+    motion: MotionConfig,
     backend: Box<dyn CameraBackend>,
 ) -> Result<()> {
     fs::create_dir_all(runtime_dir())?;
@@ -1681,12 +1881,18 @@ pub async fn run_daemon(
         let latest_jpeg: Arc<RwLock<Option<Vec<u8>>>> = Arc::new(RwLock::new(None));
         let last_error: Arc<RwLock<Option<DaemonErrorState>>> = Arc::new(RwLock::new(None));
         let (frame_tx, _) = broadcast::channel::<Vec<u8>>(60);
+        let latest_motion: Arc<RwLock<Option<MotionVerdict>>> = Arc::new(RwLock::new(None));
+        let (motion_tx, _) = broadcast::channel::<MotionVerdict>(MOTION_CHANNEL_CAPACITY);
+        let motion_watchers = Arc::new(AtomicUsize::new(0));
         let stream_state = CameraStreamState {
             latest_jpeg: latest_jpeg.clone(),
             last_error: last_error.clone(),
             frame_tx: frame_tx.clone(),
+            latest_motion: latest_motion.clone(),
+            motion_tx: motion_tx.clone(),
+            motion_watchers: motion_watchers.clone(),
         };
-        streams.insert(camera.id.clone(), stream_state);
+        streams.insert(camera.id.clone(), stream_state.clone());
 
         let backend = backend.clone();
         let camera_id = camera.id.clone();
@@ -1704,6 +1910,20 @@ pub async fn run_daemon(
             {
                 warn!(?err, camera = %camera_id, "camera loop exited");
             }
+        });
+
+        let camera_id = camera.id.clone();
+        let latest_jpeg = stream_state.latest_jpeg.clone();
+        tokio::spawn(async move {
+            motion_loop(
+                camera_id,
+                latest_jpeg,
+                latest_motion,
+                motion_tx,
+                motion_watchers,
+                motion,
+            )
+            .await;
         });
     }
 
@@ -1739,6 +1959,8 @@ pub async fn run_daemon(
         .route("/cams/{id}/frame", get(frame_http))
         .route("/cams/{id}/video", get(video_http))
         .route("/cams/{id}/stream", get(stream_http))
+        .route("/cams/{id}/motion", get(motion_http))
+        .route("/cams/{id}/events", get(events_http))
         .route("/web/{id}", get(web_ui_handler))
         .route("/chrome/tabs", get(chrome_tabs_handler))
         .route("/chrome/screenshot", get(chrome_screenshot_handler))
@@ -1797,6 +2019,286 @@ async fn camera_loop(
             }
         }
         sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// Geometry of the frame the detector scans: the decoded frame downscaled to
+/// `target_width`, preserving aspect ratio, and never upscaled.
+///
+/// Returns `(0, 0)` for a degenerate frame, which no detector can scan.
+fn analysis_dimensions(frame_width: u32, frame_height: u32, target_width: u32) -> (usize, usize) {
+    if frame_width == 0 || frame_height == 0 {
+        return (0, 0);
+    }
+    let target = target_width.clamp(MIN_MOTION_WIDTH, MAX_MOTION_WIDTH);
+    if frame_width <= target {
+        return (frame_width as usize, frame_height as usize);
+    }
+    let scale = f64::from(target) / f64::from(frame_width);
+    let height = ((f64::from(frame_height) * scale).round() as usize).max(1);
+    (target as usize, height)
+}
+
+/// The detector plus the analysis geometry it was built for.
+struct MotionDetectorState {
+    width: usize,
+    height: usize,
+    detector: motion::LightingInvariantDetector,
+}
+
+impl MotionDetectorState {
+    fn new(width: usize, height: usize, config: MotionConfig) -> Self {
+        Self {
+            width,
+            height,
+            detector: motion::LightingInvariantDetector::new(
+                width,
+                height,
+                config.detector_config(),
+            ),
+        }
+    }
+}
+
+/// Everything one analysed frame produced.
+struct MotionAnalysis {
+    status: MotionStatus,
+    changed_pixels: usize,
+    bbox: Option<motion::MotionBox>,
+    frame_width: u32,
+    frame_height: u32,
+    detector_width: usize,
+    detector_height: usize,
+    /// Why the frame could not be analysed, when it could not be. Logged once.
+    problem: Option<String>,
+}
+
+impl MotionAnalysis {
+    /// A frame that was not analysed. The measurement is empty, but `status`
+    /// says so, which `detected: false` alone cannot.
+    fn unanalysed(status: MotionStatus, problem: String) -> Self {
+        Self {
+            status,
+            changed_pixels: 0,
+            bbox: None,
+            frame_width: 0,
+            frame_height: 0,
+            detector_width: 0,
+            detector_height: 0,
+            problem: Some(problem),
+        }
+    }
+}
+
+/// Decode, downscale and detect one JPEG frame.
+///
+/// The daemon has no raw RGB: `OpenCamera::capture_jpeg` is the only capture
+/// shape, and both `latest_jpeg` and `frame_tx` carry JPEG. So this decodes,
+/// exactly as `analyze_mjpeg_frame` already does for the exposure path, which
+/// makes it work for MJPEG passthrough and for re-encoded YUYV/NV12/RGB3
+/// alike.
+///
+/// The decode is full-resolution and CPU-bound, so callers run this on the
+/// blocking pool and hold no lock across it.
+fn analyze_motion_frame(
+    state: &mut Option<MotionDetectorState>,
+    jpeg: &[u8],
+    config: MotionConfig,
+) -> MotionAnalysis {
+    let decoded = match load_from_memory(jpeg) {
+        Ok(image) => image.to_rgb8(),
+        Err(err) => {
+            return MotionAnalysis::unanalysed(
+                MotionStatus::DecodeError,
+                format!("motion: failed to decode the published JPEG frame: {err}"),
+            )
+        }
+    };
+    let (frame_width, frame_height) = decoded.dimensions();
+    let (detector_width, detector_height) =
+        analysis_dimensions(frame_width, frame_height, config.width);
+
+    // A frame too small to have an interior pixel is not "still", it is
+    // unanalysable; say so instead of reporting no motion forever.
+    if detector_width < motion::MIN_SCAN_DIMENSION || detector_height < motion::MIN_SCAN_DIMENSION {
+        return MotionAnalysis::unanalysed(
+            MotionStatus::GeometryMismatch,
+            format!(
+                "motion: decoded {frame_width}x{frame_height} frame yields a 
+                 {detector_width}x{detector_height} analysis frame, which is smaller than the 
+                 {}x{} the detector needs",
+                motion::MIN_SCAN_DIMENSION,
+                motion::MIN_SCAN_DIMENSION
+            ),
+        );
+    }
+
+    let rgb = if (detector_width, detector_height) == (frame_width as usize, frame_height as usize)
+    {
+        decoded.into_raw()
+    } else {
+        image::imageops::resize(
+            &decoded,
+            detector_width as u32,
+            detector_height as u32,
+            image::imageops::FilterType::Triangle,
+        )
+        .into_raw()
+    };
+
+    // The detector silently ignores a buffer whose length is not exactly
+    // `width * height * 3`, so a mismatch here must be reported, not scanned.
+    if rgb.len() != detector_width * detector_height * 3 {
+        return MotionAnalysis::unanalysed(
+            MotionStatus::GeometryMismatch,
+            format!(
+                "motion: analysis frame is {}x{} but its RGB buffer is {} bytes, expected {}",
+                detector_width,
+                detector_height,
+                rgb.len(),
+                detector_width * detector_height * 3
+            ),
+        );
+    }
+
+    // The detector geometry comes from the frame itself, so the hardcoded
+    // geometry the client used to assume cannot come back. A change of
+    // resolution rebuilds the detector (and loses its previous-frame state,
+    // which is why a camera that alternates resolutions will not detect
+    // motion across the change).
+    if state.as_ref().map(|s| (s.width, s.height)) != Some((detector_width, detector_height)) {
+        *state = Some(MotionDetectorState::new(
+            detector_width,
+            detector_height,
+            config,
+        ));
+    }
+    let Some(detector_state) = state.as_mut() else {
+        return MotionAnalysis::unanalysed(
+            MotionStatus::GeometryMismatch,
+            "motion: detector state was not constructed".to_string(),
+        );
+    };
+
+    let result = detector_state.detector.detect(&rgb);
+
+    MotionAnalysis {
+        status: MotionStatus::Ok,
+        changed_pixels: result.changed_pixels,
+        bbox: result.bbox,
+        frame_width,
+        frame_height,
+        detector_width,
+        detector_height,
+        problem: None,
+    }
+}
+
+/// Run one analyse step on the blocking pool, handing the detector state back.
+///
+/// Returns `None` only if the blocking task itself failed (a panic or a
+/// shutting-down runtime); the detector is then rebuilt from scratch on the
+/// next frame rather than reporting a stale measurement.
+async fn run_motion_analysis(
+    state: Option<MotionDetectorState>,
+    jpeg: Vec<u8>,
+    config: MotionConfig,
+) -> Option<(Option<MotionDetectorState>, MotionAnalysis)> {
+    tokio::task::spawn_blocking(move || {
+        let mut state = state;
+        let analysis = analyze_motion_frame(&mut state, &jpeg, config);
+        (state, analysis)
+    })
+    .await
+    .ok()
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Per-camera motion detection.
+///
+/// A task of its own, not inline in `camera_loop`: the decode and the scan are
+/// CPU-bound, and running them here means capture is never stalled by them (and
+/// no lock is ever held across them - the JPEG is cloned under a short read
+/// guard, and the analysis runs on the blocking pool).
+///
+/// Detection is gated on a subscriber count so an idle daemon does no decoding
+/// work, and throttled to `config.hz` because the full-resolution decode, not
+/// the analysis, is the expensive part.
+async fn motion_loop(
+    camera_id: String,
+    latest_jpeg: Arc<RwLock<Option<Vec<u8>>>>,
+    latest_motion: Arc<RwLock<Option<MotionVerdict>>>,
+    motion_tx: broadcast::Sender<MotionVerdict>,
+    watchers: Arc<AtomicUsize>,
+    config: MotionConfig,
+) {
+    let config = config.clamped();
+    let tick = Duration::from_millis(u64::from(1000 / config.hz).max(1));
+    let mut state: Option<MotionDetectorState> = None;
+    let mut sequence: u64 = 0;
+    let mut reported_problem: Option<String> = None;
+
+    loop {
+        sleep(tick).await;
+
+        if watchers.load(Ordering::SeqCst) == 0 {
+            continue;
+        }
+
+        // Short read lock: clone the current JPEG and release before touching
+        // it. The clone is one memcpy; the decode below is not.
+        let Some(jpeg) = latest_jpeg.read().await.clone() else {
+            continue;
+        };
+
+        let Some((state_back, analysis)) = run_motion_analysis(state.take(), jpeg, config).await
+        else {
+            warn!(camera = %camera_id, "motion analysis task failed; rebuilding the detector");
+            continue;
+        };
+        state = state_back;
+
+        match &analysis.problem {
+            // Once per distinct problem: a frame that cannot be analysed must
+            // not look like a quiet scene forever, and must not flood the log
+            // either.
+            Some(problem) if reported_problem.as_deref() != Some(problem.as_str()) => {
+                warn!(camera = %camera_id, "{problem}");
+                reported_problem = Some(problem.clone());
+            }
+            Some(_) => {}
+            None => reported_problem = None,
+        }
+
+        sequence += 1;
+        let verdict = MotionVerdict {
+            camera: camera_id.clone(),
+            sequence,
+            detected: analysis.status == MotionStatus::Ok && analysis.changed_pixels > 0,
+            changed_pixels: analysis.changed_pixels,
+            bbox: analysis.bbox,
+            frame_width: analysis.frame_width,
+            frame_height: analysis.frame_height,
+            detector_width: analysis.detector_width,
+            detector_height: analysis.detector_height,
+            timestamp_ms: unix_millis(),
+            status: analysis.status,
+        };
+
+        {
+            // Both are set under one lock acquisition, so a subscriber that
+            // wakes on the broadcast can never find a `latest_motion` that
+            // disagrees with the verdict it was handed.
+            let mut guard = latest_motion.write().await;
+            *guard = Some(verdict.clone());
+            let _ = motion_tx.send(verdict);
+        }
     }
 }
 
@@ -1997,6 +2499,171 @@ async fn stream_http(AxumPath(id): AxumPath<String>, State(state): State<AppStat
             header::CONTENT_TYPE,
             "multipart/x-mixed-replace; boundary=frame",
         )
+        .body(body)
+        .unwrap()
+}
+
+/// Query parameters of `GET /cams/{id}/events`.
+#[derive(Debug, serde::Deserialize)]
+struct EventsQuery {
+    /// Only emit verdicts whose `changed_pixels` is at least this value.
+    ///
+    /// This is an *emission* filter, not a measurement: the daemon computes
+    /// and publishes the same number either way, so two clients filtering
+    /// differently on one camera do not disagree about anything. It exists so a
+    /// watcher waiting on a threshold does not have to receive every quiet
+    /// frame; omitting it emits every verdict.
+    #[serde(default)]
+    min_area: usize,
+}
+
+/// How often an open `/events` stream refreshes `last_activity`.
+///
+/// The idle watchdog reads that field and calls `process::exit(0)` when it has
+/// gone stale, but today it is only written at handler entry, so a long-lived
+/// stream can be killed mid-flight. The refresh period is well below any
+/// useful idle timeout, so a connected client keeps the daemon alive.
+const EVENTS_ACTIVITY_REFRESH: Duration = Duration::from_secs(1);
+
+/// `GET /cams/{id}/motion` - the latest verdict for a camera.
+///
+/// The verdict is one the detector produced *after* this request arrived, not
+/// whatever happens to be cached: detection only runs while someone is
+/// watching, so serving a cached verdict would report the state of the scene
+/// at some earlier subscription. Asking also registers the caller as a watcher
+/// for the life of the request, which is what makes the detector run at all.
+async fn motion_http(AxumPath(id): AxumPath<String>, State(state): State<AppState>) -> Response {
+    *state.last_activity.write().await = Instant::now();
+    let requested = if id == "default" {
+        state.selected_camera.clone()
+    } else {
+        id
+    };
+
+    let Some(stream) = state.streams.get(&requested).cloned() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            DaemonErrorState::new(format!(
+                "camera '{requested}' is not managed by this daemon"
+            ))
+            .with_detail(format!(
+                "available cameras: {}",
+                state.streams.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+            .with_detail("request one of the IDs returned by GET /cams"),
+        );
+    };
+
+    // Asking for the latest verdict is a subscription for the duration of the
+    // request: detection only runs while someone is watching, so without this
+    // a verdict would exist only when some *other* client happened to be
+    // streaming.
+    let _watcher = MotionWatcher::register(stream.motion_watchers.clone());
+
+    // A verdict published before this request (or before this request's
+    // watcher registration) describes an earlier moment and must not be served
+    // as "what is happening now". `sequence` is the daemon's monotonic counter,
+    // so a greater value is by construction a verdict produced later.
+    let baseline = stream
+        .latest_motion
+        .read()
+        .await
+        .as_ref()
+        .map(|v| v.sequence);
+
+    for _ in 0..FRAME_WAIT_RETRIES {
+        if let Some(verdict) = stream.latest_motion.read().await.clone() {
+            let is_fresh = match baseline {
+                Some(previous) => verdict.sequence > previous,
+                None => true,
+            };
+            if is_fresh {
+                return Json(verdict).into_response();
+            }
+        }
+        sleep(Duration::from_millis(FRAME_WAIT_MS)).await;
+    }
+
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        DaemonErrorState::new("camera has not produced a motion verdict yet")
+            .with_detail(format!("camera id: {requested}"))
+            .with_detail("no verdict was available before the request timeout expired")
+            .with_detail(format!(
+                "waited approximately {} ms",
+                FRAME_WAIT_RETRIES as u64 * FRAME_WAIT_MS
+            )),
+    )
+}
+
+/// `GET /cams/{id}/events` - the verdict stream for a camera, as NDJSON.
+///
+async fn events_http(
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<EventsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    *state.last_activity.write().await = Instant::now();
+    let requested = if id == "default" {
+        state.selected_camera.clone()
+    } else {
+        id
+    };
+
+    let Some(stream) = state.streams.get(&requested).cloned() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            DaemonErrorState::new(format!(
+                "camera '{requested}' is not managed by this daemon"
+            ))
+            .with_detail(format!(
+                "available cameras: {}",
+                state.streams.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+            .with_detail("request one of the IDs returned by GET /cams"),
+        );
+    };
+
+    // Registered here rather than inside the stream so the detector resumes
+    // before the response starts flowing, and moved into the stream so a client
+    // that disconnects mid-stream still releases the subscription.
+    let watcher = MotionWatcher::register(stream.motion_watchers.clone());
+    let mut motion_rx = stream.motion_tx.subscribe();
+    let last_activity = state.last_activity.clone();
+    let min_area = params.min_area;
+
+    let body = Body::from_stream(async_stream::stream! {
+        let _watcher = watcher;
+
+        loop {
+            match tokio::time::timeout(EVENTS_ACTIVITY_REFRESH, motion_rx.recv()).await {
+                Ok(Ok(verdict)) => {
+                    *last_activity.write().await = Instant::now();
+                    if verdict.changed_pixels < min_area {
+                        continue;
+                    }
+                    if let Ok(mut line) = serde_json::to_string(&verdict) {
+                        line.push('\n');
+                        yield Ok::<_, axum::Error>(bytes::Bytes::from(line));
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    // A slow client missed verdicts; `sequence` gap tells it so.
+                    *last_activity.write().await = Instant::now();
+                    continue;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => {
+                    *last_activity.write().await = Instant::now();
+                }
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-store")
         .body(body)
         .unwrap()
 }
@@ -2887,6 +3554,7 @@ pub fn bgr24_to_jpeg(width: u32, height: u32, bytes: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use axum::http::{header, StatusCode};
+    use futures_util::StreamExt;
     #[cfg(not(target_os = "linux"))]
     use nokhwa::utils::CameraIndex;
     use reqwest::StatusCode as ReqwestStatus;
@@ -2897,12 +3565,17 @@ mod tests {
     struct FakeBackend {
         cameras: Vec<CameraDescriptor>,
         frame: Vec<u8>,
+        /// When non-empty, each `capture_jpeg` returns the next frame in turn,
+        /// so a detector watching the stream sees a change.
+        frames: Vec<Vec<u8>>,
         fail_open: Option<String>,
         fail_capture: Option<String>,
     }
 
     struct FakeOpenCamera {
         frame: Vec<u8>,
+        frames: Vec<Vec<u8>>,
+        next_frame: usize,
         fail_capture: Option<String>,
     }
 
@@ -2910,6 +3583,8 @@ mod tests {
         fn default() -> Self {
             Self {
                 frame: vec![0xff, 0xd8],
+                frames: Vec::new(),
+                next_frame: 0,
                 fail_capture: None,
             }
         }
@@ -2929,6 +3604,8 @@ mod tests {
             if self.cameras.iter().any(|c| c.id == id) {
                 Ok(Box::new(FakeOpenCamera {
                     frame: self.frame.clone(),
+                    frames: self.frames.clone(),
+                    next_frame: 0,
                     fail_capture: self.fail_capture.clone(),
                 }))
             } else {
@@ -2945,7 +3622,27 @@ mod tests {
             if let Some(message) = &self.fail_capture {
                 bail!(message.clone());
             }
-            Ok(self.frame.clone())
+            if self.frames.is_empty() {
+                return Ok(self.frame.clone());
+            }
+            let frame = self.frames[self.next_frame % self.frames.len()].clone();
+            self.next_frame += 1;
+            Ok(frame)
+        }
+    }
+
+    /// A camera stream state with no motion history, for tests that only care
+    /// about the frame path.
+    fn stream_state(latest_jpeg: Option<Vec<u8>>) -> CameraStreamState {
+        let (frame_tx, _) = broadcast::channel(60);
+        let (motion_tx, _) = broadcast::channel(MOTION_CHANNEL_CAPACITY);
+        CameraStreamState {
+            latest_jpeg: Arc::new(RwLock::new(latest_jpeg)),
+            last_error: Arc::new(RwLock::new(None)),
+            frame_tx,
+            latest_motion: Arc::new(RwLock::new(None)),
+            motion_tx,
+            motion_watchers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -2966,24 +3663,8 @@ mod tests {
 
     fn default_state() -> AppState {
         let mut streams = HashMap::new();
-        let (tx_a, _) = broadcast::channel(60);
-        streams.insert(
-            "cam-a".to_string(),
-            CameraStreamState {
-                latest_jpeg: Arc::new(RwLock::new(None)),
-                last_error: Arc::new(RwLock::new(None)),
-                frame_tx: tx_a,
-            },
-        );
-        let (tx_b, _) = broadcast::channel(60);
-        streams.insert(
-            "cam-b".to_string(),
-            CameraStreamState {
-                latest_jpeg: Arc::new(RwLock::new(None)),
-                last_error: Arc::new(RwLock::new(None)),
-                frame_tx: tx_b,
-            },
-        );
+        streams.insert("cam-a".to_string(), stream_state(None));
+        streams.insert("cam-b".to_string(), stream_state(None));
         AppState {
             selected_camera: "cam-a".to_string(),
             streams: Arc::new(streams),
@@ -3368,15 +4049,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_cams_http() {
         let mut streams = HashMap::new();
-        let (tx, _) = broadcast::channel(60);
-        streams.insert(
-            "cam-a".to_string(),
-            CameraStreamState {
-                latest_jpeg: Arc::new(RwLock::new(None)),
-                last_error: Arc::new(RwLock::new(None)),
-                frame_tx: tx,
-            },
-        );
+        streams.insert("cam-a".to_string(), stream_state(None));
         let state = AppState {
             selected_camera: "cam-a".to_string(),
             streams: Arc::new(streams),
@@ -3397,15 +4070,7 @@ mod tests {
     async fn test_frame_http_success_default() {
         let jpeg = vec![0xff, 0xd8, 0xff];
         let mut streams = HashMap::new();
-        let (tx, _) = broadcast::channel(60);
-        streams.insert(
-            "cam-a".to_string(),
-            CameraStreamState {
-                latest_jpeg: Arc::new(RwLock::new(Some(jpeg.clone()))),
-                last_error: Arc::new(RwLock::new(None)),
-                frame_tx: tx,
-            },
-        );
+        streams.insert("cam-a".to_string(), stream_state(Some(jpeg.clone())));
         let state = AppState {
             selected_camera: "cam-a".to_string(),
             streams: Arc::new(streams),
@@ -3450,6 +4115,7 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
+            frames: Vec::new(),
             fail_open: None,
             fail_capture: None,
         };
@@ -3458,6 +4124,7 @@ mod tests {
             bind,
             "cam-a".into(),
             CameraOpenOptions::default(),
+            MotionConfig::default(),
             Box::new(backend),
         ));
 
@@ -3504,6 +4171,7 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame: vec![],
+            frames: Vec::new(),
             fail_open: Some("simulated open failure".into()),
             fail_capture: None,
         };
@@ -3511,6 +4179,7 @@ mod tests {
             bind,
             "cam-a".into(),
             CameraOpenOptions::default(),
+            MotionConfig::default(),
             Box::new(backend),
         ));
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3535,6 +4204,7 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame: vec![],
+            frames: Vec::new(),
             fail_open: None,
             fail_capture: Some("simulated capture failure".into()),
         };
@@ -3543,6 +4213,7 @@ mod tests {
             bind,
             "cam-a".into(),
             CameraOpenOptions::default(),
+            MotionConfig::default(),
             Box::new(backend),
         ));
         sleep(Duration::from_millis(400)).await;
@@ -3570,6 +4241,7 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
+            frames: Vec::new(),
             fail_open: None,
             fail_capture: None,
         };
@@ -3578,6 +4250,7 @@ mod tests {
             bind,
             "cam-a".into(),
             CameraOpenOptions::default(),
+            MotionConfig::default(),
             Box::new(backend),
         ));
         let client = reqwest::Client::new();
@@ -3650,6 +4323,7 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
+            frames: Vec::new(),
             fail_open: None,
             fail_capture: None,
         };
@@ -3658,6 +4332,7 @@ mod tests {
             bind,
             "cam-a".into(),
             CameraOpenOptions::default(),
+            MotionConfig::default(),
             Box::new(backend),
         ));
 
@@ -3702,6 +4377,7 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
+            frames: Vec::new(),
             fail_open: None,
             fail_capture: None,
         };
@@ -3710,6 +4386,7 @@ mod tests {
             bind,
             "cam-a".into(),
             CameraOpenOptions::default(),
+            MotionConfig::default(),
             Box::new(backend),
         ));
 
@@ -3753,6 +4430,7 @@ mod tests {
         let backend = FakeBackend {
             cameras: fake_cameras(),
             frame,
+            frames: Vec::new(),
             fail_open: None,
             fail_capture: None,
         };
@@ -3761,6 +4439,7 @@ mod tests {
             bind,
             "cam-a".into(),
             CameraOpenOptions::default(),
+            MotionConfig::default(),
             Box::new(backend),
         ));
 
@@ -4094,5 +4773,595 @@ mod tests {
         let summary = summarize_supported(&supported);
         assert!(summary.contains("YUYV"));
         assert!(summary.contains("320x320"));
+    }
+
+    // =====================================================================
+    // Motion detection: the daemon-side pipeline, the watcher gate, the
+    // verdict publication and the two endpoints. None of these need a camera.
+    // =====================================================================
+
+    /// A `width`x`height` JPEG of a solid mid-grey frame. Decoding the same
+    /// bytes twice yields identical pixels, so a detector sees no change.
+    fn uniform_jpeg(width: u32, height: u32) -> Vec<u8> {
+        encode_rgb_to_jpeg(width, height, vec![128u8; (width * height * 3) as usize]).unwrap()
+    }
+
+    /// A `width`x`height` JPEG with a 20x20 dark block whose top-left corner is
+    /// at (`x`, `y`), on a lighter background.
+    fn block_jpeg(width: u32, height: u32, x: usize, y: usize) -> Vec<u8> {
+        let mut rgb = vec![150u8; (width * height * 3) as usize];
+        for row in y..(y + 20).min(height as usize) {
+            for col in x..(x + 20).min(width as usize) {
+                let idx = (row * width as usize + col) * 3;
+                rgb[idx] = 20;
+                rgb[idx + 1] = 20;
+                rgb[idx + 2] = 20;
+            }
+        }
+        encode_rgb_to_jpeg(width, height, rgb).unwrap()
+    }
+
+    fn test_motion_config() -> MotionConfig {
+        MotionConfig {
+            hz: 50,
+            width: 64,
+            ..MotionConfig::default()
+        }
+    }
+
+    /// Run `motion_loop` for this test and hand back the stream state it feeds.
+    fn spawn_motion_loop(jpeg: Option<Vec<u8>>) -> CameraStreamState {
+        let stream = stream_state(jpeg);
+        tokio::spawn(motion_loop(
+            "cam-a".to_string(),
+            stream.latest_jpeg.clone(),
+            stream.latest_motion.clone(),
+            stream.motion_tx.clone(),
+            stream.motion_watchers.clone(),
+            test_motion_config(),
+        ));
+        stream
+    }
+
+    #[test]
+    fn analysis_dimensions_downscales_preserving_aspect_ratio() {
+        assert_eq!(analysis_dimensions(1920, 1080, 320), (320, 180));
+        assert_eq!(analysis_dimensions(640, 480, 320), (320, 240));
+        assert_eq!(analysis_dimensions(1280, 720, 320), (320, 180));
+        // A 4:3 frame that rounds to an odd height must still be a real height.
+        assert_eq!(analysis_dimensions(1000, 333, 320), (320, 107));
+    }
+
+    #[test]
+    fn analysis_dimensions_never_upscales_and_is_clamped() {
+        // Smaller than the target: the frame's own size is used, not the target.
+        assert_eq!(analysis_dimensions(100, 50, 320), (100, 50));
+        assert_eq!(analysis_dimensions(320, 240, 320), (320, 240));
+        // Out-of-range targets are clamped by the same function the config uses.
+        assert_eq!(
+            analysis_dimensions(1000, 500, 0),
+            (MIN_MOTION_WIDTH as usize, 8)
+        );
+        assert_eq!(
+            analysis_dimensions(10_000, 10_000, 100_000),
+            (MAX_MOTION_WIDTH as usize, MAX_MOTION_WIDTH as usize)
+        );
+    }
+
+    #[test]
+    fn analysis_dimensions_rejects_degenerate_frames() {
+        assert_eq!(analysis_dimensions(0, 0, 320), (0, 0));
+        assert_eq!(analysis_dimensions(0, 480, 320), (0, 0));
+        assert_eq!(analysis_dimensions(640, 0, 320), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn analyze_motion_frame_reports_a_decode_error_instead_of_no_motion() {
+        let mut state = None;
+        let analysis = tokio::task::spawn_blocking(move || {
+            analyze_motion_frame(&mut state, b"this is not a JPEG", test_motion_config())
+        })
+        .await
+        .unwrap();
+
+        // A frame nobody could decode must not be reported as "the scene was
+        // still": `detected: false` is indistinguishable from a quiet scene.
+        assert_eq!(analysis.status, MotionStatus::DecodeError);
+        assert_eq!(analysis.changed_pixels, 0);
+        assert_eq!(analysis.bbox, None);
+        assert!(analysis.problem.is_some(), "the reason must be loggable");
+    }
+
+    #[tokio::test]
+    async fn analyze_motion_frame_reports_a_frame_too_small_to_scan() {
+        // A 2x2 frame is smaller than the detector's minimum scan dimension; a
+        // detector constructed for it would silently report no motion forever.
+        let jpeg = uniform_jpeg(2, 2);
+        let mut state = None;
+        let analysis = tokio::task::spawn_blocking(move || {
+            analyze_motion_frame(&mut state, &jpeg, test_motion_config())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(analysis.status, MotionStatus::GeometryMismatch);
+        assert!(analysis.problem.is_some());
+    }
+
+    #[tokio::test]
+    async fn analyze_motion_frame_uses_the_frames_real_geometry() {
+        // 400x300 decoded, analysis width 100: the detector geometry is derived
+        // from the frame, not from any hardcoded 640x480.
+        let jpeg = uniform_jpeg(400, 300);
+        let mut state = None;
+        let analysis = tokio::task::spawn_blocking(move || {
+            let mut config = test_motion_config();
+            config.width = 100;
+            analyze_motion_frame(&mut state, &jpeg, config)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(analysis.status, MotionStatus::Ok);
+        assert_eq!((analysis.frame_width, analysis.frame_height), (400, 300));
+        assert_eq!(
+            (analysis.detector_width, analysis.detector_height),
+            (100, 75)
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_motion_frame_detects_a_changed_frame_and_locates_it() {
+        // Two frames that differ only by a block moving 5 pixels: the fixture
+        // guarantees motion, and the bbox must be inside the frame.
+        let first = block_jpeg(64, 64, 8, 8);
+        let second = block_jpeg(64, 64, 13, 13);
+        let analysis = tokio::task::spawn_blocking(move || {
+            let mut state = None;
+            analyze_motion_frame(&mut state, &first, test_motion_config());
+            let mut analysis = analyze_motion_frame(&mut state, &second, test_motion_config());
+            analysis.problem = None;
+            analysis
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(analysis.status, MotionStatus::Ok);
+        assert!(
+            analysis.changed_pixels > 0,
+            "a moved block must register as motion"
+        );
+        let bbox = analysis.bbox.expect("motion must carry bounds");
+        assert!(bbox.x + bbox.width <= 64 && bbox.y + bbox.height <= 64);
+    }
+
+    #[tokio::test]
+    async fn analyze_motion_frame_rebuilds_the_detector_for_a_new_geometry() {
+        let first = uniform_jpeg(64, 64);
+        let second = uniform_jpeg(128, 64);
+        let analysis = tokio::task::spawn_blocking(move || {
+            let mut config = test_motion_config();
+            config.width = 128;
+            let mut state = None;
+            analyze_motion_frame(&mut state, &first, config);
+            let analysis = analyze_motion_frame(&mut state, &second, config);
+            (state, analysis)
+        })
+        .await
+        .unwrap();
+
+        let (state, analysis) = analysis;
+        assert_eq!(
+            (analysis.detector_width, analysis.detector_height),
+            (128, 64)
+        );
+        let state = state.expect("a detector must exist");
+        assert_eq!((state.width, state.height), (128, 64));
+    }
+
+    #[tokio::test]
+    async fn motion_watcher_guard_counts_subscribers() {
+        let watchers = Arc::new(AtomicUsize::new(0));
+        let first = MotionWatcher::register(watchers.clone());
+        assert_eq!(watchers.load(Ordering::SeqCst), 1);
+        let second = MotionWatcher::register(watchers.clone());
+        assert_eq!(watchers.load(Ordering::SeqCst), 2);
+
+        drop(first);
+        assert_eq!(watchers.load(Ordering::SeqCst), 1);
+        drop(second);
+        assert_eq!(watchers.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn motion_loop_does_no_work_without_a_watcher() {
+        let stream = spawn_motion_loop(Some(uniform_jpeg(64, 64)));
+        let mut rx = stream.motion_tx.subscribe();
+
+        // Several ticks with nobody watching: no verdict is produced at all.
+        sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            stream.latest_motion.read().await.is_none(),
+            "an unwatched camera must not spend CPU decoding frames"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "no verdict may be broadcast while nobody is subscribed"
+        );
+        assert_eq!(stream.motion_watchers.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn motion_loop_publishes_while_watched_and_keeps_both_copies_in_step() {
+        let stream = spawn_motion_loop(Some(uniform_jpeg(64, 64)));
+        let mut rx = stream.motion_tx.subscribe();
+        stream.motion_watchers.store(1, Ordering::SeqCst);
+
+        let broadcast = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a verdict must be published within the timeout")
+            .expect("the channel must stay open");
+
+        assert_eq!(broadcast.status, MotionStatus::Ok);
+        assert_eq!((broadcast.frame_width, broadcast.frame_height), (64, 64));
+        assert_eq!(
+            (broadcast.detector_width, broadcast.detector_height),
+            (64, 64),
+            "the detector geometry must be the frame's, not an assumed size"
+        );
+        assert!(broadcast.sequence >= 1);
+
+        // The broadcast copy and the stored copy describe the same verdict;
+        // they are written under one lock acquisition.
+        let stored = stream
+            .latest_motion
+            .read()
+            .await
+            .clone()
+            .expect("the latest verdict must be stored");
+        assert_eq!(stored.sequence, broadcast.sequence);
+        assert_eq!(stored, broadcast);
+        assert!(stored.timestamp_ms > 0);
+
+        // The sequence is monotonic across verdicts.
+        let next = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a second verdict must be published")
+            .expect("the channel must stay open");
+        assert!(
+            next.sequence > stored.sequence,
+            "sequence must increase so a client can tell 'no new verdict' from 'no motion'"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_loop_stops_when_the_last_watcher_leaves() {
+        let stream = spawn_motion_loop(Some(uniform_jpeg(64, 64)));
+        stream.motion_watchers.store(1, Ordering::SeqCst);
+
+        let mut observed = None;
+        for _ in 0..200 {
+            if let Some(verdict) = stream.latest_motion.read().await.clone() {
+                observed = Some(verdict);
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let observed = observed.expect("a verdict must be published while watched");
+
+        stream.motion_watchers.store(0, Ordering::SeqCst);
+        sleep(Duration::from_millis(200)).await;
+
+        let after = stream
+            .latest_motion
+            .read()
+            .await
+            .clone()
+            .expect("the last verdict stays readable");
+        assert_eq!(
+            after.sequence, observed.sequence,
+            "detection must stop when the last subscriber leaves"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_loop_reports_an_undecodable_frame_instead_of_going_silent() {
+        let stream = spawn_motion_loop(Some(b"not a jpeg frame".to_vec()));
+        stream.motion_watchers.store(1, Ordering::SeqCst);
+
+        let mut verdict = None;
+        for _ in 0..200 {
+            if let Some(current) = stream.latest_motion.read().await.clone() {
+                verdict = Some(current);
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let verdict = verdict.expect("a verdict must still be published");
+
+        assert_eq!(verdict.status, MotionStatus::DecodeError);
+        assert!(!verdict.detected);
+        assert_eq!(verdict.changed_pixels, 0);
+    }
+
+    #[tokio::test]
+    async fn motion_http_serves_a_verdict_produced_after_the_request_arrived() {
+        let state = default_state();
+        let stream = state.streams.get("cam-a").unwrap().clone();
+        let stale = MotionVerdict {
+            camera: "cam-a".to_string(),
+            sequence: 7,
+            detected: true,
+            changed_pixels: 42,
+            bbox: Some(motion::MotionBox {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            }),
+            frame_width: 640,
+            frame_height: 480,
+            detector_width: 320,
+            detector_height: 240,
+            timestamp_ms: 1_700_000_000_000,
+            status: MotionStatus::Ok,
+        };
+        *stream.latest_motion.write().await = Some(stale.clone());
+
+        // Stand in for the detection loop: a newer verdict arrives while the
+        // request is waiting.
+        let expected = MotionVerdict {
+            sequence: 8,
+            changed_pixels: 99,
+            ..stale.clone()
+        };
+        let publisher = stream.clone();
+        let published = expected.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            *publisher.latest_motion.write().await = Some(published);
+        });
+
+        // The request registers itself as a watcher, which is what makes the
+        // detector run when no other client is subscribed.
+        let watchers = stream.motion_watchers.clone();
+        let resp = motion_http(AxumPath("default".to_string()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            watchers.load(Ordering::SeqCst),
+            0,
+            "the subscription ends with the request"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: MotionVerdict = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, expected);
+        assert_ne!(
+            parsed.sequence, stale.sequence,
+            "a verdict from before the request must not be served as the current one"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_http_unknown_camera_is_not_found() {
+        let state = default_state();
+        let resp = motion_http(AxumPath("cam-z".to_string()), State(state)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn events_http_streams_ndjson_and_holds_a_watcher_subscription() {
+        let state = default_state();
+        let verdict = MotionVerdict {
+            camera: "cam-a".to_string(),
+            sequence: 1,
+            detected: true,
+            changed_pixels: 9,
+            bbox: None,
+            frame_width: 64,
+            frame_height: 64,
+            detector_width: 64,
+            detector_height: 64,
+            timestamp_ms: 1_700_000_000_000,
+            status: MotionStatus::Ok,
+        };
+
+        let resp = events_http(
+            AxumPath("cam-a".to_string()),
+            Query(EventsQuery { min_area: 0 }),
+            State(state.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/x-ndjson")
+        );
+
+        // Serving this response is what turns detection on.
+        let watchers = state.streams.get("cam-a").unwrap().motion_watchers.clone();
+        assert_eq!(watchers.load(Ordering::SeqCst), 1);
+
+        let mut body = resp.into_body().into_data_stream();
+        state
+            .streams
+            .get("cam-a")
+            .unwrap()
+            .motion_tx
+            .send(verdict.clone())
+            .unwrap();
+
+        let chunk = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("a verdict must be streamed")
+            .expect("the body must yield")
+            .unwrap();
+
+        // One verdict per line: NDJSON, not an array and not a frame.
+        let text = std::str::from_utf8(&chunk).unwrap();
+        assert!(text.ends_with('\n'));
+        assert_eq!(text.matches('\n').count(), 1);
+        let parsed: MotionVerdict = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(parsed, verdict);
+
+        // Dropping the response (a client that went away) releases the
+        // subscription, so the detector stops when the last watcher leaves.
+        drop(body);
+        assert_eq!(watchers.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn events_min_area_filters_emissions_not_the_measurement() {
+        let state = default_state();
+        let quiet = MotionVerdict {
+            camera: "cam-a".to_string(),
+            sequence: 1,
+            detected: false,
+            changed_pixels: 0,
+            bbox: None,
+            frame_width: 64,
+            frame_height: 64,
+            detector_width: 64,
+            detector_height: 64,
+            timestamp_ms: 1_700_000_000_000,
+            status: MotionStatus::Ok,
+        };
+        let moving = MotionVerdict {
+            sequence: 2,
+            detected: true,
+            changed_pixels: 12,
+            ..quiet.clone()
+        };
+
+        let resp = events_http(
+            AxumPath("cam-a".to_string()),
+            Query(EventsQuery { min_area: 5 }),
+            State(state.clone()),
+        )
+        .await;
+        let mut body = resp.into_body().into_data_stream();
+
+        // Both verdicts exist and are published; only the one at or above
+        // `min_area` is emitted, in order.
+        let tx = state.streams.get("cam-a").unwrap().motion_tx.clone();
+        tx.send(quiet).unwrap();
+        tx.send(moving.clone()).unwrap();
+
+        let chunk = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("a verdict must be streamed")
+            .expect("the body must yield")
+            .unwrap();
+        let parsed: MotionVerdict =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+        assert_eq!(
+            parsed.sequence, 2,
+            "the below-threshold verdict must not be emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_http_unknown_camera_is_not_found() {
+        let state = default_state();
+        let resp = events_http(
+            AxumPath("cam-z".to_string()),
+            Query(EventsQuery { min_area: 0 }),
+            State(state),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_daemon_serves_motion_verdicts_and_events_with_fake_backend() {
+        let bind: SocketAddr = "127.0.0.1:43231".parse().unwrap();
+        // Alternating frames, so the detector sees the block move.
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame: vec![],
+            frames: vec![block_jpeg(64, 64, 8, 8), block_jpeg(64, 64, 20, 20)],
+            fail_open: None,
+            fail_capture: None,
+        };
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            test_motion_config(),
+            Box::new(backend),
+        ));
+
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..20 {
+            if let Ok(resp) = client.get(format!("http://{bind}/cams")).send().await {
+                if resp.status() == ReqwestStatus::OK {
+                    ready = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "daemon did not become ready in time");
+
+        // Polling `/motion` is itself a subscription, so the detector runs even
+        // though no other client is streaming.
+        let mut verdict = None;
+        for _ in 0..50 {
+            let resp = client
+                .get(format!("http://{bind}/cams/default/motion"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), ReqwestStatus::OK);
+            let parsed: MotionVerdict = resp.json().await.unwrap();
+            if parsed.detected {
+                verdict = Some(parsed);
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        let verdict = verdict.expect("the moving block must be detected");
+        assert_eq!(verdict.camera, "cam-a");
+        assert_eq!(verdict.status, MotionStatus::Ok);
+        assert_eq!((verdict.frame_width, verdict.frame_height), (64, 64));
+        assert_eq!((verdict.detector_width, verdict.detector_height), (64, 64));
+
+        // The event stream carries the same verdict shape over the wire: this
+        // is the contract the CLI deserialises.
+        let mut events = client
+            .get(format!("http://{bind}/cams/default/events"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(events.headers()["content-type"], "application/x-ndjson");
+        let mut buffer = Vec::new();
+        let line = loop {
+            let chunk = events.chunk().await.unwrap().expect("stream ended early");
+            buffer.extend_from_slice(&chunk);
+            if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                break String::from_utf8(buffer[..newline].to_vec()).unwrap();
+            }
+        };
+        let streamed: MotionVerdict = serde_json::from_str(&line).unwrap();
+        assert_eq!(streamed.camera, "cam-a");
+        assert!(streamed.sequence >= 1);
+
+        handle.abort();
+        let _ = handle.await;
     }
 }

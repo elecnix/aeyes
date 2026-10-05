@@ -23,7 +23,11 @@ use std::cmp;
 /// neighbourhood lies inside the image. Both the Sobel and the LBP stage scan
 /// `1..(dim - 1)`, which underflows on a zero dimension, and there is nothing
 /// to scan below this size anyway.
-const MIN_SCAN_DIMENSION: usize = 3;
+///
+/// A caller that chooses the detector geometry (for example the daemon picking
+/// an analysis width) can use this to reject a frame that is too small to be
+/// scanned at all rather than reporting it as "nothing moved".
+pub const MIN_SCAN_DIMENSION: usize = 3;
 
 /// Axis-aligned bounds of the pixels one `detect` call flagged as motion.
 ///
