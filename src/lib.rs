@@ -6094,6 +6094,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_http_refreshes_activity_while_the_stream_is_open() {
+        let state = default_state();
+        let last_activity = state.last_activity.clone();
+
+        let resp = events_http(
+            AxumPath("cam-a".to_string()),
+            Query(EventsQuery { min_area: 0 }),
+            State(state.clone()),
+        )
+        .await;
+        let mut body = resp.into_body().into_data_stream();
+
+        // Pretend the daemon has been quiet for a while, as an open stream in
+        // a real daemon eventually is: `last_activity` is otherwise written
+        // only at handler entry, and the idle watchdog would exit the process
+        // in the middle of this response.
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .expect("the process has been up for at least 30 seconds");
+        *last_activity.write().await = stale;
+
+        // No verdict arrives, so this returns on the timeout; the stream itself
+        // is what must keep the daemon alive meanwhile.
+        let _ = tokio::time::timeout(
+            EVENTS_ACTIVITY_REFRESH + Duration::from_millis(500),
+            body.next(),
+        )
+        .await;
+
+        assert!(
+            last_activity.read().await.elapsed() < Duration::from_secs(5),
+            "an open event stream must refresh last_activity, or the idle \
+             watchdog will exit the daemon mid-stream"
+        );
+    }
+
+    #[tokio::test]
     async fn events_http_unknown_camera_is_not_found() {
         let state = default_state();
         let resp = events_http(
@@ -6818,6 +6855,47 @@ mod tests {
             motion_exit_code(&Ok(MotionOutcome::NoMotion { observed })),
             1,
             "no motion is exit 1, not a failure"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn motion_command_rejects_a_real_detection_below_min_area() {
+        let bind: SocketAddr = "127.0.0.1:43235".parse().unwrap();
+        let backend = FakeBackend {
+            cameras: fake_cameras(),
+            frame: vec![],
+            frames: vec![block_jpeg(64, 64, 8, 8), block_jpeg(64, 64, 20, 20)],
+            fail_open: None,
+            fail_capture: None,
+        };
+        let handle = tokio::spawn(run_daemon(
+            bind,
+            "cam-a".into(),
+            CameraOpenOptions::default(),
+            test_motion_config(),
+            Box::new(backend),
+        ));
+        wait_for_daemon(bind).await;
+
+        // The daemon really does detect the moving block; this client simply
+        // refuses to call its measurement motion. That is the client-side
+        // filter, applied to the number the daemon published.
+        let args = MotionArgs {
+            min_area: usize::MAX,
+            ..motion_args(Duration::from_millis(700), Duration::ZERO)
+        };
+        let outcome = motion_watch(bind, &args).await.unwrap();
+
+        let MotionOutcome::NoMotion { observed } = outcome else {
+            panic!("a verdict below --min-area must not count as motion");
+        };
+        assert!(
+            observed > 0,
+            "the detector must have published verdicts that the filter rejected"
         );
 
         handle.abort();
