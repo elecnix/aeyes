@@ -29,6 +29,7 @@ use rscam::{
 };
 
 pub mod chrome_capture;
+pub mod motion;
 use serde::Serialize;
 use serde_json::json;
 use std::{
