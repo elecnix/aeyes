@@ -15,7 +15,7 @@ jobs:
       - name: Review this pull request with Cite
         uses: elecnix/cite@534087b12205e442d971bddd7c157354a0c31da1  # v0.14.0
         with:
-          require_parameters: true
-          model_api_key: ${{ secrets.MODEL_API_KEY }}
-          model_base_url: https://openrouter.ai/api/v1
-          model_id: deepseek/deepseek-v4-flash-0731
+          model_api_key: ${{ secrets.OLLAMA_API_KEY }}
+          model_base_url: https://ollama.com/v1
+          model_id: deepseek-v4.1-flash
+          structured_output: tools
