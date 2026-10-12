@@ -1,10 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use aeyes::motion::{LightingInvariantConfig, LightingInvariantDetector};
@@ -106,9 +105,11 @@ fn ensure_dataset(config: &Config) -> Result<PathBuf> {
     }
     println!("Downloading CDnet 2014 dataset...");
     fs::create_dir_all(&config.cache_dir)?;
-    let url = "http://jacarini.dinf.usherbrooke.ca/static/dataset/dataset2014.zip";
+    // The original jacarini.dinf.usherbrooke.ca host is gone; this is the same
+    // archive on the benchmark's current host (see scripts/download-cdnet.sh).
+    let url = "https://changedetection.vitalab.usherbrooke.ca/static/dataset/dataset2014.zip";
     let status = std::process::Command::new("curl")
-        .args(&["-L", "-o", zip_path.to_str().unwrap(), url])
+        .args(["-L", "-o", zip_path.to_str().unwrap(), url])
         .status()
         .context("failed to execute curl")?;
     if !status.success() {
@@ -118,7 +119,7 @@ fn ensure_dataset(config: &Config) -> Result<PathBuf> {
     Ok(zip_path)
 }
 
-fn extract_dataset(zip_path: &PathBuf, config: &Config) -> Result<PathBuf> {
+fn extract_dataset(zip_path: &Path, config: &Config) -> Result<PathBuf> {
     let extraction_root = config.cache_dir.join("CDnet2014");
     let dataset_dir = extraction_root.join("dataset");
     if dataset_dir.exists() {
@@ -171,7 +172,7 @@ fn extract_dataset(zip_path: &PathBuf, config: &Config) -> Result<PathBuf> {
     Ok(dataset_dir)
 }
 
-fn load_ground_truth(gt_dir: &PathBuf, frame_idx: usize) -> Result<Option<Vec<u8>>> {
+fn load_ground_truth(gt_dir: &Path, frame_idx: usize) -> Result<Option<Vec<u8>>> {
     let candidates = [
         format!("gt{:06}.png", frame_idx + 1),
         format!("gt{:06}.jpg", frame_idx + 1),
@@ -195,7 +196,7 @@ fn load_ground_truth(gt_dir: &PathBuf, frame_idx: usize) -> Result<Option<Vec<u8
 /// Pre-convert dataset to raw RGB binary format for faster I/O.
 /// Raw files store pixel data without any header or compression.
 /// Also writes a .dims file with "WIDTHxHEIGHT\n" for loader.
-fn pre_convert_to_raw(dataset_root: &PathBuf) -> Result<usize> {
+fn pre_convert_to_raw(dataset_root: &Path) -> Result<usize> {
     let mut count = 0;
     println!("\n🔄 Pre-converting JPEG to raw RGB (this takes ~1 min)...");
 
@@ -225,16 +226,13 @@ fn pre_convert_to_raw(dataset_root: &PathBuf) -> Result<usize> {
                 fs::create_dir_all(&raw_dir)?;
 
                 // Find first image to get dimensions
-                let first_file = fs::read_dir(&input_dir)?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("png"))
-                            .unwrap_or(false)
-                    })
-                    .next();
+                let first_file = fs::read_dir(&input_dir)?.filter_map(|e| e.ok()).find(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("png"))
+                        .unwrap_or(false)
+                });
 
                 let (width, height) = if let Some(first) = first_file {
                     let img = image::open(first.path())?;
@@ -296,7 +294,7 @@ fn load_frame(path: &PathBuf, dims: Option<(u32, u32)>) -> Option<image::RgbImag
     }
 }
 
-fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<SequenceResult> {
+fn evaluate_sequence(sequence_dir: &Path, config: &Config) -> Result<SequenceResult> {
     let seq_name = sequence_dir
         .file_name()
         .unwrap()
@@ -309,12 +307,12 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
     } else if sequence_dir.join("input").exists() {
         sequence_dir.join("input")
     } else {
-        sequence_dir.clone()
+        sequence_dir.to_path_buf()
     };
     let gt_dir = if sequence_dir.join("groundtruth").exists() {
         sequence_dir.join("groundtruth")
     } else {
-        sequence_dir.clone()
+        sequence_dir.to_path_buf()
     };
 
     // Filter for supported formats
@@ -443,7 +441,7 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
         total_fp += frame_fp;
         total_fn += frame_fn;
         frames_processed += 1;
-        if frames_processed % 100 == 0 {
+        if frames_processed.is_multiple_of(100) {
             print!("    {} frames...\r", frames_processed);
             std::io::stdout().flush()?;
         }
@@ -486,7 +484,7 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
 
 fn evaluate_category(
     category_name: &str,
-    dataset_root: &PathBuf,
+    dataset_root: &Path,
     config: &Config,
 ) -> Result<CategoryResult> {
     println!("\n📁 Category: {}", category_name);
