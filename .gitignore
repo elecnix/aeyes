@@ -11,3 +11,7 @@ coverage/
 *.avi
 
 tarpaulin-report.*
+
+# CDnet 2014 evaluation dataset: 3.65 GiB of third-party benchmark data, plus
+# the raw/ frames derived from it. Fetch it with scripts/download-cdnet.sh.
+tests/cdnet_evaluation/data/

@@ -4,11 +4,23 @@ This test suite evaluates the `LightingInvariantDetector` on the standard [CDnet
 
 ## Dataset
 
-- **Download**: [CDnet 2014](http://jacarini.dinf.usherbrooke.ca/static/dataset/dataset2014.zip) (3.6 GB)
+- **Download**: `scripts/download-cdnet.sh` fetches the official [CDnet 2014](https://changedetection.net/dataset2014) archive (`dataset2014.zip`, 3,918,467,615 bytes, SHA-256 `05c6d0dd64858b094cb0d309e5b63be42de52f2b5c5adff4a65e6a640dfd2a84`)
 - **Categories**: baseline, cameraJitter, dynamicBackground, intermittentObjectMotion, shadow, thermal
 - **Ground truth**: Pixel-wise binary masks for each frame
 
-The dataset is automatically downloaded and cached when first run (set `CDNET_DOWNLOAD=1`). The cache is stored in `tests/cdnet_evaluation/data` by default.
+No part of the dataset is committed: it is third-party benchmark data, and every frame in it is reproducible from the official archive, so the repository only carries the code that consumes it. Fetch the data once with:
+
+```bash
+scripts/download-cdnet.sh
+```
+
+The script downloads the archive, verifies its checksum and unpacks it into `tests/cdnet_evaluation/data` (override with `--dest DIR` or `$CDNET_CACHE_DIR`). It is idempotent, and it keeps the archive beside the extracted frames so the evaluation below does not download it again.
+
+When `tests/cdnet_evaluation/data/dataset2014.zip` is missing, the evaluation downloads the archive itself (`CDNET_DOWNLOAD=1`, the default), so `./run.sh` still works on a fresh checkout without the script.
+
+### Pre-converted raw frames
+
+Reading frames straight from the JPEGs is I/O bound, and that dominated the benchmark runs recorded in `results/cdnet_report.json`. Running the evaluation once with `CDNET_PRECONVERT=1` writes a headerless RGB copy of every `input/*.jpg` into a `raw/` directory next to it and uses those from then on. `raw/` is a deterministic function of the archive content and is not committed either; it lives under `tests/cdnet_evaluation/data`, which is git-ignored.
 
 ## Usage
 
@@ -43,7 +55,7 @@ export CDNET_OUTPUT_DIR=/path/to/results
 
 ### Force re-download
 
-Delete the `data` directory or set `CDNET_DOWNLOAD=1` (it will re-download if the zip is missing).
+Delete the `data` directory, run `scripts/download-cdnet.sh --force`, or set `CDNET_DOWNLOAD=1` (it will re-download if the zip is missing).
 
 ## Output
 
@@ -66,7 +78,8 @@ Pixels are evaluated independently against ground truth binary masks.
 
 A GitHub Actions workflow (`.github/workflows/cdnet_evaluation.yml`) runs this evaluation:
 - Manual trigger available via "Run workflow"
-- Dataset is cached between runs (key `cdnet-dataset-v1`)
+- Runs on the self-hosted Hetzner ARC runner pool (label `arc-runners`)
+- The archive is fetched by `scripts/download-cdnet.sh` and cached between runs (key `cdnet-dataset-v1`)
 - Results are uploaded as artifacts
 
 ## Notes
