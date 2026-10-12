@@ -1,13 +1,13 @@
-use std::env;
-use std::path::PathBuf;
-use std::time::Instant;
-use serde::{Serialize, Deserialize};
-use anyhow::{Result, Context, anyhow};
+use anyhow::{anyhow, Context, Result};
 use image::GenericImageView;
+use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
+use std::time::Instant;
 
-use aeyes::motion::{LightingInvariantDetector, LightingInvariantConfig};
+use aeyes::motion::{LightingInvariantConfig, LightingInvariantDetector};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,14 +71,16 @@ impl Default for Config {
         // Support limiting categories via CDNET_CATEGORIES env var (comma-separated)
         let categories = env::var("CDNET_CATEGORIES")
             .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_else(|_| vec![
-                "baseline".to_string(),
-                "cameraJitter".to_string(),
-                "dynamicBackground".to_string(),
-                "intermittentObjectMotion".to_string(),
-                "shadow".to_string(),
-                "thermal".to_string(),
-            ]);
+            .unwrap_or_else(|_| {
+                vec![
+                    "baseline".to_string(),
+                    "cameraJitter".to_string(),
+                    "dynamicBackground".to_string(),
+                    "intermittentObjectMotion".to_string(),
+                    "shadow".to_string(),
+                    "thermal".to_string(),
+                ]
+            });
 
         Self {
             cache_dir,
@@ -133,9 +135,24 @@ fn extract_dataset(zip_path: &PathBuf, config: &Config) -> Result<PathBuf> {
     for extractor in &extractors {
         let mut cmd = std::process::Command::new(extractor);
         let args = match *extractor {
-            "unzip" => vec!["-q", zip_path.to_str().unwrap(), "-d", extraction_root.to_str().unwrap()],
-            "7z" => vec!["x", zip_path.to_str().unwrap(), "-o", extraction_root.to_str().unwrap()],
-            "tar" => vec!["-xf", zip_path.to_str().unwrap(), "-C", extraction_root.to_str().unwrap()],
+            "unzip" => vec![
+                "-q",
+                zip_path.to_str().unwrap(),
+                "-d",
+                extraction_root.to_str().unwrap(),
+            ],
+            "7z" => vec![
+                "x",
+                zip_path.to_str().unwrap(),
+                "-o",
+                extraction_root.to_str().unwrap(),
+            ],
+            "tar" => vec![
+                "-xf",
+                zip_path.to_str().unwrap(),
+                "-C",
+                extraction_root.to_str().unwrap(),
+            ],
             _ => vec![],
         };
         cmd.args(&args);
@@ -181,63 +198,83 @@ fn load_ground_truth(gt_dir: &PathBuf, frame_idx: usize) -> Result<Option<Vec<u8
 fn pre_convert_to_raw(dataset_root: &PathBuf) -> Result<usize> {
     let mut count = 0;
     println!("\n🔄 Pre-converting JPEG to raw RGB (this takes ~1 min)...");
-    
-    for category in ["baseline", "cameraJitter", "dynamicBackground", "intermittentObjectMotion", "shadow", "thermal"] {
+
+    for category in [
+        "baseline",
+        "cameraJitter",
+        "dynamicBackground",
+        "intermittentObjectMotion",
+        "shadow",
+        "thermal",
+    ] {
         let cat_dir = dataset_root.join(category);
-        if !cat_dir.exists() { continue; }
-        
+        if !cat_dir.exists() {
+            continue;
+        }
+
         for entry in fs::read_dir(&cat_dir)? {
             let seq_dir = entry?.path();
-            if !seq_dir.is_dir() { continue; }
-            
+            if !seq_dir.is_dir() {
+                continue;
+            }
+
             let input_dir = seq_dir.join("input");
             let raw_dir = seq_dir.join("raw");
-            
+
             if input_dir.exists() && !raw_dir.exists() {
                 fs::create_dir_all(&raw_dir)?;
-                
+
                 // Find first image to get dimensions
                 let first_file = fs::read_dir(&input_dir)?
                     .filter_map(|e| e.ok())
                     .filter(|e| {
-                        e.path().extension()
+                        e.path()
+                            .extension()
                             .and_then(|s| s.to_str())
                             .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("png"))
                             .unwrap_or(false)
                     })
                     .next();
-                
+
                 let (width, height) = if let Some(first) = first_file {
                     let img = image::open(first.path())?;
                     (img.width(), img.height())
                 } else {
                     continue;
                 };
-                
+
                 // Write dimensions file
                 fs::write(raw_dir.join(".dims"), format!("{}x{}\n", width, height))?;
-                
+
                 // Convert all images
                 for entry in fs::read_dir(&input_dir)? {
                     let file = entry?;
                     let path = file.path();
                     let ext = path.extension().and_then(|s| s.to_str());
-                    if !ext.map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("png")).unwrap_or(false) {
+                    if !ext
+                        .map(|s| s.eq_ignore_ascii_case("jpg") || s.eq_ignore_ascii_case("png"))
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
-                    
+
                     let img = image::open(&path)?;
                     let rgb = img.to_rgb8();
-                    let raw_name = path.file_stem().unwrap().to_string_lossy().into_owned() + ".raw";
+                    let raw_name =
+                        path.file_stem().unwrap().to_string_lossy().into_owned() + ".raw";
                     fs::write(raw_dir.join(raw_name), rgb.as_raw())?;
                     count += 1;
                 }
-                
-                println!("  ✓ {}: {} frames", seq_dir.file_name().unwrap().to_string_lossy(), count);
+
+                println!(
+                    "  ✓ {}: {} frames",
+                    seq_dir.file_name().unwrap().to_string_lossy(),
+                    count
+                );
             }
         }
     }
-    
+
     println!("✓ Pre-conversion complete: {} frames", count);
     Ok(count)
 }
@@ -247,8 +284,12 @@ fn load_frame(path: &PathBuf, dims: Option<(u32, u32)>) -> Option<image::RgbImag
     if path.extension().map(|e| e == "raw").unwrap_or(false) {
         // Raw format: binary RGB with known dimensions
         if let Some((w, h)) = dims {
-            fs::read(path).ok().and_then(|data| image::RgbImage::from_raw(w, h, data))
-        } else { None }
+            fs::read(path)
+                .ok()
+                .and_then(|data| image::RgbImage::from_raw(w, h, data))
+        } else {
+            None
+        }
     } else {
         // JPEG/PNG format
         image::open(path).ok().map(|img| img.to_rgb8())
@@ -256,7 +297,11 @@ fn load_frame(path: &PathBuf, dims: Option<(u32, u32)>) -> Option<image::RgbImag
 }
 
 fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<SequenceResult> {
-    let seq_name = sequence_dir.file_name().unwrap().to_string_lossy().into_owned();
+    let seq_name = sequence_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     // Prefer raw/ directory if available (pre-converted from JPEG)
     let use_raw = sequence_dir.join("raw").exists();
     let input_dir = if use_raw {
@@ -271,46 +316,91 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
     } else {
         sequence_dir.clone()
     };
-    
+
     // Filter for supported formats
     let input_files: Vec<PathBuf> = fs::read_dir(&input_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
             let p = e.path();
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("png") || 
-                ext.eq_ignore_ascii_case("bmp") || ext.eq_ignore_ascii_case("raw")
-            } else { false }
+                ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("png")
+                    || ext.eq_ignore_ascii_case("bmp")
+                    || ext.eq_ignore_ascii_case("raw")
+            } else {
+                false
+            }
         })
         .map(|e| e.path())
         .collect();
     if input_files.is_empty() {
         println!("  ⚠ No input frames in {}", seq_name);
-        return Ok(SequenceResult { name: seq_name, metrics: Metrics { precision: 0.0, recall: 0.0, f1_score: 0.0, true_positives: 0, false_positives: 0, false_negatives: 0, frames_processed: 0, total_time_secs: 0.0 }, frames: 0 });
+        return Ok(SequenceResult {
+            name: seq_name,
+            metrics: Metrics {
+                precision: 0.0,
+                recall: 0.0,
+                f1_score: 0.0,
+                true_positives: 0,
+                false_positives: 0,
+                false_negatives: 0,
+                frames_processed: 0,
+                total_time_secs: 0.0,
+            },
+            frames: 0,
+        });
     }
     let mut input_files = input_files;
     input_files.sort_by_key(|p| p.file_name().unwrap().to_owned());
-    let has_ground_truth = gt_dir.join("gt000001.png").exists() || gt_dir.join("gt000001.jpg").exists();
+    let has_ground_truth =
+        gt_dir.join("gt000001.png").exists() || gt_dir.join("gt000001.jpg").exists();
     if !has_ground_truth {
         println!("  ⚠ No groundtruth found in {}, skipping metrics", seq_name);
-        return Ok(SequenceResult { name: seq_name, metrics: Metrics { precision: 0.0, recall: 0.0, f1_score: 0.0, true_positives: 0, false_positives: 0, false_negatives: 0, frames_processed: 0, total_time_secs: 0.0 }, frames: input_files.len() as u64 });
+        return Ok(SequenceResult {
+            name: seq_name,
+            metrics: Metrics {
+                precision: 0.0,
+                recall: 0.0,
+                f1_score: 0.0,
+                true_positives: 0,
+                false_positives: 0,
+                false_negatives: 0,
+                frames_processed: 0,
+                total_time_secs: 0.0,
+            },
+            frames: input_files.len() as u64,
+        });
     }
     // Load dimensions for raw format
     let raw_dims = if use_raw {
-        fs::read_to_string(sequence_dir.join("raw/.dims")).ok().and_then(|dims| {
-            let parts: Vec<&str> = dims.trim().split('x').collect();
-            if parts.len() == 2 {
-                Some((parts[0].parse().unwrap_or(1), parts[1].parse().unwrap_or(1)))
-            } else { None }
-        })
-    } else { None };
-    
+        fs::read_to_string(sequence_dir.join("raw/.dims"))
+            .ok()
+            .and_then(|dims| {
+                let parts: Vec<&str> = dims.trim().split('x').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].parse().unwrap_or(1), parts[1].parse().unwrap_or(1)))
+                } else {
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
     // Load first image to get dimensions (use load_frame helper)
     let first_img = load_frame(&input_files[0], raw_dims)
         .ok_or_else(|| anyhow!("failed to load first frame"))?;
     let (width, height) = (first_img.width() as usize, first_img.height() as usize);
-    let mut detector = LightingInvariantDetector::new(width, height, LightingInvariantConfig::default());
-    println!("  ▶ {}: {} frames, {}×{} [{}]", seq_name, input_files.len(), width, height, if use_raw { "raw" } else { "jpeg" });
+    let mut detector =
+        LightingInvariantDetector::new(width, height, LightingInvariantConfig::default());
+    println!(
+        "  ▶ {}: {} frames, {}×{} [{}]",
+        seq_name,
+        input_files.len(),
+        width,
+        height,
+        if use_raw { "raw" } else { "jpeg" }
+    );
     let mut total_tp = 0u64;
     let mut total_fp = 0u64;
     let mut total_fn = 0u64;
@@ -330,7 +420,7 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
             }
         };
         let gt_binary = load_ground_truth(&gt_dir, i)?
-            .ok_or_else(|| anyhow!("missing ground truth for frame {}", i+1))?;
+            .ok_or_else(|| anyhow!("missing ground truth for frame {}", i + 1))?;
         let detections = detector.detect(rgb.as_raw());
         let mut frame_tp = 0;
         let mut frame_fp = 0;
@@ -359,14 +449,46 @@ fn evaluate_sequence(sequence_dir: &PathBuf, config: &Config) -> Result<Sequence
         }
     }
     let elapsed = start_time.elapsed();
-    let precision = if total_tp + total_fp > 0 { total_tp as f64 / (total_tp + total_fp) as f64 } else { 0.0 };
-    let recall = if total_tp + total_fn > 0 { total_tp as f64 / (total_tp + total_fn) as f64 } else { 0.0 };
-    let f1_score = if precision + recall > 0.0 { 2.0 * precision * recall / (precision + recall) } else { 0.0 };
-    println!("  ✓ {}: F1={:.4}, P={:.4}, R={:.4}", seq_name, f1_score, precision, recall);
-    Ok(SequenceResult { name: seq_name, metrics: Metrics { precision, recall, f1_score, true_positives: total_tp, false_positives: total_fp, false_negatives: total_fn, frames_processed, total_time_secs: elapsed.as_secs_f64() }, frames: frames_processed })
+    let precision = if total_tp + total_fp > 0 {
+        total_tp as f64 / (total_tp + total_fp) as f64
+    } else {
+        0.0
+    };
+    let recall = if total_tp + total_fn > 0 {
+        total_tp as f64 / (total_tp + total_fn) as f64
+    } else {
+        0.0
+    };
+    let f1_score = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+    println!(
+        "  ✓ {}: F1={:.4}, P={:.4}, R={:.4}",
+        seq_name, f1_score, precision, recall
+    );
+    Ok(SequenceResult {
+        name: seq_name,
+        metrics: Metrics {
+            precision,
+            recall,
+            f1_score,
+            true_positives: total_tp,
+            false_positives: total_fp,
+            false_negatives: total_fn,
+            frames_processed,
+            total_time_secs: elapsed.as_secs_f64(),
+        },
+        frames: frames_processed,
+    })
 }
 
-fn evaluate_category(category_name: &str, dataset_root: &PathBuf, config: &Config) -> Result<CategoryResult> {
+fn evaluate_category(
+    category_name: &str,
+    dataset_root: &PathBuf,
+    config: &Config,
+) -> Result<CategoryResult> {
     println!("\n📁 Category: {}", category_name);
     let category_dir = dataset_root.join(category_name);
     if !category_dir.exists() {
@@ -381,7 +503,10 @@ fn evaluate_category(category_name: &str, dataset_root: &PathBuf, config: &Confi
         return Err(anyhow!("no sequences found in category: {}", category_name));
     }
     println!("  Found {} sequences", sequence_dirs.len());
-    let results: Vec<Result<SequenceResult>> = sequence_dirs.par_iter().map(|seq_dir| evaluate_sequence(seq_dir, config)).collect();
+    let results: Vec<Result<SequenceResult>> = sequence_dirs
+        .par_iter()
+        .map(|seq_dir| evaluate_sequence(seq_dir, config))
+        .collect();
     let mut sequence_results = Vec::new();
     let mut agg_tp = 0u64;
     let mut agg_fp = 0u64;
@@ -403,12 +528,40 @@ fn evaluate_category(category_name: &str, dataset_root: &PathBuf, config: &Confi
             }
         }
     }
-    let precision = if agg_tp + agg_fp > 0 { agg_tp as f64 / (agg_tp + agg_fp) as f64 } else { 0.0 };
-    let recall = if agg_tp + agg_fn > 0 { agg_tp as f64 / (agg_tp + agg_fn) as f64 } else { 0.0 };
-    let f1_score = if precision + recall > 0.0 { 2.0 * precision * recall / (precision + recall) } else { 0.0 };
-    let aggregate = Metrics { precision, recall, f1_score, true_positives: agg_tp, false_positives: agg_fp, false_negatives: agg_fn, frames_processed: total_frames, total_time_secs: total_time };
-    println!("  📊 Category Summary: F1={:.4}, P={:.4}, R={:.4}", f1_score, precision, recall);
-    Ok(CategoryResult { name: category_name.to_string(), sequences: sequence_results, aggregate })
+    let precision = if agg_tp + agg_fp > 0 {
+        agg_tp as f64 / (agg_tp + agg_fp) as f64
+    } else {
+        0.0
+    };
+    let recall = if agg_tp + agg_fn > 0 {
+        agg_tp as f64 / (agg_tp + agg_fn) as f64
+    } else {
+        0.0
+    };
+    let f1_score = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+    let aggregate = Metrics {
+        precision,
+        recall,
+        f1_score,
+        true_positives: agg_tp,
+        false_positives: agg_fp,
+        false_negatives: agg_fn,
+        frames_processed: total_frames,
+        total_time_secs: total_time,
+    };
+    println!(
+        "  📊 Category Summary: F1={:.4}, P={:.4}, R={:.4}",
+        f1_score, precision, recall
+    );
+    Ok(CategoryResult {
+        name: category_name.to_string(),
+        sequences: sequence_results,
+        aggregate,
+    })
 }
 
 fn save_report(report: &Report, config: &Config) -> Result<PathBuf> {
@@ -424,20 +577,32 @@ fn print_summary(report: &Report) {
     println!("\n{}", "═".repeat(60));
     println!("CDnet 2014 Evaluation Summary");
     println!("{}", "═".repeat(60));
-    println!("{:<20} {:>12} {:>12} {:>12}", "Category", "F1-Score", "Precision", "Recall");
+    println!(
+        "{:<20} {:>12} {:>12} {:>12}",
+        "Category", "F1-Score", "Precision", "Recall"
+    );
     println!("{}", "─".repeat(60));
     for cat in &report.categories {
         let agg = &cat.aggregate;
-        println!("{:<20} {:>12.4} {:>12.4} {:>12.4}", cat.name, agg.f1_score, agg.precision, agg.recall);
+        println!(
+            "{:<20} {:>12.4} {:>12.4} {:>12.4}",
+            cat.name, agg.f1_score, agg.precision, agg.recall
+        );
     }
     println!("{}", "─".repeat(60));
-    println!("{:<20} {:>12.4} {:>12.4} {:>12.4}", "OVERALL", report.overall.f1_score, report.overall.precision, report.overall.recall);
+    println!(
+        "{:<20} {:>12.4} {:>12.4} {:>12.4}",
+        "OVERALL", report.overall.f1_score, report.overall.precision, report.overall.recall
+    );
     println!("{}", "═".repeat(60));
     println!("Frames: {}", report.overall.frames_processed);
     println!("Time: {:.2} seconds", report.overall.total_time_secs);
     let fps = report.overall.frames_processed as f64 / report.overall.total_time_secs;
     println!("Throughput: {:.2} FPS", fps);
-    println!("Config: max_frames_per_sequence={}", report.config.max_frames_per_sequence);
+    println!(
+        "Config: max_frames_per_sequence={}",
+        report.config.max_frames_per_sequence
+    );
     println!();
     println!("METRIC overall_f1={:.6}", report.overall.f1_score);
     println!("METRIC overall_precision={:.6}", report.overall.precision);
@@ -459,10 +624,14 @@ fn main() -> Result<()> {
     println!();
     let zip_path = ensure_dataset(&config)?;
     let dataset_root = extract_dataset(&zip_path, &config)?;
-    
+
     // Auto-convert to raw if not done yet (skip on subsequent runs)
     let raw_sequences = dataset_root.join("baseline/highway/raw").exists();
-    if !raw_sequences && env::var("CDNET_PRECONVERT").map(|v| v == "1").unwrap_or(false) {
+    if !raw_sequences
+        && env::var("CDNET_PRECONVERT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
         match pre_convert_to_raw(&dataset_root) {
             Ok(count) => println!("  Pre-converted {} frames to raw format", count),
             Err(e) => eprintln!("  ⚠ Pre-conversion failed: {}, continuing with JPEG", e),
@@ -470,7 +639,7 @@ fn main() -> Result<()> {
     } else if raw_sequences {
         println!("  Using pre-converted raw frames (set CDNET_PRECONVERT=0 to re-convert)");
     }
-    
+
     let mut category_results = Vec::new();
     let mut overall_tp = 0u64;
     let mut overall_fp = 0u64;
@@ -492,11 +661,40 @@ fn main() -> Result<()> {
             }
         }
     }
-    let precision = if overall_tp + overall_fp > 0 { overall_tp as f64 / (overall_tp + overall_fp) as f64 } else { 0.0 };
-    let recall = if overall_tp + overall_fn > 0 { overall_tp as f64 / (overall_tp + overall_fn) as f64 } else { 0.0 };
-    let f1_score = if precision + recall > 0.0 { 2.0 * precision * recall / (precision + recall) } else { 0.0 };
-    let overall = Metrics { precision, recall, f1_score, true_positives: overall_tp, false_positives: overall_fp, false_negatives: overall_fn, frames_processed: overall_frames, total_time_secs: overall_time };
-    let report = Report { dataset: "CDnet 2014".to_string(), timestamp: chrono::Utc::now().to_rfc3339(), categories: category_results, overall, config: EvaluationConfig { max_frames_per_sequence: config.max_frames_per_sequence } };
+    let precision = if overall_tp + overall_fp > 0 {
+        overall_tp as f64 / (overall_tp + overall_fp) as f64
+    } else {
+        0.0
+    };
+    let recall = if overall_tp + overall_fn > 0 {
+        overall_tp as f64 / (overall_tp + overall_fn) as f64
+    } else {
+        0.0
+    };
+    let f1_score = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+    let overall = Metrics {
+        precision,
+        recall,
+        f1_score,
+        true_positives: overall_tp,
+        false_positives: overall_fp,
+        false_negatives: overall_fn,
+        frames_processed: overall_frames,
+        total_time_secs: overall_time,
+    };
+    let report = Report {
+        dataset: "CDnet 2014".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        categories: category_results,
+        overall,
+        config: EvaluationConfig {
+            max_frames_per_sequence: config.max_frames_per_sequence,
+        },
+    };
     let _report_path = save_report(&report, &config)?;
     print_summary(&report);
     Ok(())

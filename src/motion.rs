@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 /// Lighting-Invariant Motion Detection for aeyes
 ///
 /// Detects motion while being robust to global and local lighting changes.
@@ -18,7 +19,6 @@
 /// - People/animals moving
 /// - Screen changes (pixel-level motion)
 use std::cmp;
-use rayon::prelude::*;
 use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
@@ -63,9 +63,9 @@ impl Default for LightingInvariantConfig {
             decay_rate: 0.96,
             min_sensitivity: 0.3,
             use_temporal_edges: true,
-            use_lbp: true,   // keep LBP for accuracy
+            use_lbp: true, // keep LBP for accuracy
             use_sobel: true,
-            dilate: false,   // dilation off for speed
+            dilate: false, // dilation off for speed
         }
     }
 }
@@ -145,29 +145,32 @@ impl SobelEdgeDetector {
         self.prev_edges.copy_from_slice(&self.edges);
 
         // Process interior pixels in parallel (skip borders)
-        self.edges.par_iter_mut().enumerate().for_each(|(idx, edge)| {
-            let y = idx / self.width;
-            let x = idx % self.width;
-            if y > 0 && y < self.height - 1 && x > 0 && x < self.width - 1 {
-                // 3x3 neighborhood
-                let tl = lum_frame[(y - 1) * self.width + (x - 1)];
-                let tm = lum_frame[(y - 1) * self.width + x];
-                let tr = lum_frame[(y - 1) * self.width + (x + 1)];
-                let ml = lum_frame[y * self.width + (x - 1)];
-                let mr = lum_frame[y * self.width + (x + 1)];
-                let bl = lum_frame[(y + 1) * self.width + (x - 1)];
-                let bm = lum_frame[(y + 1) * self.width + x];
-                let br = lum_frame[(y + 1) * self.width + (x + 1)];
-                // Sobel gradients
-                let gx = Self::sobel_gx(tl, tm, tr, ml, mr, bl, bm, br);
-                let gy = Self::sobel_gy(tl, tm, tr, ml, mr, bl, bm, br);
-                // Magnitude: sqrt(gx² + gy²) ≈ |gx| + |gy| (faster)
-                // Clamp to u8 range
-                let magnitude = cmp::min(255, (gx.abs() + gy.abs()) as u16) as u8;
-                *edge = cmp::min(255, magnitude as u8);
-            }
-            // Borders remain unchanged (from previous frame)
-        });
+        self.edges
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, edge)| {
+                let y = idx / self.width;
+                let x = idx % self.width;
+                if y > 0 && y < self.height - 1 && x > 0 && x < self.width - 1 {
+                    // 3x3 neighborhood
+                    let tl = lum_frame[(y - 1) * self.width + (x - 1)];
+                    let tm = lum_frame[(y - 1) * self.width + x];
+                    let tr = lum_frame[(y - 1) * self.width + (x + 1)];
+                    let ml = lum_frame[y * self.width + (x - 1)];
+                    let mr = lum_frame[y * self.width + (x + 1)];
+                    let bl = lum_frame[(y + 1) * self.width + (x - 1)];
+                    let bm = lum_frame[(y + 1) * self.width + x];
+                    let br = lum_frame[(y + 1) * self.width + (x + 1)];
+                    // Sobel gradients
+                    let gx = Self::sobel_gx(tl, tm, tr, ml, mr, bl, bm, br);
+                    let gy = Self::sobel_gy(tl, tm, tr, ml, mr, bl, bm, br);
+                    // Magnitude: sqrt(gx² + gy²) ≈ |gx| + |gy| (faster)
+                    // Clamp to u8 range
+                    let magnitude = cmp::min(255, (gx.abs() + gy.abs()) as u16) as u8;
+                    *edge = cmp::min(255, magnitude as u8);
+                }
+                // Borders remain unchanged (from previous frame)
+            });
 
         &self.edges
     }
@@ -230,23 +233,26 @@ impl LocalBinaryPattern {
         self.prev_patterns.copy_from_slice(&self.patterns);
 
         // Process interior pixels in parallel
-        self.patterns.par_iter_mut().enumerate().for_each(|(idx, pattern)| {
-            let y = idx / self.width;
-            let x = idx % self.width;
-            if y > 0 && y < self.height - 1 && x > 0 && x < self.width - 1 {
-                let center = lum_frame[idx];
-                let tl = lum_frame[(y - 1) * self.width + (x - 1)];
-                let tm = lum_frame[(y - 1) * self.width + x];
-                let tr = lum_frame[(y - 1) * self.width + (x + 1)];
-                let ml = lum_frame[y * self.width + (x - 1)];
-                let mr = lum_frame[y * self.width + (x + 1)];
-                let bl = lum_frame[(y + 1) * self.width + (x - 1)];
-                let bm = lum_frame[(y + 1) * self.width + x];
-                let br = lum_frame[(y + 1) * self.width + (x + 1)];
-                *pattern = Self::compute_lbp(center, tl, tm, tr, ml, mr, bl, bm, br);
-            }
-            // else: border remains unchanged (copied from previous patterns)
-        });
+        self.patterns
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, pattern)| {
+                let y = idx / self.width;
+                let x = idx % self.width;
+                if y > 0 && y < self.height - 1 && x > 0 && x < self.width - 1 {
+                    let center = lum_frame[idx];
+                    let tl = lum_frame[(y - 1) * self.width + (x - 1)];
+                    let tm = lum_frame[(y - 1) * self.width + x];
+                    let tr = lum_frame[(y - 1) * self.width + (x + 1)];
+                    let ml = lum_frame[y * self.width + (x - 1)];
+                    let mr = lum_frame[y * self.width + (x + 1)];
+                    let bl = lum_frame[(y + 1) * self.width + (x - 1)];
+                    let bm = lum_frame[(y + 1) * self.width + x];
+                    let br = lum_frame[(y + 1) * self.width + (x + 1)];
+                    *pattern = Self::compute_lbp(center, tl, tm, tr, ml, mr, bl, bm, br);
+                }
+                // else: border remains unchanged (copied from previous patterns)
+            });
     }
 
     /// Get pattern at pixel
@@ -437,7 +443,9 @@ impl LightingInvariantDetector {
                     let curr_edge = edges[idx];
                     let prev_edge = self.sobel.prev_edges[idx];
                     let edge_delta = (curr_edge as i16 - prev_edge as i16).unsigned_abs() as u8;
-                    if edge_delta > self.config.min_edge_movement && curr_edge > self.config.edge_threshold {
+                    if edge_delta > self.config.min_edge_movement
+                        && curr_edge > self.config.edge_threshold
+                    {
                         is_motion = true;
                     }
                 }
@@ -446,14 +454,17 @@ impl LightingInvariantDetector {
                 if self.config.use_lbp && !is_motion {
                     let curr_pattern = self.lbp.pattern(x, y);
                     let prev_pattern = self.lbp.prev_pattern(x, y);
-                    let pattern_distance = LocalBinaryPattern::hamming_distance(curr_pattern, prev_pattern);
+                    let pattern_distance =
+                        LocalBinaryPattern::hamming_distance(curr_pattern, prev_pattern);
                     if pattern_distance > self.config.contrast_threshold {
                         is_motion = true;
                     }
                 }
 
                 if is_motion {
-                    let threshold = self.adaptive_threshold.threshold_at(x, y, self.config.edge_threshold);
+                    let threshold =
+                        self.adaptive_threshold
+                            .threshold_at(x, y, self.config.edge_threshold);
                     if edges[idx] > threshold {
                         detections.push((x, y));
                         self.adaptive_threshold.register_detection(x, y);
@@ -474,15 +485,31 @@ impl LightingInvariantDetector {
             let mut dilated_set: HashSet<(usize, usize)> = detections.iter().cloned().collect();
             for &(x, y) in &detections {
                 // 4-connected
-                if x > 0 { dilated_set.insert((x - 1, y)); }
-                if x + 1 < self.width { dilated_set.insert((x + 1, y)); }
-                if y > 0 { dilated_set.insert((x, y - 1)); }
-                if y + 1 < self.height { dilated_set.insert((x, y + 1)); }
+                if x > 0 {
+                    dilated_set.insert((x - 1, y));
+                }
+                if x + 1 < self.width {
+                    dilated_set.insert((x + 1, y));
+                }
+                if y > 0 {
+                    dilated_set.insert((x, y - 1));
+                }
+                if y + 1 < self.height {
+                    dilated_set.insert((x, y + 1));
+                }
                 // diagonals
-                if x > 0 && y > 0 { dilated_set.insert((x - 1, y - 1)); }
-                if x + 1 < self.width && y > 0 { dilated_set.insert((x + 1, y - 1)); }
-                if x > 0 && y + 1 < self.height { dilated_set.insert((x - 1, y + 1)); }
-                if x + 1 < self.width && y + 1 < self.height { dilated_set.insert((x + 1, y + 1)); }
+                if x > 0 && y > 0 {
+                    dilated_set.insert((x - 1, y - 1));
+                }
+                if x + 1 < self.width && y > 0 {
+                    dilated_set.insert((x + 1, y - 1));
+                }
+                if x > 0 && y + 1 < self.height {
+                    dilated_set.insert((x - 1, y + 1));
+                }
+                if x + 1 < self.width && y + 1 < self.height {
+                    dilated_set.insert((x + 1, y + 1));
+                }
             }
             detections = dilated_set.into_iter().collect();
         }
