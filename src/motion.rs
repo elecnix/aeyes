@@ -167,7 +167,7 @@ impl SobelEdgeDetector {
                     // Magnitude: sqrt(gx² + gy²) ≈ |gx| + |gy| (faster)
                     // Clamp to u8 range
                     let magnitude = cmp::min(255, (gx.abs() + gy.abs()) as u16) as u8;
-                    *edge = cmp::min(255, magnitude as u8);
+                    *edge = magnitude;
                 }
                 // Borders remain unchanged (from previous frame)
             });
@@ -175,8 +175,6 @@ impl SobelEdgeDetector {
         &self.edges
     }
 }
-
-/// Local Binary Pattern
 
 /// Local Binary Pattern - texture descriptor invariant to monotonic lighting
 /// Compares each pixel to neighbors: bright neighbor = 1 bit
@@ -398,7 +396,8 @@ impl LightingInvariantDetector {
     #[inline]
     fn rgb_to_lum(r: u8, g: u8, b: u8) -> u8 {
         // (306*r + 601*g + 117*b) >> 10 ≈ 0.299*r + 0.587*g + 0.114*b
-        (((306 * r as u16) + (601 * g as u16) + (117 * b as u16)) >> 10) as u8
+        // The weighted sum reaches 261,120, so it needs 18 bits: u16 wraps.
+        (((306 * r as u32) + (601 * g as u32) + (117 * b as u32)) >> 10) as u8
     }
 
     /// Detect motion in RGB frame
