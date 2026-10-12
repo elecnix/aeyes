@@ -5,7 +5,8 @@ on:
 
 jobs:
   evaluate:
-    runs-on: ubuntu-latest
+    # Self-hosted ARC runner pool (label `arc-runners`).
+    runs-on: arc-runners
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -14,19 +15,24 @@ jobs:
           workspaces: |
             .
             tests/cdnet_evaluation
-      - name: Cache CDnet dataset
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+      - name: Cache CDnet archive
         uses: actions/cache@v4
         with:
-          path: tests/cdnet_evaluation/data
+          # Only the archive: the extracted frames and the raw/ cache are
+          # rebuilt from it, and the whole data directory overflows the cache.
+          path: tests/cdnet_evaluation/data/dataset2014.zip
           key: cdnet-dataset-v1
           restore-keys: |
             cdnet-dataset-
-      - name: Install unzip
-        run: sudo apt-get update && sudo apt-get install -y unzip
+      - name: Fetch CDnet 2014 dataset
+        run: scripts/download-cdnet.sh
       - name: Run CDnet evaluation
         env:
           CDNET_DOWNLOAD: 1
           CDNET_MAX_FRAMES: 0
+          CDNET_PRECONVERT: 1
         run: |
           cargo run --release --bin cdnet-evaluation
         timeout-minutes: 180

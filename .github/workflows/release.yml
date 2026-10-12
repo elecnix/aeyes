@@ -11,7 +11,9 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # Self-hosted ARC runner pool (label `arc-runners`); it is the only Linux
+    # capacity this account can use while GitHub-hosted runners are blocked.
+    runs-on: arc-runners
     steps:
       - uses: actions/checkout@v5
         with:

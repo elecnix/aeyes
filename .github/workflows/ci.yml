@@ -3,12 +3,21 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
     strategy:
+      # A failing leg must not cancel the others; the self-hosted Linux leg is
+      # the one that carries CI while GitHub-hosted runners are unavailable.
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Linux runs on the self-hosted ARC runner pool (label `arc-runners`).
+        # Windows and macOS need GitHub-hosted runners, which this account
+        # cannot use at the moment, so those legs only run when the workflow is
+        # dispatched by hand.
+        os: [arc-runners, windows-latest, macos-latest]
+    if: matrix.os == 'arc-runners' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
