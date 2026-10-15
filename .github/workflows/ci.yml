@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # A bare self-hosted runner ships only rustc/cargo/rust-std; the format
+          # and lint steps below need these components explicitly.
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux deps
         if: runner.os == 'Linux'
