@@ -1,25 +1,32 @@
 name: review
+
+# One shape across the fleet. The endpoint, the model and the structured-output
+# mode are repository variables, so retargeting this repository is three
+# variable edits and never a workflow edit; the credential is one secret. The
+# action is pinned to a full commit SHA, which also pins the release binary it
+# downloads, and the run log prints the endpoint and model it used.
+
 on:
   pull_request:
+
 permissions:
   contents: read
   pull-requests: write
   checks: write
+
 concurrency:
   group: cite-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
+
 jobs:
   review:
     runs-on: ubuntu-latest
     steps:
       - name: Review this pull request with Cite
-        uses: elecnix/cite@f5707676437aacf2d3566d0e831c5c558717f994 # v0.15.0
+        uses: elecnix/cite@e790f27116e76c26aa8b4f6c6437c5bec6c5cc30 # v0.16.0
         with:
-          # Ollama Cloud is the default provider. Set the CITE_PROVIDER
-          # repository variable to "openrouter" to switch this repository
-          # back; both keys exist in every repository.
-          structured_output: ${{ vars.CITE_PROVIDER == 'openrouter' && 'response_format' || 'tools' }}
-          require_parameters: ${{ vars.CITE_PROVIDER == 'openrouter' }}
-          model_api_key: ${{ vars.CITE_PROVIDER == 'openrouter' && secrets.MODEL_API_KEY || secrets.OLLAMA_API_KEY }}
-          model_base_url: ${{ vars.CITE_PROVIDER == 'openrouter' && 'https://openrouter.ai/api/v1' || 'https://ollama.com/v1' }}
-          model_id: ${{ vars.CITE_PROVIDER == 'openrouter' && 'deepseek/deepseek-v4-flash-0731' || 'deepseek-v4.1-flash' }}
+          model_api_key: ${{ secrets.REVIEW_MODEL_API_KEY }}
+          model_base_url: ${{ vars.REVIEW_MODEL_BASE_URL }}
+          model_id: ${{ vars.REVIEW_MODEL_ID }}
+          structured_output: ${{ vars.REVIEW_MODEL_STRUCTURED_OUTPUT }}
+
